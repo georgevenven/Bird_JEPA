@@ -14,7 +14,7 @@ def sinusoidal_positional_encoding(seq_len, dim):
     return pe
 
 class ViT(nn.Module):
-    def __init__(self, input_dim, hidden_dim=256, depth=6, num_heads=8, mlp_ratio=4.0, dropout=0.1):
+    def __init__(self, input_dim, hidden_dim=64, depth=1, num_heads=4, mlp_ratio=4.0, dropout=0.1):
         super().__init__()
         # input_dim = D (freq bins)
         # input to forward: (B,D,T)
@@ -88,12 +88,19 @@ class BirdJEPA(nn.Module):
         super().__init__()
         self.context_encoder = ViT(input_dim=input_dim, hidden_dim=hidden_dim)
         self.target_encoder = ViT(input_dim=input_dim, hidden_dim=hidden_dim)
+        
+        # Initialize target encoder with same parameters as context encoder
+        for param_q, param_k in zip(self.context_encoder.parameters(), self.target_encoder.parameters()):
+            param_k.data.copy_(param_q.data)
+        
+        # Freeze target encoder parameters after copying
         for p in self.target_encoder.parameters():
             p.requires_grad = False
+            
         self.predictor = Predictor(dim=hidden_dim)
         self.decoder = nn.Linear(hidden_dim, input_dim)
-        self.ema_m = 0.9999
-        self.update_ema()
+        self.ema_m = 0.90
+        # No initial update_ema() call since parameters are already identical
 
     @torch.no_grad()
     def update_ema(self):
@@ -131,15 +138,16 @@ class BirdJEPA(nn.Module):
     def train_forward(self, spec):
         # spec: (B,D,T) with -1.0 at masked positions
         mask = (spec == -1.0)
-        target_spectrogram = torch.zeros_like(spec)
-        target_spectrogram[mask] = spec[mask]
+        
+        # The target_spectrogram and context_spectrogram are already correctly masked from the data loader
         context_spectrogram = torch.where(spec == -1.0, torch.zeros_like(spec), spec)
+        target_spectrogram = spec  # Use the input directly since it's already masked correctly
 
         # encode context
         context_repr, intermediate_outputs = self.context_encoder(context_spectrogram)
-        pred = self.predictor(context_repr)       # (B,T,H)
-        decoded_pred = self.decoder(pred)         # (B,T,D)
-        decoded_pred = decoded_pred.transpose(1,2)# (B,D,T)
+        pred = self.predictor(context_repr)       
+        decoded_pred = self.decoder(pred)         
+        decoded_pred = decoded_pred.transpose(1,2)
         return decoded_pred, mask, target_spectrogram, {"layer_outputs": torch.stack(intermediate_outputs, dim=0)}
 
     def mse_loss(self, predictions, spec, mask, intermediate_layers=None, vocalization=None):
