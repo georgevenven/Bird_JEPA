@@ -108,16 +108,17 @@ def collate_fn(batch, segment_length=500, mask_p=0.75, verbose=False):
 
     full_spectrogram = segs.clone()       # (B,F,T)
     context_spectrogram = segs.clone()    # (B,F,T)
-    target_spectrogram = torch.zeros_like(segs) # (B,F,T)
+    target_spectrogram = segs.clone()     # Changed from zeros_like to clone
 
     # apply mask per sample (mask entire freq bins at masked timesteps)
-    # masked steps: set context to -1.0, target to original values
     for b in range(B):
+        # For context: set masked timesteps to -1.0
         context_spectrogram[b, :, mask[b]] = -1.0
-        target_spectrogram[b, :, mask[b]] = segs[b, :, mask[b]]
+        # For target: set unmasked timesteps to -1.0
+        target_spectrogram[b, :, ~mask[b]] = -1.0  # Using ~mask[b] to invert the mask
 
-    # Create dummy vocalization tensor (same shape as spectrogram)
-    vocalization = torch.zeros_like(segs)  # (B,F,T)
+    # Create dummy vocalization tensor (same shape as labels)
+    vocalization = labels
 
     file_names = [f"dummy_{i}.npy" for i in range(B)]
 

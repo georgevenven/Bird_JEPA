@@ -16,12 +16,10 @@ from datetime import datetime
 
 class ModelTrainer:
     def __init__(self, model, train_loader, test_loader, optimizer, device, 
-                 max_steps=10000, eval_interval=500, save_interval=1000, 
-                 weights_save_dir='saved_weights', overfit_on_batch=False, experiment_dir=None, 
-                 early_stopping=True, patience=8, trailing_avg_window=1000, verbose=False):
-
-        self.overfit_on_batch = overfit_on_batch
-        self.fixed_batch = None
+                 max_steps=1000, eval_interval=100, save_interval=500,
+                 weights_save_dir="saved_weights", experiment_dir="experiments",
+                 trailing_avg_window=100, early_stopping=True, patience=10,
+                 verbose=False, overfit_single_batch=False):
         self.model = model
         self.train_iter = train_loader
         self.test_iter = test_loader
@@ -29,194 +27,406 @@ class ModelTrainer:
         self.device = device
         self.max_steps = max_steps
         self.eval_interval = eval_interval
-        self.scheduler = StepLR(optimizer, step_size=10000, gamma=1)
+        self.save_interval = save_interval
+        self.trailing_avg_window = trailing_avg_window
         self.early_stopping = early_stopping
         self.patience = patience
-        self.trailing_avg_window = trailing_avg_window
-        self.save_interval = save_interval
-        self.weights_save_dir = weights_save_dir
-        self.experiment_dir = experiment_dir
-        self.count_reinit = 0
         self.verbose = verbose
-
-        if not os.path.exists(self.weights_save_dir):
-            os.makedirs(self.weights_save_dir)
-
-        self.predictions_subfolder_path = os.path.join(experiment_dir, "predictions") if experiment_dir else "predictions"
-        if not os.path.exists(self.predictions_subfolder_path):
-            os.makedirs(self.predictions_subfolder_path)
+        self.overfit_single_batch = overfit_single_batch
+        
+        # Print model parameter counts
+        context_params = sum(p.numel() for p in self.model.context_encoder.parameters())
+        target_params = sum(p.numel() for p in self.model.target_encoder.parameters())
+        predictor_params = sum(p.numel() for p in self.model.predictor.parameters())
+        decoder_params = sum(p.numel() for p in self.model.decoder.parameters())
+        total_params = sum(p.numel() for p in self.model.parameters())
+        
+        print("\nModel Parameter Counts:")
+        print(f"Context Encoder:  {context_params:,} parameters")
+        print(f"Target Encoder:   {target_params:,} parameters")
+        print(f"Predictor:        {predictor_params:,} parameters")
+        print(f"Decoder:          {decoder_params:,} parameters")
+        print(f"Total:            {total_params:,} parameters\n")
+        
+        # Setup directories
+        self.experiment_dir = experiment_dir
+        self.weights_save_dir = weights_save_dir
+        os.makedirs(self.weights_save_dir, exist_ok=True)
+        
+        # Create predictions subfolder
+        self.predictions_subfolder_path = os.path.join(self.experiment_dir, 'predictions')
+        os.makedirs(self.predictions_subfolder_path, exist_ok=True)
+        
+        # Learning rate scheduler
+        self.scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+            self.optimizer, T_max=max_steps)
 
     def embedding_variance(self, embeddings):
-        """Compute the mean variance of embeddings across the batch."""
-        return embeddings.var(dim=0).mean().item()
-
-    def sum_squared_weights(self):
-        return sum(torch.sum(p ** 2) for p in self.model.parameters())
+        # Calculate variance of embeddings
+        # embeddings: (B,T,H)
+        return embeddings.var().item()
 
     def save_model(self, step, training_stats):
-        filename = f"model_step_{step}.pth"
-        filepath = os.path.join(self.weights_save_dir, filename)
-        torch.save(self.model.state_dict(), filepath)
-
+        checkpoint = {
+            'step': step,
+            'model_state_dict': self.model.state_dict(),
+            'optimizer_state_dict': self.optimizer.state_dict(),
+            'scheduler_state_dict': self.scheduler.state_dict(),
+        }
+        
+        checkpoint_path = os.path.join(self.weights_save_dir, f'checkpoint_{step}.pt')
+        torch.save(checkpoint, checkpoint_path)
+        
+        # Convert tensors to Python native types for JSON serialization
+        json_safe_stats = {}
+        for key, value in training_stats.items():
+            if isinstance(value, (list, tuple)) and len(value) > 0 and torch.is_tensor(value[0]):
+                json_safe_stats[key] = [float(v.cpu().detach()) if torch.is_tensor(v) else float(v) for v in value]
+            elif torch.is_tensor(value):
+                json_safe_stats[key] = float(value.cpu().detach())
+            else:
+                json_safe_stats[key] = value
+        
+        # Save training statistics
         stats_filename = "training_statistics.json"
         stats_filepath = os.path.join(self.experiment_dir, stats_filename)
         with open(stats_filepath, 'w') as json_file:
-            json.dump(training_stats, json_file, indent=4)
+            json.dump(json_safe_stats, json_file)
 
-    def create_large_canvas(self, context_outputs, target_outputs=None, image_idx=0, spec_shape=None, spec=None, target_spec=None):
-        # Determine number of rows and columns
-        context_layers = context_outputs["layer_outputs"].shape[0]  # (#layers,B,T,H)
+    def load_model(self, checkpoint_path):
+        checkpoint = torch.load(checkpoint_path)
+        self.model.load_state_dict(checkpoint['model_state_dict'])
+        self.optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
+        self.scheduler.load_state_dict(checkpoint['scheduler_state_dict'])
+        return checkpoint['step'], checkpoint['training_stats']
+
+    def create_large_canvas(self, context_outputs, target_outputs=None, image_idx=0, spec_shape=None, 
+                           context_spec=None, target_spec=None):
+        context_layers = context_outputs["layer_outputs"].shape[0]
         total_rows = context_layers + 1  # +1 for input spectrograms
-        num_cols = 2 if target_outputs is not None else 1
-
-        fig, axes = plt.subplots(total_rows, num_cols, figsize=(20, 5 * total_rows))
-        if total_rows == 1 and num_cols == 1:
-            axes = np.array([[axes]])
-        elif total_rows == 1 or num_cols == 1:
-            axes = axes.reshape(total_rows, num_cols)
-
-        y_axis_limit = spec_shape[1] if spec_shape else None
-
+        
+        # Use 2:1 aspect ratio for each subplot
+        fig, axes = plt.subplots(total_rows, 2, figsize=(20, 5*total_rows))
+        
         # Plot input spectrograms
-        if spec_shape is not None:
-            axes[0,0].imshow(spec.cpu()[image_idx].numpy(), aspect='auto', origin='lower')
-            axes[0,0].set_title("Input to Context Encoder")
-            axes[0,1].imshow(target_spec.cpu()[image_idx].numpy(), aspect='auto', origin='lower')
-            axes[0,1].set_title("Input to Target Encoder")
-
-        # Plot encoder outputs
+        axes[0,0].imshow(context_spec.cpu()[image_idx].numpy(), aspect='auto', origin='lower')
+        axes[0,0].set_title("Input to Context Encoder")
+        axes[0,1].imshow(target_spec.cpu()[image_idx].numpy(), aspect='auto', origin='lower')
+        axes[0,1].set_title("Input to Target Encoder")
+        
+        # Plot intermediate layers - transpose to (H,T)
         for i in range(context_layers):
-            # Context encoder outputs
-            ax = axes[i+1,0]
-            image_data = context_outputs["layer_outputs"][i, image_idx].cpu().detach().numpy()
-            ax.imshow(image_data.T, aspect='auto', origin='lower')
-            if y_axis_limit:
-                ax.set_ylim(bottom=0, top=y_axis_limit)
-            ax.set_title(f"Context Encoder Layer {i}")
-
-            # Target encoder outputs
+            # Context encoder layers
+            c_layer = context_outputs["layer_outputs"][i][image_idx].cpu().numpy().T
+            axes[i+1,0].imshow(c_layer, aspect='auto', origin='lower')
+            axes[i+1,0].set_title(f"Context Encoder Layer {i}")
+            
+            # Target encoder layers (now directly using tensor)
             if target_outputs is not None:
-                ax = axes[i+1,1]
-                image_data = target_outputs["layer_outputs"][i, image_idx].cpu().detach().numpy()
-                ax.imshow(image_data.T, aspect='auto', origin='lower')
-                if y_axis_limit:
-                    ax.set_ylim(bottom=0, top=y_axis_limit)
-                ax.set_title(f"Target Encoder Layer {i}")
-
-        plt.subplots_adjust(hspace=0.3)
+                t_layer = target_outputs[i][image_idx].cpu().numpy().T
+                axes[i+1,1].imshow(t_layer, aspect='auto', origin='lower')
+                axes[i+1,1].set_title(f"Target Encoder Layer {i}")
+            else:
+                axes[i+1,1].axis('off')
+        
+        # Remove legends and adjust layout
+        for ax in axes.flatten():
+            ax.set_xticks([])
+            ax.set_yticks([])
+        
         plt.tight_layout()
 
     def visualize_mse(self, output, mask, spec, step, full_spectrogram=None):
-        # output,spec,mask: (B,D,T)
-        output_np = output.cpu().numpy()
-        spec_np = spec.cpu().numpy()
-        mask_np = mask.cpu().numpy()
-        
-        # Create error heatmap
-        error_map = ((output - spec)**2 * mask.float())[0].cpu().numpy()  # (D,T)
+        # Use 2:1 aspect ratio for each subplot
+        fig, axs = plt.subplots(2, 2, figsize=(20, 10))
+        axs = axs.flatten()
 
-        # Increase number of subplots
-        fig, axs = plt.subplots(2, 2, figsize=(30, 20))
-        axs = axs.ravel()
+        # Plot 1: Original spectrogram with mask overlay
+        im = axs[0].imshow(spec[0].cpu().numpy(), aspect='auto', origin='lower')
+        axs[0].set_title('Masked Input Spectrogram', fontsize=35, pad=20)
+        self._add_mask_overlay(axs[0], mask[0])
 
-        x_label = 'Time Bins'
-        y_label = 'Frequency Bins'
-        plt.subplots_adjust(hspace=0.33, wspace=0.2)
-        for ax in axs:
-            ax.tick_params(axis='both', which='major', labelsize=25, length=6, width=2)
-            ax.set_xlabel(x_label, fontsize=25)
-            ax.set_ylabel(y_label, fontsize=25)
+        # Plot 2: Model's prediction
+        im = axs[1].imshow(output[0].cpu().detach().numpy(), aspect='auto', origin='lower')
+        axs[1].set_title('Model Prediction', fontsize=35, pad=20)
+        self._add_mask_overlay(axs[1], mask[0])
 
-        # Plot 1: Original unmasked spectrogram
-        if full_spectrogram is not None:
-            axs[0].imshow(full_spectrogram[0].cpu().numpy(), aspect='auto', origin='lower')
-            axs[0].set_title('Original Spectrogram (No Mask)', fontsize=35, pad=20)
-
-        # Plot 2: Masked input
-        axs[1].imshow(spec_np[0], aspect='auto', origin='lower')
-        axs[1].set_title('Masked Input Spectrogram', fontsize=35, pad=20)
-        self._add_mask_overlay(axs[1], mask_np[0])
-
-        # Plot 3: Model prediction
-        axs[2].imshow(output_np[0], aspect='auto', origin='lower')
-        axs[2].set_title('Model Prediction', fontsize=35, pad=20)
-        self._add_mask_overlay(axs[2], mask_np[0])
+        # Plot 3: Empty for now
+        axs[2].set_visible(False)
 
         # Plot 4: Error heatmap
+        error_map = (output[0] - spec[0]).cpu().detach().numpy() ** 2
         im = axs[3].imshow(error_map, aspect='auto', origin='lower', cmap='hot')
         axs[3].set_title('Prediction Error Heatmap', fontsize=35, pad=20)
-        plt.colorbar(im, ax=axs[3])
 
+        # Remove legends and ticks
+        for ax in axs:
+            if ax.get_visible():
+                ax.set_xticks([])
+                ax.set_yticks([])
+
+        plt.tight_layout()
         plt.savefig(os.path.join(self.predictions_subfolder_path, f'MSE_Visualization_{step}.png'), format="png")
         plt.close(fig)
 
     def _add_mask_overlay(self, axis, mask):
-        # mask: (D,T)
-        # highlight masked time steps
-        masked_tokens = (mask != 0).any(axis=0) # bool for each time step
+        """
+        Add mask overlay to plot
+        Args:
+            axis: matplotlib axis
+            mask: tensor of shape (T) or (D, T)
+        """
+        # If mask is 2D (D,T), reduce to 1D (T)
+        if mask.dim() > 1:
+            masked_tokens = mask.any(dim=0)  # Reduce along frequency dimension if present
+        else:
+            masked_tokens = mask
+        
         y_min, y_max = axis.get_ylim()
         mask_bar_position = y_max - 15
-        for idx,m in enumerate(masked_tokens):
-            if m:
-                axis.add_patch(plt.Rectangle((idx, mask_bar_position), 1, 15, 
-                                             edgecolor='none', facecolor='red'))
+        
+        # Convert to numpy for matplotlib
+        masked_tokens = masked_tokens.cpu().numpy()
+        
+        # Iterate over time steps
+        for t in range(len(masked_tokens)):
+            if masked_tokens[t]:
+                axis.add_patch(plt.Rectangle((t, mask_bar_position), 1, 15, 
+                                           edgecolor='none', facecolor='red'))
 
-    def visualize_masked_predictions(self, step, spec, output, mask, all_outputs, full_spectrogram=None):
+    def visualize_masked_predictions(self, step, context_spec, target_spec, output, mask, all_outputs):
         self.model.eval()
         with torch.no_grad():
-            # Get target encoder outputs using target_spectrogram
-            target_outputs = None
-            if hasattr(self.model, 'target_encoder'):
-                # Get target_spectrogram from the data loader
-                _, target_spectrogram, context_spectrogram, _, _, _ = next(iter(self.test_iter))
-                target_spectrogram = target_spectrogram.to(self.device)
-                _, target_intermediate = self.model.target_encoder(target_spectrogram)
-                target_outputs = {"layer_outputs": torch.stack(target_intermediate, dim=0)}
-
             # Visualize MSE and predictions
-            self.visualize_mse(output=output, mask=mask, spec=spec, step=step, 
-                              full_spectrogram=full_spectrogram)
+            self.visualize_mse(output=output, mask=mask, spec=target_spec, step=step)
             
-            # Pass spec to create_large_canvas
-            self.create_large_canvas(all_outputs, target_outputs, image_idx=0, 
-                                   spec_shape=spec.shape, spec=spec, target_spec=target_spectrogram)
+            # Create visualization with both context and target - pass target_outputs directly
+            self.create_large_canvas(
+                context_outputs=all_outputs,
+                target_outputs=all_outputs["target_outputs"], 
+                image_idx=0, 
+                spec_shape=context_spec.shape,
+                context_spec=context_spec, 
+                target_spec=target_spec
+            )
+            
             plt.savefig(os.path.join(self.predictions_subfolder_path, 
                        f'Intermediate_Outputs_{step}.png'), format="png")
             plt.close()
 
-    def validate_model(self, step, spec, vocalization):
+    def visualize_latent_predictions(self, step, context_repr, target_repr, pred_sequence, mask):
+        """Visualize the latent space predictions"""
+        # Use 2:1 aspect ratio for each subplot
+        fig, axs = plt.subplots(2, 2, figsize=(20, 10))
+        axs = axs.flatten()
+
+        # Plot 1: Target embeddings
+        im = axs[0].imshow(target_repr[0].cpu().numpy().T, aspect='auto', origin='lower')
+        axs[0].set_title('Target Embeddings', fontsize=35, pad=20)
+        self._add_mask_overlay(axs[0], mask[0])
+
+        # Plot 2: Predicted embeddings
+        im = axs[1].imshow(pred_sequence[0].cpu().detach().numpy().T, aspect='auto', origin='lower')
+        axs[1].set_title('Predicted Embeddings', fontsize=35, pad=20)
+        self._add_mask_overlay(axs[1], mask[0])
+
+        # Plot 3: Error heatmap (only for masked regions)
+        mask_expanded = mask[0].unsqueeze(-1).expand(-1, pred_sequence.shape[-1])
+        error_map = ((pred_sequence[0] - target_repr[0]) * mask_expanded).cpu().detach().numpy().T ** 2
+        im = axs[2].imshow(error_map, aspect='auto', origin='lower', cmap='hot')
+        axs[2].set_title('Prediction Error Heatmap (Masked Regions)', fontsize=35, pad=20)
+
+        # Plot 4: Context embeddings
+        im = axs[3].imshow(context_repr[0].cpu().numpy().T, aspect='auto', origin='lower')
+        axs[3].set_title('Context Embeddings', fontsize=35, pad=20)
+
+        # Remove legends and ticks
+        for ax in axs:
+            ax.set_xticks([])
+            ax.set_yticks([])
+
+        plt.tight_layout()
+        plt.savefig(os.path.join(self.predictions_subfolder_path, f'Latent_Predictions_{step}.png'), format="png")
+        plt.close(fig)
+
+    def visualize_decoder_reconstruction(self, step, original_spec, decoded_pred, mask):
+        """Visualize the decoder's reconstruction"""
+        # Ensure decoded_pred is in the right shape (B, D, T)
+        if decoded_pred.shape[1] != original_spec.shape[1]:
+            decoded_pred = decoded_pred.transpose(1, 2)
+        
+        # Use 2:1 aspect ratio for each subplot
+        fig, axs = plt.subplots(2, 2, figsize=(20, 10))
+        axs = axs.flatten()
+
+        # Plot 1: Original spectrogram
+        im = axs[0].imshow(original_spec[0].cpu().numpy(), aspect='auto', origin='lower')
+        axs[0].set_title('Original Spectrogram', fontsize=35, pad=20)
+        self._add_mask_overlay(axs[0], mask[0])
+
+        # Plot 2: Decoded prediction
+        im = axs[1].imshow(decoded_pred[0].cpu().detach().numpy(), aspect='auto', origin='lower')
+        axs[1].set_title('Decoded Prediction', fontsize=35, pad=20)
+        self._add_mask_overlay(axs[1], mask[0])
+
+        # Plot 3: Error heatmap for full reconstruction
+        error_map = (decoded_pred[0] - original_spec[0]).cpu().detach().numpy() ** 2
+        im = axs[2].imshow(error_map, aspect='auto', origin='lower', cmap='hot')
+        axs[2].set_title('Full Reconstruction Error', fontsize=35, pad=20)
+
+        # Plot 4: Error heatmap for masked regions only
+        masked_error = error_map * mask[0].cpu().numpy()
+        im = axs[3].imshow(masked_error, aspect='auto', origin='lower', cmap='hot')
+        axs[3].set_title('Masked Regions Error', fontsize=35, pad=20)
+
+        # Remove legends and ticks
+        for ax in axs:
+            ax.set_xticks([])
+            ax.set_yticks([])
+
+        plt.tight_layout()
+        plt.savefig(os.path.join(self.predictions_subfolder_path, f'Decoder_Reconstruction_{step}.png'), format="png")
+        plt.close(fig)
+
+    def validate_model(self, step, context_spec, target_spec, vocalization):
         self.model.eval()
         with torch.no_grad():
-            if self.verbose:
-                print(f"\nValidation Input Shapes:")
-                print(f"spec: {spec.shape}")
-                print(f"vocalization: {vocalization.shape}")
+            # Clean context input by zeroing masked positions
+            context_clean = torch.where(context_spec == -1.0, 
+                                      torch.zeros_like(context_spec), 
+                                      context_spec)
+            
+            context_repr, context_intermediate = self.model.context_encoder(context_clean)
+            target_repr, target_intermediate = self.model.target_encoder(target_spec)
+            
+            # Extract mask from context_spec (where values are -1.0)
+            mask = (context_spec == -1.0).any(dim=1)  # (B,T)
+            
+            # Pass mask to predictor
+            pred_sequence = self.model.predictor(context_repr, mask=mask)
+            
+            # Calculate latent space loss properly across all batches
+            masked_latent_loss = ((pred_sequence - target_repr)**2 * mask.unsqueeze(-1)).mean()
+            
+            # Get decoder predictions
+            decoded_pred = self.model.decoder(pred_sequence)
+            decoded_pred = decoded_pred.transpose(1, 2)
+            
+            # Calculate embedding variances
+            context_var = self.embedding_variance(context_repr)
+            target_var = self.embedding_variance(target_repr)
+            
+            # Generate visualizations at eval_interval
+            if step % self.eval_interval == 0:
+                # Latent predictions visualization
+                self.visualize_latent_predictions(
+                    step, context_repr=context_repr, target_repr=target_repr,
+                    pred_sequence=pred_sequence, mask=mask
+                )
+                
+                # Encoder states visualization
+                context_outputs_dict = {"layer_outputs": torch.stack(context_intermediate, dim=0),
+                                      "target_outputs": torch.stack(target_intermediate, dim=0)}
+                
+                self.create_large_canvas(
+                    context_outputs=context_outputs_dict,
+                    target_outputs=target_intermediate,
+                    image_idx=0,
+                    spec_shape=context_spec.shape,
+                    context_spec=context_spec,
+                    target_spec=target_spec
+                )
+                plt.savefig(os.path.join(self.predictions_subfolder_path, 
+                           f'Encoders_Activations_{step}.png'), format="png")
+                plt.close()
+                
+                # Decoder reconstruction visualization
+                if step % 1000 == 0:
+                    self.visualize_decoder_reconstruction(
+                        step, original_spec=target_spec,
+                        decoded_pred=decoded_pred, mask=mask
+                    )
+            
+            # Calculate sequence accuracies (for tracking)
+            mask_expanded = mask.unsqueeze(1)
+            masked_seq_acc = ((decoded_pred - target_spec)**2 * mask_expanded.float()).mean()
+            unmasked_seq_acc = ((decoded_pred - target_spec)**2 * (~mask_expanded).float()).mean()
+            
+            return masked_latent_loss.item(), masked_seq_acc.item(), unmasked_seq_acc.item()
 
-            spec = spec.to(self.device)
-            decoded_pred, mask, target_spectrogram, intermediate_outputs = self.model.train_forward(spec)
-
-            if self.verbose:
-                print(f"\nValidation Output Shapes:")
-                print(f"decoded_pred: {decoded_pred.shape}")
-                print(f"mask: {mask.shape}")
-                print(f"target_spectrogram: {target_spectrogram.shape}")
-                print(f"intermediate_outputs['layer_outputs']: {intermediate_outputs['layer_outputs'].shape}")
-
-            if step % self.eval_interval == 0 or step == 0:
-                self.visualize_masked_predictions(step, spec=spec, output=decoded_pred, mask=mask, all_outputs=intermediate_outputs)
-            val_loss, masked_seq_acc, unmasked_seq_acc = self.model.mse_loss(predictions=decoded_pred, spec=target_spectrogram, mask=mask, vocalization=vocalization, intermediate_layers=intermediate_outputs)
-            return val_loss.item(), masked_seq_acc.item(), unmasked_seq_acc.item()
+    def train_decoder(self):
+        """Periodically train decoder on unmasked data"""
+        self.model.context_encoder.eval()  # Freeze context encoder
+        self.model.decoder.train()  # Set decoder to training mode
+        decoder_optimizer = torch.optim.Adam(self.model.decoder.parameters(), lr=1e-4)
+        
+        for batch in self.train_iter:  # Use a subset of data if needed
+            full_spec = batch[0].to(self.device)  # shape: (B, D, T)
+            
+            with torch.no_grad():
+                # Get embeddings from frozen encoder
+                embeddings, _ = self.model.context_encoder(full_spec)  # shape: (B, T, H)
+            
+            # Forward pass through decoder (with gradients)
+            decoder_optimizer.zero_grad()
+            decoded = self.model.decoder(embeddings)  # shape: (B, T, D)
+            decoded = decoded.transpose(1, 2)  # Now shape: (B, D, T)
+            
+            # Compute loss
+            decoder_loss = F.mse_loss(decoded, full_spec)
+            
+            # Backward pass
+            decoder_loss.backward()
+            decoder_optimizer.step()
+            
+            # Only train on one batch
+            break
 
     def moving_average(self, values, window):
         if len(values) < window:
             return []
+        
+        # Convert tensors to CPU numpy arrays if needed
+        numpy_values = []
+        for v in values:
+            if torch.is_tensor(v):
+                numpy_values.append(v.detach().cpu().numpy())
+            else:
+                numpy_values.append(v)
+        
         weights = np.repeat(1.0, window) / window
-        sma = np.convolve(values, weights, 'valid')
+        sma = np.convolve(numpy_values, weights, 'valid')
         return sma.tolist()
+
+    def get_network_stats(self, network, name):
+        """Get gradient and weight statistics for a network"""
+        grad_norm = 0
+        weight_norm = 0
+        grad_max = 0
+        weight_max = 0
+        param_count = 0
+        
+        for p in network.parameters():
+            if p.grad is not None:
+                grad_norm += p.grad.norm().item() ** 2
+                grad_max = max(grad_max, p.grad.abs().max().item())
+            weight_norm += p.norm().item() ** 2
+            weight_max = max(weight_max, p.abs().max().item())
+            param_count += p.numel()
+        
+        grad_norm = grad_norm ** 0.5
+        weight_norm = weight_norm ** 0.5
+        
+        return {
+            f"{name}_grad_norm": grad_norm,
+            f"{name}_grad_max": grad_max,
+            f"{name}_weight_norm": weight_norm,
+            f"{name}_weight_max": weight_max,
+            f"{name}_param_count": param_count
+        }
 
     def train(self, continue_training=False, training_stats=None, last_step=0):
         step = last_step + 1 if continue_training else 0
-
         scaler = GradScaler()
 
         if continue_training:
@@ -237,48 +447,38 @@ class ModelTrainer:
         train_iter = iter(self.train_iter)
         test_iter = iter(self.test_iter)
 
+        # Get single batch if overfitting
+        if self.overfit_single_batch:
+            train_batch = next(iter(self.train_iter))
+            val_batch = train_batch  # Use same batch for validation
+            print("\nOverfitting on single batch...")
+            
         while step < self.max_steps:
             try:
-                train_batch = next(train_iter)
-                val_batch = next(test_iter)
+                if not self.overfit_single_batch:
+                    train_batch = next(train_iter)
+                    val_batch = next(test_iter)
             except StopIteration:
-                train_iter = iter(self.train_iter)
-                test_iter = iter(self.test_iter)
-                continue
+                if not self.overfit_single_batch:
+                    train_iter = iter(self.train_iter)
+                    test_iter = iter(self.test_iter)
+                    continue
 
+            # Unpack batches
             full_spectrogram, target_spectrogram, context_spectrogram, ground_truth_labels, vocalization, file_names = train_batch
+            val_full_spect, val_target_spect, val_context_spect, val_labels, val_vocalization, val_file_names = val_batch
             
-            if self.verbose and step % self.eval_interval == 0:
-                # the shape is (B,F,T) for spectograms 
-                # F is the number of frequency bins
-                # T is the number of time bins
-                # B is the batch size
-                # the shape is (B,T) for labels
-                
-                print(f"\nStep {step} Input Shapes:")
-                print(f"full_spectrogram: {full_spectrogram.shape}")
-                print(f"target_spectrogram: {target_spectrogram.shape}")
-                print(f"context_spectrogram: {context_spectrogram.shape}")
-                print(f"ground_truth_labels: {ground_truth_labels.shape}")
-                print(f"vocalization: {vocalization.shape}")
-            
+            # Move to device
             context_spectrogram = context_spectrogram.to(self.device)
             target_spectrogram = target_spectrogram.to(self.device)
+            val_context_spect = val_context_spect.to(self.device)
+            val_target_spect = val_target_spect.to(self.device)
+            val_vocalization = val_vocalization.to(self.device) if torch.is_tensor(val_vocalization) else val_vocalization
 
+            # Training step
             self.model.train()
             with autocast():
-                decoded_pred, mask, t_spect, intermediate_outputs = self.model.train_forward(context_spectrogram)
-                
-                if self.verbose and step % self.eval_interval == 0:
-                    print(f"\nStep {step} Output Shapes:")
-                    print(f"decoded_pred: {decoded_pred.shape}")
-                    print(f"mask: {mask.shape}")
-                    print(f"t_spect: {t_spect.shape}")
-                    print(f"intermediate_outputs['layer_outputs']: {intermediate_outputs['layer_outputs'].shape}")
-
-                loss, masked_seq_acc, unmasked_seq_acc = self.model.mse_loss(
-                    predictions=decoded_pred, spec=t_spect, mask=mask, 
-                    vocalization=vocalization, intermediate_layers=intermediate_outputs)
+                loss = self.model.training_step(context_spectrogram, target_spectrogram)
 
             self.optimizer.zero_grad()
             scaler.scale(loss).backward()
@@ -286,47 +486,42 @@ class ModelTrainer:
             scaler.update()
             self.scheduler.step()
 
+            # Periodically train decoder
+            if step % 1000 == 0:
+                self.train_decoder()
+
+            # Validation step
+            val_loss, masked_seq_acc, unmasked_seq_acc = self.validate_model(
+                step, context_spec=val_context_spect, 
+                target_spec=val_target_spect, 
+                vocalization=val_vocalization
+            )
+
+            # Update statistics
             raw_loss_list.append(loss.item())
-
-            val_full_spect, val_target_spect, val_context_spect, val_gt_labels, val_vocalization, val_file_names = val_batch
-            val_context_spect = val_context_spect.to(self.device)
-            val_vocalization = val_vocalization.to(self.device)
-
-            with autocast():
-                val_loss, avg_masked_seq_acc, avg_unmasked_seq_acc = self.validate_model(step, spec=val_context_spect, vocalization=val_vocalization)
-
             raw_val_loss_list.append(val_loss)
-            raw_masked_seq_acc_list.append(avg_masked_seq_acc)
-            raw_unmasked_seq_acc_list.append(avg_unmasked_seq_acc)
+            raw_masked_seq_acc_list.append(masked_seq_acc)
+            raw_unmasked_seq_acc_list.append(unmasked_seq_acc)
 
-            if step % self.eval_interval == 0 or step == 0:
-                # Calculate variances here
+            if step % self.eval_interval == 0:
+                # Calculate variances
                 with torch.no_grad():
                     context_repr, _ = self.model.context_encoder(context_spectrogram)
                     target_repr, _ = self.model.target_encoder(target_spectrogram)
                     context_var = self.embedding_variance(context_repr)
                     target_var = self.embedding_variance(target_repr)
 
+                # Calculate smoothed losses
                 if len(raw_loss_list) >= self.trailing_avg_window:
                     smoothed_training_loss = self.moving_average(raw_loss_list, self.trailing_avg_window)[-1]
                     smoothed_val_loss = self.moving_average(raw_val_loss_list, self.trailing_avg_window)[-1]
-                    smoothed_masked_seq_acc = self.moving_average(raw_masked_seq_acc_list, self.trailing_avg_window)[-1]
-                    smoothed_unmasked_seq_acc = self.moving_average(raw_unmasked_seq_acc_list, self.trailing_avg_window)[-1]
                 else:
                     smoothed_training_loss = loss.item()
                     smoothed_val_loss = val_loss
-                    smoothed_masked_seq_acc = avg_masked_seq_acc
-                    smoothed_unmasked_seq_acc = avg_unmasked_seq_acc
 
-                print(f'Step [{step}/{self.max_steps}], '
-                      f'Smoothed Training Loss: {smoothed_training_loss:.4f}, '
-                      f'Smoothed Validation Loss: {smoothed_val_loss:.4f}, '
-                      f'Smoothed Masked Seq Loss: {smoothed_masked_seq_acc:.4f}, '
-                      f'Smoothed Unmasked Seq Loss: {smoothed_unmasked_seq_acc:.4f}, '
-                      f'Context Var: {context_var:.6f}, Target Var: {target_var:.6f}')
-
-                if context_var < 1e-5 or target_var < 1e-5:
-                    print(f"Warning: Potential collapse detected at step {step} (low variance).")
+                # Single consolidated print statement
+                print(f"\nStep [{step}/{self.max_steps}] - Train Loss: {smoothed_training_loss:.4f}, "
+                      f"Val Loss: {smoothed_val_loss:.4f}, Vars [C/T]: {context_var:.4f}/{target_var:.4f}")
 
                 if smoothed_val_loss < best_val_loss:
                     best_val_loss = smoothed_val_loss
@@ -335,22 +530,25 @@ class ModelTrainer:
                     steps_since_improvement += 1
 
                 if self.early_stopping and steps_since_improvement >= self.patience:
-                    print(f"Early stopping triggered at step {step}. No improvement for {self.patience} intervals.")
+                    print(f"\nEarly stopping triggered at step {step}. No improvement for {self.patience} intervals.")
                     break
 
-            if step % self.save_interval == 0 or step == self.max_steps - 1:
-                current_training_stats = {
-                    'step': step,
+            if step % self.save_interval == 0:
+                training_stats = {
                     'training_loss': raw_loss_list,
+                    'validation_loss': raw_val_loss_list,
                     'masked_seq_acc': raw_masked_seq_acc_list,
                     'unmasked_seq_acc': raw_unmasked_seq_acc_list,
-                    'validation_loss': raw_val_loss_list,
-                    'steps_since_improvement': steps_since_improvement,
-                    'best_val_loss': best_val_loss
+                    'best_val_loss': best_val_loss,
+                    'steps_since_improvement': steps_since_improvement
                 }
-                self.save_model(step, current_training_stats)
+                self.save_model(step, training_stats)
 
             step += 1
+            # Update target encoder EMA
+            self.model.update_ema()
+
+        return raw_loss_list, raw_val_loss_list
 
     def plot_results(self, save_plot=True, config=None):
         stats_filename = "training_statistics.json"
@@ -423,6 +621,24 @@ if __name__ == '__main__':
     parser.add_argument('--batch_size', type=int, default=8)
     parser.add_argument('--lr', type=float, default=1e-4)
     parser.add_argument('--name', type=str, required=True, help='Name of the experiment')
+    parser.add_argument('--eval_interval', type=int, default=100, help='How often to run validation')
+    parser.add_argument('--input_dim', type=int, default=513, help='Input dimension (frequency bins)')
+    parser.add_argument('--hidden_dim', type=int, default=64, help='Hidden dimension for encoders')
+    parser.add_argument('--num_layers', type=int, default=2, help='Number of transformer layers for encoders')
+    parser.add_argument('--num_heads', type=int, default=2, help='Number of attention heads for encoders')
+    parser.add_argument('--dropout', type=float, default=0.2, help='Dropout rate')
+    parser.add_argument('--mlp_dim', type=int, default=128, help='MLP hidden dimension for encoders')
+    parser.add_argument('--pred_hidden_dim', type=int, default=64, help='Hidden dimension for predictor')
+    parser.add_argument('--pred_num_layers', type=int, default=2, help='Number of transformer layers for predictor')
+    parser.add_argument('--pred_num_heads', type=int, default=2, help='Number of attention heads for predictor')
+    parser.add_argument('--pred_mlp_ratio', type=float, default=4.0, help='MLP ratio for predictor')
+    parser.add_argument('--max_seq_len', type=int, default=500, help='Maximum sequence length for predictor')
+    parser.add_argument('--overfit_batch', action='store_true', 
+                       help='Whether to overfit on a single batch (default: False)')
+    parser.add_argument('--mask_ratio', type=float, default=0.75,
+                       help='Ratio of timesteps to mask (default: 0.75)')
+    parser.add_argument('--verbose', action='store_true',
+                       help='Enable verbose output during training')
     args = parser.parse_args()
 
     root_exp_dir = "experiments"
@@ -451,35 +667,97 @@ if __name__ == '__main__':
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
     dl_train = DataLoader(
-        BirdJEPA_Dataset(data_dir=args.train_dir, segment_len=500, verbose=False),
+        BirdJEPA_Dataset(data_dir=args.train_dir, segment_len=args.max_seq_len, verbose=False),
         batch_size=args.batch_size,
         shuffle=True,
-        collate_fn=lambda batch: collate_fn(batch, segment_length=500, mask_p=0.5, verbose=False)
+        collate_fn=lambda batch: collate_fn(batch, 
+                                          segment_length=args.max_seq_len, 
+                                          mask_p=args.mask_ratio, 
+                                          verbose=False)
     )
 
     dl_test = DataLoader(
-        BirdJEPA_Dataset(data_dir=args.test_dir, segment_len=500, verbose=False),
+        BirdJEPA_Dataset(data_dir=args.test_dir, segment_len=args.max_seq_len, verbose=False),
         batch_size=args.batch_size,
         shuffle=True,
-        collate_fn=lambda batch: collate_fn(batch, segment_length=500, mask_p=0.5, verbose=False)
+        collate_fn=lambda batch: collate_fn(batch, 
+                                          segment_length=args.max_seq_len, 
+                                          mask_p=args.mask_ratio, 
+                                          verbose=False)
     )
 
     # ensure input_dim matches D from dataset
     # set input_dim=... (e.g., 256)
-    model = BirdJEPA(input_dim=513, hidden_dim=64).to(device)
-    opt = torch.optim.Adam(list(model.context_encoder.parameters()) + list(model.predictor.parameters()) + list(model.decoder.parameters()), lr=args.lr)
+    model = BirdJEPA(
+        input_dim=args.input_dim,
+        hidden_dim=args.hidden_dim,
+        num_layers=args.num_layers,
+        num_heads=args.num_heads,
+        dropout=args.dropout,
+        mlp_dim=args.mlp_dim,
+        pred_hidden_dim=args.pred_hidden_dim,
+        pred_num_layers=args.pred_num_layers,
+        pred_num_heads=args.pred_num_heads,
+        pred_mlp_ratio=args.pred_mlp_ratio,
+        max_seq_len=args.max_seq_len
+    ).to(device)
+    opt = torch.optim.Adam(list(model.context_encoder.parameters()) + 
+                          list(model.predictor.parameters()) + 
+                          list(model.decoder.parameters()), lr=args.lr)
 
+    # Create config dictionary
+    config = {
+        # Data parameters
+        "input_dim": args.input_dim,
+        "max_seq_len": args.max_seq_len,
+        "mask_ratio": args.mask_ratio,
+        
+        # Model architecture
+        "hidden_dim": args.hidden_dim,
+        "num_layers": args.num_layers,
+        "num_heads": args.num_heads,
+        "dropout": args.dropout,
+        "mlp_dim": args.mlp_dim,
+        
+        # Predictor parameters
+        "pred_hidden_dim": args.pred_hidden_dim,
+        "pred_num_layers": args.pred_num_layers,
+        "pred_num_heads": args.pred_num_heads,
+        "pred_mlp_ratio": args.pred_mlp_ratio,
+        
+        # Training parameters
+        "batch_size": args.batch_size,
+        "learning_rate": args.lr,
+        "max_steps": args.steps,
+        "eval_interval": args.eval_interval,
+        
+        # Paths and names
+        "experiment_name": args.name,
+        "train_dir": args.train_dir,
+        "test_dir": args.test_dir,
+        
+        # Additional info
+        "device": str(device),
+        "timestamp": datetime.now().strftime("%Y%m%d_%H%M%S")
+    }
+    
+    # Save config
+    config_path = os.path.join(experiment_dir, 'config.json')
+    with open(config_path, 'w') as f:
+        json.dump(config, f, indent=4)
+    
     trainer = ModelTrainer(model=model, 
                           train_loader=dl_train, 
                           test_loader=dl_test, 
                           optimizer=opt, 
                           device=device, 
                           max_steps=args.steps, 
-                          eval_interval=100, 
+                          eval_interval=args.eval_interval,
                           save_interval=500, 
                           weights_save_dir=weights_dir,
                           experiment_dir=experiment_dir,
-                          verbose=False)
+                          verbose=args.verbose,
+                          overfit_single_batch=args.overfit_batch)
 
     trainer.train()
     trainer.plot_results(save_plot=True)
