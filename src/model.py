@@ -3,15 +3,7 @@ import torch
 import torch.nn as nn
 import math
 import torch.nn.functional as F
-
-def sinusoidal_positional_encoding(seq_len, dim):
-    # standard positional encoding for seq_len x dim
-    pe = torch.zeros(seq_len, dim)
-    position = torch.arange(0, seq_len, dtype=torch.float).unsqueeze(1)
-    div_term = torch.exp(torch.arange(0, dim, 2).float() * (-math.log(10000.0) / dim))
-    pe[:, 0::2] = torch.sin(position * div_term)
-    pe[:, 1::2] = torch.cos(position * div_term)
-    return pe
+from custom_transformer import CustomEncoderBlock
 
 class ViT(nn.Module):
     def __init__(self, input_dim, hidden_dim=64, depth=3, num_heads=4, mlp_ratio=4.0, dropout=0.1, max_len=512):
@@ -24,24 +16,16 @@ class ViT(nn.Module):
         self.cls_token = nn.Parameter(torch.randn(1, 1, hidden_dim))
         self.dropout = nn.Dropout(dropout)
 
-        # Replace learned positional embeddings with sinusoidal
-        self.register_buffer('pos_embedding', 
-            sinusoidal_positional_encoding(max_len + 1, hidden_dim))  # +1 for CLS token
-
-        self.layers = nn.ModuleList([])
-        for _ in range(depth):
-            self.layers.append(nn.ModuleList([
-                nn.LayerNorm(hidden_dim),
-                nn.MultiheadAttention(hidden_dim, num_heads, dropout=dropout, batch_first=True),
-                nn.LayerNorm(hidden_dim),
-                nn.Sequential(
-                    nn.Linear(hidden_dim, int(hidden_dim * mlp_ratio)),
-                    nn.GELU(),
-                    nn.Dropout(dropout),
-                    nn.Linear(int(hidden_dim * mlp_ratio), hidden_dim),
-                    nn.Dropout(dropout),
-                )
-            ]))
+        self.layers = nn.ModuleList([
+            CustomEncoderBlock(
+                d_model=hidden_dim,
+                num_heads=num_heads,
+                ffn_dim=int(hidden_dim * mlp_ratio),
+                dropout=dropout,
+                pos_enc_type="relative",
+                length=max_len + 1  # +1 for CLS token
+            ) for _ in range(depth)
+        ])
 
     def forward(self, x):
         # x: (B,D,T)
@@ -56,26 +40,14 @@ class ViT(nn.Module):
         cls_tokens = self.cls_token.expand(B, -1, -1) # (B,1,H)
         x = torch.cat((cls_tokens, x), dim=1) # (B,T+1,H)
         
-        # Add positional embeddings
-        x = x + self.pos_embedding[:, :T+1]  # +1 for CLS token
         x = self.dropout(x)
 
         layer_outputs = []
-        for (ln1, attn, ln2, mlp) in self.layers:
-            # Attention block
-            x2 = ln1(x)
-            attn_output, _ = attn(x2, x2, x2, need_weights=False)
-            x = x + attn_output
-            
-            # MLP block
-            x2 = ln2(x)
-            x = x + mlp(x2)
-            
-            # Store full layer output
-            layer_outputs.append(x)
+        for block in self.layers:
+            block_output = block(x)
+            x = block_output['feed_forward_output']
+            layer_outputs.append(x[:, 1:])  # Store output excluding CLS token
 
-        # remove CLS token from all outputs
-        layer_outputs = [layer[:, 1:] for layer in layer_outputs]
         return x[:, 1:], layer_outputs  # (B,T,H), [list of layer outputs]
 
 class Predictor(nn.Module):
@@ -110,28 +82,18 @@ class PredictorViT(nn.Module):
         super().__init__()
         self.hidden_dim = hidden_dim
         self.dropout = nn.Dropout(dropout)
-        
-        # Replace learned position embeddings with sinusoidal
-        self.register_buffer('pos_embedding',
-            sinusoidal_positional_encoding(max_len, hidden_dim))
-        
-        self.layers = nn.ModuleList([])
-        for _ in range(depth):
-            self.layers.append(nn.ModuleList([
-                nn.LayerNorm(hidden_dim),
-                nn.MultiheadAttention(hidden_dim, num_heads, dropout=dropout, batch_first=True),
-                nn.LayerNorm(hidden_dim),
-                nn.Sequential(
-                    nn.Linear(hidden_dim, int(hidden_dim * mlp_ratio)),
-                    nn.GELU(),
-                    nn.Dropout(dropout),
-                    nn.Linear(int(hidden_dim * mlp_ratio), hidden_dim),
-                    nn.Dropout(dropout),
-                )
-            ]))
-
-        # Add mask token embedding
         self.mask_token = nn.Parameter(torch.randn(1, 1, hidden_dim))
+
+        self.layers = nn.ModuleList([
+            CustomEncoderBlock(
+                d_model=hidden_dim,
+                num_heads=num_heads,
+                ffn_dim=int(hidden_dim * mlp_ratio),
+                dropout=dropout,
+                pos_enc_type="relative",
+                length=max_len
+            ) for _ in range(depth)
+        ])
 
     def forward(self, x, mask):
         # x: (B,T,H) context embeddings
@@ -139,11 +101,6 @@ class PredictorViT(nn.Module):
         B, T, H = x.shape
         assert x.shape == (B, T, H), f"Input shape wrong: {x.shape}"
         assert mask.shape == (B, T), f"Mask shape wrong: {mask.shape}"
-        
-        # Fix positional embeddings
-        pos_emb = self.pos_embedding[:T].unsqueeze(0)  # (1,T,H)
-        x = x + pos_emb  # Should broadcast correctly to (B,T,H)
-        assert x.shape == (B, T, H), f"After pos_emb shape wrong: {x.shape}"
         
         # Expand mask tokens
         mask_tokens = self.mask_token.expand(B, T, H)  # (B,T,H)
@@ -153,14 +110,9 @@ class PredictorViT(nn.Module):
         assert x.shape == (B, T, H), f"After masking shape wrong: {x.shape}"
         
         # Apply transformer layers
-        for (ln1, attn, ln2, mlp) in self.layers:
-            x2 = ln1(x)
-            assert x2.shape == (B, T, H), f"Pre-attention shape wrong: {x2.shape}"
-            attn_output, _ = attn(x2, x2, x2)
-            x = x + attn_output
-            
-            x2 = ln2(x)
-            x = x + mlp(x2)
+        for block in self.layers:
+            block_output = block(x)
+            x = block_output['feed_forward_output']
 
         return x  # (B,T,H)
 
@@ -251,11 +203,25 @@ class BirdJEPA(nn.Module):
         pred = self.predictor(context_repr, mask=mask)  # (B,T,H)
         return pred, target_repr
 
-    def training_step(self, context_spectrogram, target_spectrogram):
-        pred, target = self.forward(context_spectrogram, target_spectrogram)
-        # Fix: Remove keepdim=True to get mask shape (B,T) instead of (B,1,T)
-        masked_positions = (context_spectrogram == -1.0).any(dim=1)
-        loss = ((pred - target)**2 * masked_positions.unsqueeze(-1)).mean()
+    def training_step(self, context_spectrogram, target_spectrogram, mask):
+        """
+        Args:
+            context_spectrogram: Input spectrogram with noise at masked positions (B,D,T)
+            target_spectrogram: Target spectrogram (B,D,T)
+            mask: Boolean tensor indicating masked positions (B,T)
+        """
+        # Encode context (with noise at masked positions)
+        context_repr, _ = self.context_encoder(context_spectrogram)
+        
+        # Encode target with frozen encoder
+        with torch.no_grad():
+            target_repr, _ = self.target_encoder(target_spectrogram)
+        
+        # Pass mask to predictor
+        pred = self.predictor(context_repr, mask=mask)
+        
+        # Compute loss only on masked positions
+        loss = ((pred - target_repr)**2 * mask.unsqueeze(-1)).mean()
         return loss
 
     def train_forward(self, context_spectrogram, target_spectrogram):

@@ -14,27 +14,27 @@ from torch.utils.data import DataLoader
 class TestDataClass(unittest.TestCase):
     def setUp(self):
         # set up dataset and dataloader
-        self.data_dir = "/media/george-vengrovski/George-SSD/llb_stuff/llb3_test"  # update this
+        self.data_dir = "/media/george-vengrovski/George-SSD/llb_stuff/llb3_test"
         self.dataset = BirdJEPA_Dataset(data_dir=self.data_dir, segment_len=1000, verbose=True)
         self.loader = DataLoader(self.dataset, batch_size=2,
-                                 collate_fn=lambda batch: collate_fn(
-                                     batch,
-                                     segment_length=1000,
-                                     mask_p=0.5,
-                                     verbose=True
-                                 ))
+                               collate_fn=lambda batch: collate_fn(
+                                   batch,
+                                   segment_length=1000,
+                                   mask_p=0.5,
+                                   verbose=True
+                               ))
 
     def test_dataclass(self):
         # get a single batch
         batch = next(iter(self.loader))
-        full_spectrogram, target_spectrogram, context_spectrogram, ground_truth_labels, vocalization, file_names = batch
+        full_spectrogram, target_spectrogram, context_spectrogram, ground_truth_labels, mask, file_names = batch
 
         print("==== test_dataclass ====")
         print("full_spectrogram shape:", full_spectrogram.shape)
         print("target_spectrogram shape:", target_spectrogram.shape)
         print("context_spectrogram shape:", context_spectrogram.shape)
         print("ground_truth_labels shape:", ground_truth_labels.shape)
-        print("vocalization shape:", vocalization.shape)
+        print("mask shape:", mask.shape)
         print("file_names:", file_names)
 
         os.makedirs("test_outputs", exist_ok=True)
@@ -92,10 +92,10 @@ class TestDataClass(unittest.TestCase):
         self.assertIsInstance(context_spectrogram, torch.Tensor)
         self.assertIsInstance(target_spectrogram, torch.Tensor)
         self.assertIsInstance(ground_truth_labels, torch.Tensor)
-        self.assertIsInstance(vocalization, torch.Tensor)
+        self.assertIsInstance(mask, torch.Tensor)
         self.assertTrue(len(file_names) == full_spectrogram.size(0))
-        # check masking occurred with -1
-        self.assertTrue((context_spectrogram[0] == -1).any())
+        # check masking occurred by verifying noise in context spectrogram where mask is True
+        self.assertTrue((context_spectrogram[0, :, mask[0]] != full_spectrogram[0, :, mask[0]]).all())
 
 if __name__ == '__main__':
     unittest.main()

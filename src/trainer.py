@@ -13,6 +13,7 @@ import torch.nn.functional as F
 import argparse
 import shutil
 from datetime import datetime
+import math
 
 class ModelTrainer:
     def __init__(self, model, train_loader, test_loader, optimizer, device, 
@@ -57,9 +58,22 @@ class ModelTrainer:
         self.predictions_subfolder_path = os.path.join(self.experiment_dir, 'predictions')
         os.makedirs(self.predictions_subfolder_path, exist_ok=True)
         
-        # Learning rate scheduler
-        self.scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
-            self.optimizer, T_max=max_steps)
+        # Learning rate scheduler with warmup and cosine decay
+        self.warmup_steps = 15 * 1000  # 15 "epochs" * 1000 steps
+        self.initial_lr = 1e-4
+        self.peak_lr = 1e-3
+        self.final_lr = 1e-6
+        
+        # Weight decay scheduler
+        self.initial_wd = 0.04
+        self.final_wd = 0.4
+        
+        # EMA momentum scheduler
+        self.initial_momentum = 0.996
+        self.final_momentum = 1.0
+        
+        # Replace existing scheduler with custom learning rate scheduling
+        self.scheduler = None  # Remove the existing scheduler
 
     def embedding_variance(self, embeddings):
         # Calculate variance of embeddings
@@ -71,8 +85,11 @@ class ModelTrainer:
             'step': step,
             'model_state_dict': self.model.state_dict(),
             'optimizer_state_dict': self.optimizer.state_dict(),
-            'scheduler_state_dict': self.scheduler.state_dict(),
         }
+        
+        # Only include scheduler if it exists
+        if self.scheduler is not None:
+            checkpoint['scheduler_state_dict'] = self.scheduler.state_dict()
         
         checkpoint_path = os.path.join(self.weights_save_dir, f'checkpoint_{step}.pt')
         torch.save(checkpoint, checkpoint_path)
@@ -288,19 +305,12 @@ class ModelTrainer:
         plt.savefig(os.path.join(self.predictions_subfolder_path, f'Decoder_Reconstruction_{step}.png'), format="png")
         plt.close(fig)
 
-    def validate_model(self, step, context_spec, target_spec, vocalization):
+    def validate_model(self, step, context_spec, target_spec, mask, vocalization):
         self.model.eval()
         with torch.no_grad():
-            # Clean context input by zeroing masked positions
-            context_clean = torch.where(context_spec == -1.0, 
-                                      torch.zeros_like(context_spec), 
-                                      context_spec)
-            
-            context_repr, context_intermediate = self.model.context_encoder(context_clean)
+            # Get model predictions using mask
+            context_repr, context_intermediate = self.model.context_encoder(context_spec)
             target_repr, target_intermediate = self.model.target_encoder(target_spec)
-            
-            # Extract mask from context_spec (where values are -1.0)
-            mask = (context_spec == -1.0).any(dim=1)  # (B,T)
             
             # Pass mask to predictor
             pred_sequence = self.model.predictor(context_repr, mask=mask)
@@ -383,20 +393,15 @@ class ModelTrainer:
             break
 
     def moving_average(self, values, window):
-        if len(values) < window:
+        if len(values) == 0:
             return []
         
-        # Convert tensors to CPU numpy arrays if needed
-        numpy_values = []
-        for v in values:
-            if torch.is_tensor(v):
-                numpy_values.append(v.detach().cpu().numpy())
-            else:
-                numpy_values.append(v)
-        
-        weights = np.repeat(1.0, window) / window
-        sma = np.convolve(numpy_values, weights, 'valid')
-        return sma.tolist()
+        # Exponential Moving Average
+        alpha = 2 / (window + 1)  # Smoothing factor
+        ema = [values[0]]  # Initialize with first value
+        for i in range(1, len(values)):
+            ema.append(alpha * values[i] + (1 - alpha) * ema[-1])
+        return ema
 
     def get_network_stats(self, network, name):
         """Get gradient and weight statistics for a network"""
@@ -424,6 +429,43 @@ class ModelTrainer:
             f"{name}_weight_max": weight_max,
             f"{name}_param_count": param_count
         }
+
+    def adjust_learning_rate(self, step):
+        """Custom learning rate schedule with warmup and cosine decay"""
+        if step < self.warmup_steps:
+            # Linear warmup
+            lr = self.initial_lr + (self.peak_lr - self.initial_lr) * (step / self.warmup_steps)
+        else:
+            # Cosine decay from peak_lr to final_lr
+            progress = (step - self.warmup_steps) / (self.max_steps - self.warmup_steps)
+            lr = self.final_lr + 0.5 * (self.peak_lr - self.final_lr) * (1 + math.cos(math.pi * progress))
+        
+        # Update learning rate
+        for param_group in self.optimizer.param_groups:
+            param_group['lr'] = lr
+        
+        return lr
+
+    def adjust_weight_decay(self, step):
+        """Linear weight decay schedule"""
+        progress = step / self.max_steps
+        weight_decay = self.initial_wd + (self.final_wd - self.initial_wd) * progress
+        
+        # Update weight decay
+        for param_group in self.optimizer.param_groups:
+            param_group['weight_decay'] = weight_decay
+        
+        return weight_decay
+
+    def adjust_momentum(self, step):
+        """Linear momentum schedule for target encoder EMA"""
+        progress = step / self.max_steps
+        momentum = self.initial_momentum + (self.final_momentum - self.initial_momentum) * progress
+        
+        # Update momentum in model's EMA
+        self.model.ema_m = momentum
+        
+        return momentum
 
     def train(self, continue_training=False, training_stats=None, last_step=0):
         step = last_step + 1 if continue_training else 0
@@ -464,37 +506,35 @@ class ModelTrainer:
                     test_iter = iter(self.test_iter)
                     continue
 
-            # Unpack batches
-            full_spectrogram, target_spectrogram, context_spectrogram, ground_truth_labels, vocalization, file_names = train_batch
-            val_full_spect, val_target_spect, val_context_spect, val_labels, val_vocalization, val_file_names = val_batch
+            # Unpack batch with mask
+            full_spectrogram, target_spectrogram, context_spectrogram, ground_truth_labels, mask, file_names = train_batch
+            val_full_spect, val_target_spect, val_context_spect, val_labels, val_mask, val_file_names = val_batch
             
-            # Move to device
+            # Move everything to device
             context_spectrogram = context_spectrogram.to(self.device)
             target_spectrogram = target_spectrogram.to(self.device)
-            val_context_spect = val_context_spect.to(self.device)
-            val_target_spect = val_target_spect.to(self.device)
-            val_vocalization = val_vocalization.to(self.device) if torch.is_tensor(val_vocalization) else val_vocalization
-
-            # Training step
+            mask = mask.to(self.device)  # Move mask to device
+            
+            # Training step with mask
             self.model.train()
             with autocast():
-                loss = self.model.training_step(context_spectrogram, target_spectrogram)
+                loss = self.model.training_step(context_spectrogram, target_spectrogram, mask)
 
             self.optimizer.zero_grad()
             scaler.scale(loss).backward()
             scaler.step(self.optimizer)
             scaler.update()
-            self.scheduler.step()
-
+            
             # Periodically train decoder
             if step % 1000 == 0:
                 self.train_decoder()
 
             # Validation step
             val_loss, masked_seq_acc, unmasked_seq_acc = self.validate_model(
-                step, context_spec=val_context_spect, 
-                target_spec=val_target_spect, 
-                vocalization=val_vocalization
+                step, context_spec=val_context_spect.to(self.device), 
+                target_spec=val_target_spect.to(self.device), 
+                mask=val_mask.to(self.device),
+                vocalization=val_labels.to(self.device)  # Use val_labels instead of val_vocalization
             )
 
             # Update statistics
@@ -512,16 +552,23 @@ class ModelTrainer:
                     target_var = self.embedding_variance(target_repr)
 
                 # Calculate smoothed losses
-                if len(raw_loss_list) >= self.trailing_avg_window:
-                    smoothed_training_loss = self.moving_average(raw_loss_list, self.trailing_avg_window)[-1]
-                    smoothed_val_loss = self.moving_average(raw_val_loss_list, self.trailing_avg_window)[-1]
-                else:
+                if step == 0:
+                    # For first step, just use raw values
                     smoothed_training_loss = loss.item()
                     smoothed_val_loss = val_loss
+                else:
+                    # Use EMA for subsequent steps
+                    recent_train_losses = raw_loss_list[-self.trailing_avg_window:]
+                    recent_val_losses = raw_val_loss_list[-self.trailing_avg_window:]
+                    
+                    smoothed_values = self.moving_average(recent_train_losses, self.trailing_avg_window)
+                    smoothed_training_loss = smoothed_values[-1] if smoothed_values else loss.item()
+                    
+                    smoothed_values = self.moving_average(recent_val_losses, self.trailing_avg_window)
+                    smoothed_val_loss = smoothed_values[-1] if smoothed_values else val_loss
 
-                # Single consolidated print statement
-                print(f"\nStep [{step}/{self.max_steps}] - Train Loss: {smoothed_training_loss:.4f}, "
-                      f"Val Loss: {smoothed_val_loss:.4f}, Vars [C/T]: {context_var:.4f}/{target_var:.4f}")
+                print(f"\nStep [{step}/{self.max_steps}] - Smoothed Train Loss: {smoothed_training_loss:.4f}, "
+                      f"Smoothed Val Loss: {smoothed_val_loss:.4f}, Vars [C/T]: {context_var:.4f}/{target_var:.4f}")
 
                 if smoothed_val_loss < best_val_loss:
                     best_val_loss = smoothed_val_loss
@@ -564,17 +611,19 @@ class ModelTrainer:
         masked_seq_acc = training_stats['masked_seq_acc']
         unmasked_seq_acc = training_stats['unmasked_seq_acc']
 
+        # Calculate smoothed values
         smoothed_training_losses = self.moving_average(training_losses, self.trailing_avg_window)
         smoothed_validation_losses = self.moving_average(validation_losses, self.trailing_avg_window)
         smoothed_masked_seq_acc = self.moving_average(masked_seq_acc, self.trailing_avg_window)
         smoothed_unmasked_seq_acc = self.moving_average(unmasked_seq_acc, self.trailing_avg_window)
 
-        smoothed_steps = steps[self.trailing_avg_window - 1:] if len(steps) >= self.trailing_avg_window else steps
+        # Create corresponding steps arrays that match the smoothed data lengths
+        smoothed_steps = steps[:len(smoothed_training_losses)]
 
         plt.figure(figsize=(16, 12))
 
         plt.subplot(2, 2, 1)
-        if smoothed_training_losses and smoothed_validation_losses:
+        if len(smoothed_training_losses) > 0 and len(smoothed_validation_losses) > 0:
             plt.plot(smoothed_steps, smoothed_training_losses, label='Smoothed Training Loss')
             plt.plot(smoothed_steps, smoothed_validation_losses, label='Smoothed Validation Loss')
         else:
@@ -586,7 +635,7 @@ class ModelTrainer:
         plt.legend()
 
         plt.subplot(2, 2, 2)
-        if smoothed_masked_seq_acc and smoothed_unmasked_seq_acc:
+        if len(smoothed_masked_seq_acc) > 0 and len(smoothed_unmasked_seq_acc) > 0:
             plt.plot(smoothed_steps, smoothed_masked_seq_acc, label='Smoothed Masked Seq Loss')
             plt.plot(smoothed_steps, smoothed_unmasked_seq_acc, label='Smoothed Unmasked Seq Loss')
         else:
@@ -618,25 +667,25 @@ if __name__ == '__main__':
     parser.add_argument('--train_dir', type=str, required=True)
     parser.add_argument('--test_dir', type=str, required=True)
     parser.add_argument('--steps', type=int, default=1000)
-    parser.add_argument('--batch_size', type=int, default=8)
-    parser.add_argument('--lr', type=float, default=1e-4)
+    parser.add_argument('--batch_size', type=int, default=256)
+    parser.add_argument('--lr', type=float, default=1e-3)
     parser.add_argument('--name', type=str, required=True, help='Name of the experiment')
     parser.add_argument('--eval_interval', type=int, default=100, help='How often to run validation')
     parser.add_argument('--input_dim', type=int, default=513, help='Input dimension (frequency bins)')
-    parser.add_argument('--hidden_dim', type=int, default=64, help='Hidden dimension for encoders')
-    parser.add_argument('--num_layers', type=int, default=2, help='Number of transformer layers for encoders')
-    parser.add_argument('--num_heads', type=int, default=2, help='Number of attention heads for encoders')
-    parser.add_argument('--dropout', type=float, default=0.2, help='Dropout rate')
-    parser.add_argument('--mlp_dim', type=int, default=128, help='MLP hidden dimension for encoders')
-    parser.add_argument('--pred_hidden_dim', type=int, default=64, help='Hidden dimension for predictor')
-    parser.add_argument('--pred_num_layers', type=int, default=2, help='Number of transformer layers for predictor')
-    parser.add_argument('--pred_num_heads', type=int, default=2, help='Number of attention heads for predictor')
+    parser.add_argument('--hidden_dim', type=int, default=256, help='Hidden dimension for encoders')
+    parser.add_argument('--num_layers', type=int, default=4, help='Number of transformer layers for encoders')
+    parser.add_argument('--num_heads', type=int, default=8, help='Number of attention heads for encoders')
+    parser.add_argument('--dropout', type=float, default=0.1, help='Dropout rate')
+    parser.add_argument('--mlp_dim', type=int, default=1024, help='MLP hidden dimension for encoders')
+    parser.add_argument('--pred_hidden_dim', type=int, default=256, help='Hidden dimension for predictor')
+    parser.add_argument('--pred_num_layers', type=int, default=3, help='Number of transformer layers for predictor')
+    parser.add_argument('--pred_num_heads', type=int, default=4, help='Number of attention heads for predictor')
     parser.add_argument('--pred_mlp_ratio', type=float, default=4.0, help='MLP ratio for predictor')
     parser.add_argument('--max_seq_len', type=int, default=500, help='Maximum sequence length for predictor')
     parser.add_argument('--overfit_batch', action='store_true', 
                        help='Whether to overfit on a single batch (default: False)')
-    parser.add_argument('--mask_ratio', type=float, default=0.75,
-                       help='Ratio of timesteps to mask (default: 0.75)')
+    parser.add_argument('--mask_ratio', type=float, default=0.2,
+                       help='Ratio of timesteps to mask (default: 0.2)')
     parser.add_argument('--verbose', action='store_true',
                        help='Enable verbose output during training')
     args = parser.parse_args()
@@ -701,9 +750,13 @@ if __name__ == '__main__':
         pred_mlp_ratio=args.pred_mlp_ratio,
         max_seq_len=args.max_seq_len
     ).to(device)
-    opt = torch.optim.Adam(list(model.context_encoder.parameters()) + 
-                          list(model.predictor.parameters()) + 
-                          list(model.decoder.parameters()), lr=args.lr)
+    opt = torch.optim.AdamW(
+        list(model.context_encoder.parameters()) + 
+        list(model.predictor.parameters()) + 
+        list(model.decoder.parameters()),
+        lr=1e-4,  # Initial learning rate
+        weight_decay=0.04  # Initial weight decay
+    )
 
     # Create config dictionary
     config = {

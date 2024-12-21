@@ -65,10 +65,10 @@ class BirdJEPA_Dataset(Dataset):
             segment = spec[:, start:start+self.segment_len]
             segment_labels = ground_truth_labels[start:start+self.segment_len]  # Get corresponding labels
 
-            # normalize along frequency dimension: min-max per frequency bin
-            min_val = np.min(segment, axis=1, keepdims=True)   # (D,1)
-            max_val = np.max(segment, axis=1, keepdims=True)
-            segment = (segment - min_val) / (max_val - min_val + 1e-8)
+            # Replace min-max normalization with z-score normalization
+            mean_val = np.mean(segment, axis=1, keepdims=True)   # (D,1)
+            std_val = np.std(segment, axis=1, keepdims=True)     # (D,1)
+            segment = (segment - mean_val) / (std_val + 1e-8)    # Add epsilon for numerical stability
 
             segment = torch.from_numpy(segment).float()  # shape (D, segment_len)
             segment_labels = torch.from_numpy(segment_labels).long()  # Convert labels to tensor
@@ -94,7 +94,7 @@ def collate_fn(batch, segment_length=500, mask_p=0.75, verbose=False):
     if verbose:
         print(f"Stacked batch shape: {segs.shape}")
 
-    # create mask along time dimension (T)
+    # Create mask along time dimension (T)
     mask = torch.zeros(B, T, dtype=torch.bool)
     for b in range(B):
         remaining_timesteps_to_mask = int(mask_p * T)
@@ -103,25 +103,20 @@ def collate_fn(batch, segment_length=500, mask_p=0.75, verbose=False):
             t_start = random.randint(0, T - block_size)
             mask[b, t_start:t_start+block_size] = True
             remaining_timesteps_to_mask -= block_size
-            if verbose:
-                print(f"Applied mask block: batch {b}, time {t_start}-{t_start+block_size}")
 
+    # Clone spectrograms
     full_spectrogram = segs.clone()       # (B,F,T)
     context_spectrogram = segs.clone()    # (B,F,T)
-    target_spectrogram = segs.clone()     # Changed from zeros_like to clone
+    target_spectrogram = segs.clone()     # (B,F,T)
 
-    # apply mask per sample (mask entire freq bins at masked timesteps)
+    # Apply masking using noise
     for b in range(B):
-        # For context: set masked timesteps to -1.0
-        context_spectrogram[b, :, mask[b]] = -1.0
-        # For target: set unmasked timesteps to -1.0
-        target_spectrogram[b, :, ~mask[b]] = -1.0  # Using ~mask[b] to invert the mask
+        noise_context = torch.randn_like(context_spectrogram[b, :, mask[b]])
+        noise_target = torch.randn_like(target_spectrogram[b, :, ~mask[b]])
+        
+        context_spectrogram[b, :, mask[b]] = noise_context
+        target_spectrogram[b, :, ~mask[b]] = noise_target
 
-    # Create dummy vocalization tensor (same shape as labels)
-    vocalization = labels
-
+    # Return mask tensor directly
     file_names = [f"dummy_{i}.npy" for i in range(B)]
-
-    if verbose:
-        print("Returning collated batch.")
-    return full_spectrogram, target_spectrogram, context_spectrogram, labels, vocalization, file_names
+    return full_spectrogram, target_spectrogram, context_spectrogram, labels, mask, file_names
