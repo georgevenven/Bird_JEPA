@@ -76,38 +76,28 @@ class PredictorViT(nn.Module):
                  hidden_dim=384,  
                  depth=6,         
                  num_heads=6, 
-                 mlp_ratio=4.0, 
+                 mlp_dim=1024,
                  dropout=0.1,
                  max_len=512):   
         super().__init__()
         self.hidden_dim = hidden_dim
         self.dropout = nn.Dropout(dropout)
-        self.mask_token = nn.Parameter(torch.randn(1, 1, hidden_dim))
 
         self.layers = nn.ModuleList([
             CustomEncoderBlock(
                 d_model=hidden_dim,
                 num_heads=num_heads,
-                ffn_dim=int(hidden_dim * mlp_ratio),
+                ffn_dim=mlp_dim,
                 dropout=dropout,
                 pos_enc_type="relative",
                 length=max_len
             ) for _ in range(depth)
         ])
 
-    def forward(self, x, mask):
+    def forward(self, x):
         # x: (B,T,H) context embeddings
-        # mask: (B,T) boolean mask indicating masked positions
         B, T, H = x.shape
         assert x.shape == (B, T, H), f"Input shape wrong: {x.shape}"
-        assert mask.shape == (B, T), f"Mask shape wrong: {mask.shape}"
-        
-        # Expand mask tokens
-        mask_tokens = self.mask_token.expand(B, T, H)  # (B,T,H)
-        
-        # Keep mask as (B,T), don't add extra dimension
-        x = torch.where(mask.unsqueeze(-1), mask_tokens, x)
-        assert x.shape == (B, T, H), f"After masking shape wrong: {x.shape}"
         
         # Apply transformer layers
         for block in self.layers:
@@ -127,7 +117,7 @@ class BirdJEPA(nn.Module):
                  pred_hidden_dim=384,
                  pred_num_layers=6,
                  pred_num_heads=6,
-                 pred_mlp_ratio=4.0,
+                 pred_mlp_dim=1024,
                  max_seq_len=512):
         super().__init__()
         
@@ -156,12 +146,12 @@ class BirdJEPA(nn.Module):
                                 mlp_ratio=mlp_dim/hidden_dim,
                                 max_len=max_seq_len)
 
-        # Predictor ViT with configurable parameters
+        # Predictor ViT with explicit MLP dimension
         self.predictor = PredictorViT(
             hidden_dim=pred_hidden_dim,
             depth=pred_num_layers,
             num_heads=pred_num_heads,
-            mlp_ratio=pred_mlp_ratio,
+            mlp_dim=pred_mlp_dim,
             dropout=dropout,
             max_len=max_seq_len
         )
@@ -169,7 +159,7 @@ class BirdJEPA(nn.Module):
         # Decoder now matches predictor's dimension
         self.decoder = nn.Linear(pred_hidden_dim, input_dim)
         
-        # Initialize EMA for target encoder
+        # Initialize EMA with lower momentum
         self.ema_updater = EMA(0.999)
         self.ema_m = 0.999
         
@@ -185,12 +175,10 @@ class BirdJEPA(nn.Module):
 
     def forward(self, context_spectrogram, target_spectrogram, use_no_mask=False):
         # Get mask from context spectrogram (True where masked)
-        mask = (context_spectrogram == -1.0).any(dim=1)  # (B,T)
+        mask = (context_spectrogram == 0.0).any(dim=1)  # Changed from -1.0 to 0.0
         
-        # Clean context input by zeroing masked positions
-        context_clean = torch.where(context_spectrogram == -1.0, 
-                                  torch.zeros_like(context_spectrogram), 
-                                  context_spectrogram)
+        # Clean context input by zeroing masked positions (no change needed here since already zeros)
+        context_clean = context_spectrogram  # Simplified since input is already properly masked
         
         # Encode context
         context_repr, _ = self.context_encoder(context_clean)
@@ -200,7 +188,7 @@ class BirdJEPA(nn.Module):
             target_repr, _ = self.target_encoder(target_spectrogram)
         
         # Pass mask to predictor
-        pred = self.predictor(context_repr, mask=mask)  # (B,T,H)
+        pred = self.predictor(context_repr)  # (B,T,H)
         return pred, target_repr
 
     def training_step(self, context_spectrogram, target_spectrogram, mask):
@@ -218,24 +206,18 @@ class BirdJEPA(nn.Module):
             target_repr, _ = self.target_encoder(target_spectrogram)
         
         # Pass mask to predictor
-        pred = self.predictor(context_repr, mask=mask)
+        pred = self.predictor(context_repr)
         
         # Compute loss only on masked positions
         loss = ((pred - target_repr)**2 * mask.unsqueeze(-1)).mean()
         return loss
 
     def train_forward(self, context_spectrogram, target_spectrogram):
-        # context_spectrogram: (B,D,T) with -1.0 at masked positions
-        # target_spectrogram: (B,D,T) with original values at masked positions
-        mask = (context_spectrogram == -1.0)
+        # context_spectrogram: (B,D,T) already masked from dataloader
+        # target_spectrogram: (B,D,T) already contains original values
         
-        # Zero out masked positions in context
-        context_clean = torch.where(context_spectrogram == -1.0, 
-                                  torch.zeros_like(context_spectrogram), 
-                                  context_spectrogram)
-
-        # encode context
-        context_repr, intermediate_outputs = self.context_encoder(context_clean)
+        # encode context (using already masked input)
+        context_repr, intermediate_outputs = self.context_encoder(context_spectrogram)
         
         # encode target with frozen target encoder
         with torch.no_grad():

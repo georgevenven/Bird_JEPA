@@ -65,9 +65,9 @@ class BirdJEPA_Dataset(Dataset):
             segment = spec[:, start:start+self.segment_len]
             segment_labels = ground_truth_labels[start:start+self.segment_len]  # Get corresponding labels
 
-            # Replace min-max normalization with z-score normalization
-            mean_val = np.mean(segment, axis=1, keepdims=True)   # (D,1)
-            std_val = np.std(segment, axis=1, keepdims=True)     # (D,1)
+            # Replace column-wise z-score normalization with global z-score normalization
+            mean_val = np.mean(segment)    # Single scalar mean
+            std_val = np.std(segment)      # Single scalar std
             segment = (segment - mean_val) / (std_val + 1e-8)    # Add epsilon for numerical stability
 
             segment = torch.from_numpy(segment).float()  # shape (D, segment_len)
@@ -83,19 +83,27 @@ class BirdJEPA_Dataset(Dataset):
             return self.__getitem__(random.randint(0, len(self.files)-1))
 
 def collate_fn(batch, segment_length=500, mask_p=0.75, verbose=False):
-    # batch: list of tuples (spectrogram, labels)
     # Unzip the batch into separate lists
     specs, labels = zip(*batch)
     
     # stack -> (B,F,T)
     segs = torch.stack(specs, dim=0)  # (B,F,T)
     labels = torch.stack(labels, dim=0)  # (B,T)
-    B, F, T = segs.shape
+    
+    # Create full_spectrogram before any masking
+    full_spectrogram = segs.clone()  # This should be completely unmasked
+    
+    # Get batch size and sequence length
+    B, F, T = segs.shape  # Define B here before using it
+    
     if verbose:
-        print(f"Stacked batch shape: {segs.shape}")
-
+        print(f"DEBUG: full_spectrogram shape before any processing: {full_spectrogram.shape}")
+        print(f"DEBUG: full_spectrogram contains -1?: {(full_spectrogram == -1).any().item()}")
+    
+    # Create mask
+    mask = torch.zeros(B, T, dtype=torch.bool)  # Now B is defined
+    
     # Create mask along time dimension (T)
-    mask = torch.zeros(B, T, dtype=torch.bool)
     for b in range(B):
         remaining_timesteps_to_mask = int(mask_p * T)
         while remaining_timesteps_to_mask > 0:
@@ -105,18 +113,29 @@ def collate_fn(batch, segment_length=500, mask_p=0.75, verbose=False):
             remaining_timesteps_to_mask -= block_size
 
     # Clone spectrograms
-    full_spectrogram = segs.clone()       # (B,F,T)
     context_spectrogram = segs.clone()    # (B,F,T)
     target_spectrogram = segs.clone()     # (B,F,T)
 
-    # Apply masking using noise
+    # Apply masking using zeros instead of noise
     for b in range(B):
-        noise_context = torch.randn_like(context_spectrogram[b, :, mask[b]])
-        noise_target = torch.randn_like(target_spectrogram[b, :, ~mask[b]])
-        
-        context_spectrogram[b, :, mask[b]] = noise_context
-        target_spectrogram[b, :, ~mask[b]] = noise_target
+        context_spectrogram[b, :, mask[b]] = 0  # Replace with zeros for masked regions
+        target_spectrogram[b, :, ~mask[b]] = 0  # Zero out unmasked regions in target
 
     # Return mask tensor directly
     file_names = [f"dummy_{i}.npy" for i in range(B)]
+    
+    # Add shape and value range debugging
+    if verbose:
+        print("\nShape Information:")
+        print(f"full_spectrogram: {full_spectrogram.shape}")
+        print(f"target_spectrogram: {target_spectrogram.shape}")
+        print(f"context_spectrogram: {context_spectrogram.shape}")
+        print(f"labels: {labels.shape}")
+        print(f"mask: {mask.shape}")
+        
+        print("\nValue Ranges:")
+        print(f"full_spectrogram: min={full_spectrogram.min().item():.3f}, max={full_spectrogram.max().item():.3f}, avg={full_spectrogram.mean().item():.3f}")
+        print(f"target_spectrogram: min={target_spectrogram.min().item():.3f}, max={target_spectrogram.max().item():.3f}, avg={target_spectrogram.mean().item():.3f}")
+        print(f"context_spectrogram: min={context_spectrogram.min().item():.3f}, max={context_spectrogram.max().item():.3f}, avg={context_spectrogram.mean().item():.3f}")
+        
     return full_spectrogram, target_spectrogram, context_spectrogram, labels, mask, file_names

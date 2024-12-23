@@ -19,8 +19,8 @@ class ModelTrainer:
     def __init__(self, model, train_loader, test_loader, optimizer, device, 
                  max_steps=1000, eval_interval=100, save_interval=500,
                  weights_save_dir="saved_weights", experiment_dir="experiments",
-                 trailing_avg_window=100, early_stopping=True, patience=10,
-                 verbose=False, overfit_single_batch=False):
+                 trailing_avg_window=100, early_stopping=True, patience=4,
+                 ema_momentum=0.999, verbose=False, overfit_single_batch=False):
         self.model = model
         self.train_iter = train_loader
         self.test_iter = test_loader
@@ -30,8 +30,8 @@ class ModelTrainer:
         self.eval_interval = eval_interval
         self.save_interval = save_interval
         self.trailing_avg_window = trailing_avg_window
-        self.early_stopping = early_stopping
-        self.patience = patience
+        self.early_stopping = early_stopping  # Will be set by grid search
+        self.patience = patience            # Will be set by grid search
         self.verbose = verbose
         self.overfit_single_batch = overfit_single_batch
         
@@ -58,22 +58,39 @@ class ModelTrainer:
         self.predictions_subfolder_path = os.path.join(self.experiment_dir, 'predictions')
         os.makedirs(self.predictions_subfolder_path, exist_ok=True)
         
-        # Learning rate scheduler with warmup and cosine decay
-        self.warmup_steps = 15 * 1000  # 15 "epochs" * 1000 steps
-        self.initial_lr = 1e-4
-        self.peak_lr = 1e-3
-        self.final_lr = 1e-6
+        # Comment out learning rate scheduling parameters
+        # self.warmup_steps = 15 * 1000
+        # self.initial_lr = 5e-3
+        # self.peak_lr = 5e-3
+        # self.final_lr = 1e-6
+        
+        # Remove scheduler reference
+        # self.scheduler = None
         
         # Weight decay scheduler
-        self.initial_wd = 0.04
-        self.final_wd = 0.4
+        # self.initial_wd = 0.04
+        # self.final_wd = 0.4
         
-        # EMA momentum scheduler
-        self.initial_momentum = 0.996
+        # EMA momentum parameters
+        self.initial_momentum = ema_momentum
         self.final_momentum = 1.0
         
+        # Update model's EMA momentum
+        self.model.ema_m = ema_momentum
+        self.model.ema_updater = EMA(ema_momentum)
+        
         # Replace existing scheduler with custom learning rate scheduling
-        self.scheduler = None  # Remove the existing scheduler
+        # self.scheduler = None  # Remove the existing scheduler
+
+        # Print early stopping configuration
+        if self.early_stopping:
+            print(f"\nEarly Stopping Configuration:")
+            print(f"Patience: {self.patience} validation intervals")
+            print(f"Will stop after {self.patience * self.eval_interval} steps without improvement")
+
+        print(f"\nEMA Configuration:")
+        print(f"Initial momentum: {self.initial_momentum}")
+        print(f"Final momentum: {self.final_momentum}")
 
     def embedding_variance(self, embeddings):
         # Calculate variance of embeddings
@@ -87,9 +104,9 @@ class ModelTrainer:
             'optimizer_state_dict': self.optimizer.state_dict(),
         }
         
-        # Only include scheduler if it exists
-        if self.scheduler is not None:
-            checkpoint['scheduler_state_dict'] = self.scheduler.state_dict()
+        # Remove scheduler check and save
+        # if self.scheduler is not None:
+        #     checkpoint['scheduler_state_dict'] = self.scheduler.state_dict()
         
         checkpoint_path = os.path.join(self.weights_save_dir, f'checkpoint_{step}.pt')
         torch.save(checkpoint, checkpoint_path)
@@ -266,35 +283,26 @@ class ModelTrainer:
         plt.savefig(os.path.join(self.predictions_subfolder_path, f'Latent_Predictions_{step}.png'), format="png")
         plt.close(fig)
 
-    def visualize_decoder_reconstruction(self, step, original_spec, decoded_pred, mask):
-        """Visualize the decoder's reconstruction"""
+    def visualize_decoder_reconstruction(self, step, original_spec, decoded_pred, context_repr, mask):
+        """Visualize the decoder's reconstruction with context embeddings"""
         # Ensure decoded_pred is in the right shape (B, D, T)
         if decoded_pred.shape[1] != original_spec.shape[1]:
             decoded_pred = decoded_pred.transpose(1, 2)
         
         # Use 2:1 aspect ratio for each subplot
-        fig, axs = plt.subplots(2, 2, figsize=(20, 10))
-        axs = axs.flatten()
+        fig, axs = plt.subplots(1, 3, figsize=(30, 5))
 
-        # Plot 1: Original spectrogram
+        # Plot 1: Original input spectrogram
         im = axs[0].imshow(original_spec[0].cpu().numpy(), aspect='auto', origin='lower')
-        axs[0].set_title('Original Spectrogram', fontsize=35, pad=20)
-        self._add_mask_overlay(axs[0], mask[0])
+        axs[0].set_title('Input Spectrogram', fontsize=35, pad=20)
 
-        # Plot 2: Decoded prediction
-        im = axs[1].imshow(decoded_pred[0].cpu().detach().numpy(), aspect='auto', origin='lower')
-        axs[1].set_title('Decoded Prediction', fontsize=35, pad=20)
-        self._add_mask_overlay(axs[1], mask[0])
+        # Plot 2: Context embeddings
+        im = axs[1].imshow(context_repr[0].cpu().detach().numpy().T, aspect='auto', origin='lower')
+        axs[1].set_title('Context Embeddings', fontsize=35, pad=20)
 
-        # Plot 3: Error heatmap for full reconstruction
-        error_map = (decoded_pred[0] - original_spec[0]).cpu().detach().numpy() ** 2
-        im = axs[2].imshow(error_map, aspect='auto', origin='lower', cmap='hot')
-        axs[2].set_title('Full Reconstruction Error', fontsize=35, pad=20)
-
-        # Plot 4: Error heatmap for masked regions only
-        masked_error = error_map * mask[0].cpu().numpy()
-        im = axs[3].imshow(masked_error, aspect='auto', origin='lower', cmap='hot')
-        axs[3].set_title('Masked Regions Error', fontsize=35, pad=20)
+        # Plot 3: Decoder reconstruction
+        im = axs[2].imshow(decoded_pred[0].cpu().detach().numpy(), aspect='auto', origin='lower')
+        axs[2].set_title('Decoder Reconstruction', fontsize=35, pad=20)
 
         # Remove legends and ticks
         for ax in axs:
@@ -308,12 +316,12 @@ class ModelTrainer:
     def validate_model(self, step, context_spec, target_spec, mask, vocalization):
         self.model.eval()
         with torch.no_grad():
-            # Get model predictions using mask
+            # Get model predictions (removed mask from predictor call)
             context_repr, context_intermediate = self.model.context_encoder(context_spec)
             target_repr, target_intermediate = self.model.target_encoder(target_spec)
             
-            # Pass mask to predictor
-            pred_sequence = self.model.predictor(context_repr, mask=mask)
+            # Remove mask argument from predictor call
+            pred_sequence = self.model.predictor(context_repr)
             
             # Calculate latent space loss properly across all batches
             masked_latent_loss = ((pred_sequence - target_repr)**2 * mask.unsqueeze(-1)).mean()
@@ -349,14 +357,7 @@ class ModelTrainer:
                 plt.savefig(os.path.join(self.predictions_subfolder_path, 
                            f'Encoders_Activations_{step}.png'), format="png")
                 plt.close()
-                
-                # Decoder reconstruction visualization
-                if step % 1000 == 0:
-                    self.visualize_decoder_reconstruction(
-                        step, original_spec=target_spec,
-                        decoded_pred=decoded_pred, mask=mask
-                    )
-            
+
             # Calculate sequence accuracies (for tracking)
             mask_expanded = mask.unsqueeze(1)
             masked_seq_acc = ((decoded_pred - target_spec)**2 * mask_expanded.float()).mean()
@@ -364,33 +365,84 @@ class ModelTrainer:
             
             return masked_latent_loss.item(), masked_seq_acc.item(), unmasked_seq_acc.item()
 
-    def train_decoder(self):
-        """Periodically train decoder on unmasked data"""
-        self.model.context_encoder.eval()  # Freeze context encoder
+    def train_decoder(self, num_batches=100, step=0):
+        """Train decoder on unmasked data using context encoder in inference mode"""
+        print("\nTraining decoder...")
+        self.model.context_encoder.eval()  # Set context encoder to eval mode
         self.model.decoder.train()  # Set decoder to training mode
-        decoder_optimizer = torch.optim.Adam(self.model.decoder.parameters(), lr=1e-4)
+        decoder_optimizer = torch.optim.Adam(self.model.decoder.parameters(), lr=1e-3)
         
-        for batch in self.train_iter:  # Use a subset of data if needed
-            full_spec = batch[0].to(self.device)  # shape: (B, D, T)
+        # Get initial loss using test batch
+        test_batch = next(iter(self.test_iter))
+        full_spectrogram, _, _, _, _, _ = test_batch  # Use full_spectrogram (unmasked)
+        full_spectrogram = full_spectrogram.to(self.device)  # This is the unmasked version!
+        
+        # Get embeddings from frozen encoder using unmasked spectrogram
+        with torch.no_grad():
+            embeddings, _ = self.model.context_encoder(full_spectrogram)
+            decoded = self.model.decoder(embeddings)
+            decoded = decoded.transpose(1, 2)
+            initial_loss = F.mse_loss(decoded, full_spectrogram)
+        print(f"Initial decoder loss: {initial_loss.item():.6f}")
+        
+        # Train for multiple batches
+        train_iter = iter(self.train_iter)
+        running_loss = 0.0
+        
+        for batch_idx in range(num_batches):
+            try:
+                batch = next(train_iter)
+            except StopIteration:
+                train_iter = iter(self.train_iter)
+                batch = next(train_iter)
+                
+            # Unpack batch and use full_spectrogram (unmasked version)
+            full_spectrogram, _, _, _, _, _ = batch  # Use full_spectrogram
+            full_spectrogram = full_spectrogram.to(self.device)
             
+            # Get embeddings from frozen encoder using unmasked spectrogram
             with torch.no_grad():
-                # Get embeddings from frozen encoder
-                embeddings, _ = self.model.context_encoder(full_spec)  # shape: (B, T, H)
+                embeddings, _ = self.model.context_encoder(full_spectrogram)
             
-            # Forward pass through decoder (with gradients)
+            # Forward pass through decoder
             decoder_optimizer.zero_grad()
-            decoded = self.model.decoder(embeddings)  # shape: (B, T, D)
-            decoded = decoded.transpose(1, 2)  # Now shape: (B, D, T)
+            decoded = self.model.decoder(embeddings)
+            decoded = decoded.transpose(1, 2)
             
-            # Compute loss
-            decoder_loss = F.mse_loss(decoded, full_spec)
+            # Compute loss using full spectrogram
+            decoder_loss = F.mse_loss(decoded, full_spectrogram)
             
             # Backward pass
             decoder_loss.backward()
             decoder_optimizer.step()
             
-            # Only train on one batch
-            break
+            running_loss += decoder_loss.item()
+            
+            if (batch_idx + 1) % 10 == 0:
+                avg_loss = running_loss / 10
+                print(f"Batch {batch_idx + 1}/{num_batches}, Average Loss: {avg_loss:.6f}")
+                running_loss = 0.0
+        
+        # Get final loss and visualize using test batch
+        test_batch = next(iter(self.test_iter))
+        full_spectrogram, _, _, _, _, _ = test_batch  # Use full_spectrogram
+        full_spectrogram = full_spectrogram.to(self.device)
+        with torch.no_grad():
+            embeddings, _ = self.model.context_encoder(full_spectrogram)
+            decoded = self.model.decoder(embeddings)
+            decoded = decoded.transpose(1, 2)
+            final_loss = F.mse_loss(decoded, full_spectrogram)
+            
+            # Visualize reconstruction
+            self.visualize_decoder_reconstruction(
+                step=step,
+                original_spec=full_spectrogram,  # Use full_spectrogram
+                decoded_pred=decoded,
+                context_repr=embeddings,
+                mask=None
+            )
+        
+        print(f"Final decoder loss: {final_loss.item():.6f}\n")
 
     def moving_average(self, values, window):
         if len(values) == 0:
@@ -431,31 +483,32 @@ class ModelTrainer:
         }
 
     def adjust_learning_rate(self, step):
-        """Custom learning rate schedule with warmup and cosine decay"""
-        if step < self.warmup_steps:
-            # Linear warmup
-            lr = self.initial_lr + (self.peak_lr - self.initial_lr) * (step / self.warmup_steps)
-        else:
-            # Cosine decay from peak_lr to final_lr
-            progress = (step - self.warmup_steps) / (self.max_steps - self.warmup_steps)
-            lr = self.final_lr + 0.5 * (self.peak_lr - self.final_lr) * (1 + math.cos(math.pi * progress))
+        """Commented out custom learning rate schedule"""
+        # if step < self.warmup_steps:
+        #     # Linear warmup
+        #     lr = self.initial_lr + (self.peak_lr - self.initial_lr) * (step / self.warmup_steps)
+        # else:
+        #     # Cosine decay from peak_lr to final_lr
+        #     progress = (step - self.warmup_steps) / (self.max_steps - self.warmup_steps)
+        #     lr = self.final_lr + 0.5 * (self.peak_lr - self.final_lr) * (1 + math.cos(math.pi * progress))
         
         # Update learning rate
-        for param_group in self.optimizer.param_groups:
-            param_group['lr'] = lr
+        # for param_group in self.optimizer.param_groups:
+        #     param_group['lr'] = lr
         
-        return lr
+        return self.optimizer.param_groups[0]['lr']  # Just return current learning rate
 
     def adjust_weight_decay(self, step):
-        """Linear weight decay schedule"""
-        progress = step / self.max_steps
-        weight_decay = self.initial_wd + (self.final_wd - self.initial_wd) * progress
+        """Linear weight decay schedule (currently disabled)"""
+        # Commenting out weight decay adjustment
+        # progress = step / self.max_steps
+        # weight_decay = self.initial_wd + (self.final_wd - self.initial_wd) * progress
         
         # Update weight decay
-        for param_group in self.optimizer.param_groups:
-            param_group['weight_decay'] = weight_decay
+        # for param_group in self.optimizer.param_groups:
+        #     param_group['weight_decay'] = weight_decay
         
-        return weight_decay
+        return 0.0  # Return 0 since weight decay is disabled
 
     def adjust_momentum(self, step):
         """Linear momentum schedule for target encoder EMA"""
@@ -527,7 +580,7 @@ class ModelTrainer:
             
             # Periodically train decoder
             if step % 1000 == 0:
-                self.train_decoder()
+                self.train_decoder(step=step)
 
             # Validation step
             val_loss, masked_seq_acc, unmasked_seq_acc = self.validate_model(
@@ -544,6 +597,13 @@ class ModelTrainer:
             raw_unmasked_seq_acc_list.append(unmasked_seq_acc)
 
             if step % self.eval_interval == 0:
+                # Get current learning rate
+                current_lr = self.optimizer.param_groups[0]['lr']
+
+                # Get context encoder gradient norm
+                context_stats = self.get_network_stats(self.model.context_encoder, "context")
+                context_grad_norm = context_stats["context_grad_norm"]
+
                 # Calculate variances
                 with torch.no_grad():
                     context_repr, _ = self.model.context_encoder(context_spectrogram)
@@ -567,8 +627,12 @@ class ModelTrainer:
                     smoothed_values = self.moving_average(recent_val_losses, self.trailing_avg_window)
                     smoothed_val_loss = smoothed_values[-1] if smoothed_values else val_loss
 
-                print(f"\nStep [{step}/{self.max_steps}] - Smoothed Train Loss: {smoothed_training_loss:.4f}, "
-                      f"Smoothed Val Loss: {smoothed_val_loss:.4f}, Vars [C/T]: {context_var:.4f}/{target_var:.4f}")
+                print(f"\nStep [{step}/{self.max_steps}] - "
+                      f"Smoothed Train Loss: {smoothed_training_loss:.4f}, "
+                      f"Smoothed Val Loss: {smoothed_val_loss:.4f}, "
+                      f"Vars [C/T]: {context_var:.4f}/{target_var:.4f} - "
+                      f"Grad Norm: {context_grad_norm:.2e} - "
+                      f"LR: {current_lr:.2e}")
 
                 if smoothed_val_loss < best_val_loss:
                     best_val_loss = smoothed_val_loss
@@ -607,7 +671,6 @@ class ModelTrainer:
         steps = list(range(len(training_stats['training_loss'])))
         training_losses = training_stats['training_loss']
         validation_losses = training_stats['validation_loss']
-
         masked_seq_acc = training_stats['masked_seq_acc']
         unmasked_seq_acc = training_stats['unmasked_seq_acc']
 
@@ -617,11 +680,18 @@ class ModelTrainer:
         smoothed_masked_seq_acc = self.moving_average(masked_seq_acc, self.trailing_avg_window)
         smoothed_unmasked_seq_acc = self.moving_average(unmasked_seq_acc, self.trailing_avg_window)
 
+        # Generate learning rate schedule for plotting
+        lr_schedule = []
+        for step in range(self.max_steps):
+            lr_schedule.append(self.adjust_learning_rate(step))
+        lr_steps = list(range(len(lr_schedule)))
+
         # Create corresponding steps arrays that match the smoothed data lengths
         smoothed_steps = steps[:len(smoothed_training_losses)]
 
         plt.figure(figsize=(16, 12))
 
+        # Plot 1: Training and Validation Loss
         plt.subplot(2, 2, 1)
         if len(smoothed_training_losses) > 0 and len(smoothed_validation_losses) > 0:
             plt.plot(smoothed_steps, smoothed_training_losses, label='Smoothed Training Loss')
@@ -634,6 +704,7 @@ class ModelTrainer:
         plt.title('Smoothed Training and Validation Loss')
         plt.legend()
 
+        # Plot 2: Masked and Unmasked Sequence Loss
         plt.subplot(2, 2, 2)
         if len(smoothed_masked_seq_acc) > 0 and len(smoothed_unmasked_seq_acc) > 0:
             plt.plot(smoothed_steps, smoothed_masked_seq_acc, label='Smoothed Masked Seq Loss')
@@ -646,12 +717,23 @@ class ModelTrainer:
         plt.title('Masked and Unmasked Validation Loss')
         plt.legend()
 
+        # Plot 3: Raw Losses
         plt.subplot(2, 2, 3)
         plt.plot(steps, training_losses, label='Raw Training Loss', alpha=0.7)
         plt.plot(steps, validation_losses, label='Raw Validation Loss', alpha=0.7)
         plt.xlabel('Step')
         plt.ylabel('Loss')
         plt.title('Raw Training and Validation Loss')
+        plt.legend()
+
+        # Plot 4: Learning Rate Schedule
+        plt.subplot(2, 2, 4)
+        plt.plot(lr_steps, lr_schedule, label='Learning Rate', color='green')
+        plt.xlabel('Step')
+        plt.ylabel('Learning Rate')
+        plt.title('Learning Rate Schedule')
+        plt.yscale('log')  # Use log scale for better visualization
+        plt.grid(True)
         plt.legend()
 
         plt.tight_layout()
@@ -667,25 +749,25 @@ if __name__ == '__main__':
     parser.add_argument('--train_dir', type=str, required=True)
     parser.add_argument('--test_dir', type=str, required=True)
     parser.add_argument('--steps', type=int, default=1000)
-    parser.add_argument('--batch_size', type=int, default=256)
+    parser.add_argument('--batch_size', type=int, default=42)
     parser.add_argument('--lr', type=float, default=1e-3)
     parser.add_argument('--name', type=str, required=True, help='Name of the experiment')
     parser.add_argument('--eval_interval', type=int, default=100, help='How often to run validation')
     parser.add_argument('--input_dim', type=int, default=513, help='Input dimension (frequency bins)')
     parser.add_argument('--hidden_dim', type=int, default=256, help='Hidden dimension for encoders')
-    parser.add_argument('--num_layers', type=int, default=4, help='Number of transformer layers for encoders')
-    parser.add_argument('--num_heads', type=int, default=8, help='Number of attention heads for encoders')
+    parser.add_argument('--num_layers', type=int, default=6, help='Number of transformer layers for encoders')
+    parser.add_argument('--num_heads', type=int, default=4, help='Number of attention heads for encoders')
     parser.add_argument('--dropout', type=float, default=0.1, help='Dropout rate')
-    parser.add_argument('--mlp_dim', type=int, default=1024, help='MLP hidden dimension for encoders')
+    parser.add_argument('--mlp_dim', type=int, default=512, help='MLP hidden dimension for encoders')
     parser.add_argument('--pred_hidden_dim', type=int, default=256, help='Hidden dimension for predictor')
     parser.add_argument('--pred_num_layers', type=int, default=3, help='Number of transformer layers for predictor')
     parser.add_argument('--pred_num_heads', type=int, default=4, help='Number of attention heads for predictor')
-    parser.add_argument('--pred_mlp_ratio', type=float, default=4.0, help='MLP ratio for predictor')
+    parser.add_argument('--pred_mlp_ratio', type=float, default=2.0, help='MLP ratio for predictor')
     parser.add_argument('--max_seq_len', type=int, default=500, help='Maximum sequence length for predictor')
     parser.add_argument('--overfit_batch', action='store_true', 
                        help='Whether to overfit on a single batch (default: False)')
-    parser.add_argument('--mask_ratio', type=float, default=0.2,
-                       help='Ratio of timesteps to mask (default: 0.2)')
+    parser.add_argument('--mask_ratio', type=float, default=0.5,
+                       help='Ratio of timesteps to mask (default: 0.5)')
     parser.add_argument('--verbose', action='store_true',
                        help='Enable verbose output during training')
     args = parser.parse_args()
@@ -754,8 +836,8 @@ if __name__ == '__main__':
         list(model.context_encoder.parameters()) + 
         list(model.predictor.parameters()) + 
         list(model.decoder.parameters()),
-        lr=1e-4,  # Initial learning rate
-        weight_decay=0.04  # Initial weight decay
+        lr=args.lr,  # Now using the learning rate from argparse
+        weight_decay=0.0
     )
 
     # Create config dictionary
