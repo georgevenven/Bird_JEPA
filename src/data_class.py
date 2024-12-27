@@ -137,5 +137,6 @@ def collate_fn(batch, segment_length=500, mask_p=0.75, verbose=False):
         print(f"full_spectrogram: min={full_spectrogram.min().item():.3f}, max={full_spectrogram.max().item():.3f}, avg={full_spectrogram.mean().item():.3f}")
         print(f"target_spectrogram: min={target_spectrogram.min().item():.3f}, max={target_spectrogram.max().item():.3f}, avg={target_spectrogram.mean().item():.3f}")
         print(f"context_spectrogram: min={context_spectrogram.min().item():.3f}, max={context_spectrogram.max().item():.3f}, avg={context_spectrogram.mean().item():.3f}")
-        
+
+    
     return full_spectrogram, target_spectrogram, context_spectrogram, labels, mask, file_names

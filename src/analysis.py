@@ -320,7 +320,7 @@ def plot_umap_projection(model, device, data_dirs, category_colors_file="test_ll
         vocalization = vocalization[:samples]
 
     print("Initializing UMAP reducer...")
-    reducer = umap.UMAP(n_neighbors=200, min_dist=0, n_components=2, metric='cosine')
+    reducer = umap.UMAP(n_neighbors=200, min_dist=0, n_components=2, metric='euclidean')
     print("UMAP reducer initialized.")
     embedding_outputs = reducer.fit_transform(predictions)
     print("UMAP fitting complete. Shape of embedding outputs:", embedding_outputs.shape)

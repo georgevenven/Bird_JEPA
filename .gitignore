@@ -3,3 +3,5 @@
 /test_outputs
 .png
 /experiments
+/grid_search_results
+/files

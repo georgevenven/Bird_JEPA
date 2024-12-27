@@ -13,25 +13,43 @@ from data_class import collate_fn
 def create_parameter_grid():
     """Define the parameter grid for search"""
     param_grid = {
-        'hidden_dim': [128, 256, 512],
-        'num_layers': [4, 6, 8],
-        'num_heads': [4, 8],
-        'dropout': [0.1, 0.2],
-        'mlp_dim': [512, 1024],          # MLP dim for encoders
-        'pred_hidden_dim': [256, 384],
-        'pred_num_layers': [3, 6],
-        'pred_mlp_dim': [512, 1024],     # Explicit MLP dim for predictor (instead of ratio)
-        'batch_size': [32, 64],
-        'lr': [1e-3, 5e-4],
-        'patience': [2, 4, 6],
-        'ema_momentum': [0.996, 0.999]
+        'input_dim': [513],
+        'max_seq_len': [500],
+        'mask_ratio': [0.3],
+        'hidden_dim': [128],
+        'num_layers': [2],
+        'num_heads': [2],
+        'dropout': [0.0],
+        'mlp_dim': [256],
+        'pred_hidden_dim': [128],
+        'pred_num_layers': [2],
+        'pred_mlp_dim': [256],
+        'batch_size': [16],
+        
+        'encoder_lr': [1e-4],
+        'predictor_lr': [1e-4],
+        'decoder_lr': [1e-4],
+        
+        'freeze_encoder_steps': [0, 1000],
+        'freeze_decoder_steps': [0, 1000],
+        
+        'patience': [4],
+        'ema_momentum': [0.9, 0.99],
+        'steps': [20000],
+        'eval_interval': [500]
     }
     return param_grid
 
 def get_experiment_name(params):
     """Generate a unique experiment name based on parameters"""
-    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    return f"grid_search_{timestamp}_h{params['hidden_dim']}_l{params['num_layers']}_head{params['num_heads']}"
+    timestamp = datetime.now().strftime("%m%d_%H%M")  # Shorter timestamp format
+    
+    # Create compact parameter string
+    model_params = f"h{params['hidden_dim']}_l{params['num_layers']}_d{str(params['dropout']).replace('0.','')}"
+    training_params = f"bs{params['batch_size']}_elr{str(params['encoder_lr']).replace('0.','').replace('-','')}_plr{str(params['predictor_lr']).replace('0.','').replace('-','')}_dlr{str(params['decoder_lr']).replace('0.','').replace('-','')}"
+    ema = f"ema{str(params['ema_momentum']).replace('0.','')}"
+    
+    return f"jepa_{model_params}_{training_params}_{ema}_{timestamp}"
 
 def run_experiment(args, params):
     """Run a single experiment with given parameters"""
@@ -40,13 +58,32 @@ def run_experiment(args, params):
     experiment_dir = os.path.join(args.output_dir, experiment_name)
     weights_dir = os.path.join(experiment_dir, 'saved_weights')
     os.makedirs(experiment_dir, exist_ok=True)
+
+    # Extract training control parameters AFTER creating experiment name
+    steps = params.pop('steps')
+    eval_interval = params.pop('eval_interval')
+    patience = params.pop('patience')
+    ema_momentum = params.pop('ema_momentum')
     
-    # Save configuration
+    # Extract learning rates and freeze steps
+    encoder_lr = params.pop('encoder_lr')
+    predictor_lr = params.pop('predictor_lr')
+    decoder_lr = params.pop('decoder_lr')
+    freeze_encoder_steps = params.pop('freeze_encoder_steps')
+    freeze_decoder_steps = params.pop('freeze_decoder_steps')
+    
+    # Save full configuration with all parameters
     config = {
         **params,
-        "input_dim": args.input_dim,
-        "max_seq_len": args.max_seq_len,
-        "mask_ratio": args.mask_ratio,
+        "steps": steps,
+        "eval_interval": eval_interval,
+        "patience": patience,
+        "ema_momentum": ema_momentum,
+        "encoder_lr": encoder_lr,
+        "predictor_lr": predictor_lr,
+        "decoder_lr": decoder_lr,
+        "freeze_encoder_steps": freeze_encoder_steps,
+        "freeze_decoder_steps": freeze_decoder_steps,
         "train_dir": args.train_dir,
         "test_dir": args.test_dir,
         "device": str(args.device),
@@ -56,28 +93,28 @@ def run_experiment(args, params):
     with open(os.path.join(experiment_dir, 'config.json'), 'w') as f:
         json.dump(config, f, indent=4)
 
-    # Create data loaders
+    # Create data loaders using params
     dl_train = DataLoader(
-        BirdJEPA_Dataset(data_dir=args.train_dir, segment_len=args.max_seq_len),
+        BirdJEPA_Dataset(data_dir=args.train_dir, segment_len=params['max_seq_len']),
         batch_size=params['batch_size'],
         shuffle=True,
         collate_fn=lambda batch: collate_fn(batch, 
-                                          segment_length=args.max_seq_len, 
-                                          mask_p=args.mask_ratio)
+                                          segment_length=params['max_seq_len'], 
+                                          mask_p=params['mask_ratio'])
     )
 
     dl_test = DataLoader(
-        BirdJEPA_Dataset(data_dir=args.test_dir, segment_len=args.max_seq_len),
+        BirdJEPA_Dataset(data_dir=args.test_dir, segment_len=params['max_seq_len']),
         batch_size=params['batch_size'],
         shuffle=True,
         collate_fn=lambda batch: collate_fn(batch, 
-                                          segment_length=args.max_seq_len, 
-                                          mask_p=args.mask_ratio)
+                                          segment_length=params['max_seq_len'], 
+                                          mask_p=params['mask_ratio'])
     )
 
-    # Initialize model
+    # Initialize model using params
     model = BirdJEPA(
-        input_dim=args.input_dim,
+        input_dim=params['input_dim'],
         hidden_dim=params['hidden_dim'],
         num_layers=params['num_layers'],
         num_heads=params['num_heads'],
@@ -85,42 +122,49 @@ def run_experiment(args, params):
         mlp_dim=params['mlp_dim'],
         pred_hidden_dim=params['pred_hidden_dim'],
         pred_num_layers=params['pred_num_layers'],
-        pred_num_heads=params['num_heads'],  # Using same as encoder
-        pred_mlp_ratio=4.0,  # Fixed
-        max_seq_len=args.max_seq_len
+        pred_num_heads=params['num_heads'],
+        pred_mlp_dim=params['pred_mlp_dim'],
+        max_seq_len=params['max_seq_len']
     ).to(args.device)
 
-    # Initialize optimizer
-    optimizer = torch.optim.AdamW(
-        list(model.context_encoder.parameters()) + 
-        list(model.predictor.parameters()) + 
-        list(model.decoder.parameters()),
-        lr=params['lr'],
-        weight_decay=0.0
-    )
-
-    # Initialize trainer
+    # Initialize trainer with separate learning rates and freeze steps
     trainer = ModelTrainer(
         model=model,
         train_loader=dl_train,
         test_loader=dl_test,
-        optimizer=optimizer,
+        encoder_lr=encoder_lr,
+        predictor_lr=predictor_lr,
+        decoder_lr=decoder_lr,
+        freeze_encoder_steps=freeze_encoder_steps,
+        freeze_decoder_steps=freeze_decoder_steps,
         device=args.device,
-        max_steps=args.steps,
-        eval_interval=args.eval_interval,
+        max_steps=steps,
+        eval_interval=eval_interval,
         save_interval=args.save_interval,
         weights_save_dir=weights_dir,
         experiment_dir=experiment_dir,
+        early_stopping=True,
+        patience=patience,
+        ema_momentum=ema_momentum,
         verbose=args.verbose
     )
 
-    # Train model
-    loss_history = trainer.train()
+    # Train model and get loss history
+    train_losses, val_losses = trainer.train()
     
-    # Plot results
+    # Calculate evaluation metrics
+    eval_metrics = {
+        'final_train_loss': train_losses[-1] if train_losses else None,
+        'final_val_loss': val_losses[-1] if val_losses else None,
+        'min_val_loss': min(val_losses) if val_losses else None,
+        'avg_val_loss': sum(val_losses) / len(val_losses) if val_losses else None,
+        'convergence_step': len(train_losses)  # Number of steps before stopping
+    }
+    
+    # Plot and save results
     trainer.plot_results(save_plot=True)
 
-    return loss_history
+    return eval_metrics
 
 def main():
     parser = argparse.ArgumentParser(description='Grid Search for BirdJEPA')
@@ -140,6 +184,13 @@ def main():
     parser.add_argument('--max_seq_len', type=int, default=500)
     parser.add_argument('--mask_ratio', type=float, default=0.5)
     parser.add_argument('--verbose', action='store_true')
+    
+    # Additional parameters
+    parser.add_argument('--encoder_lr', type=float, default=1e-4)
+    parser.add_argument('--predictor_lr', type=float, default=1e-3)
+    parser.add_argument('--decoder_lr', type=float, default=1e-4)
+    parser.add_argument('--freeze_encoder_steps', type=int, default=0)
+    parser.add_argument('--freeze_decoder_steps', type=int, default=0)
     
     args = parser.parse_args()
     args.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
@@ -169,14 +220,16 @@ def main():
         print("Parameters:", json.dumps(params, indent=2))
         
         try:
-            loss_history = run_experiment(args, params)
+            eval_metrics = run_experiment(args, params)
             
             # Store results
             result = {
                 'params': params,
-                'final_train_loss': loss_history[0][-1] if loss_history[0] else None,
-                'final_val_loss': loss_history[1][-1] if loss_history[1] else None,
-                'min_val_loss': min(loss_history[1]) if loss_history[1] else None
+                'final_train_loss': eval_metrics['final_train_loss'],
+                'final_val_loss': eval_metrics['final_val_loss'],
+                'min_val_loss': eval_metrics['min_val_loss'],
+                'avg_val_loss': eval_metrics['avg_val_loss'],
+                'convergence_step': eval_metrics['convergence_step']
             }
             results.append(result)
             
@@ -197,3 +250,6 @@ def main():
 
 if __name__ == '__main__':
     main()
+
+
+# python src/grid_search.py --train_dir /media/george-vengrovski/George-SSD/llb_stuff/combined_train --test_dir /media/george-vengrovski/George-SSD/llb_stuff/combined_test --output_dir ./grid_search_results --verbose

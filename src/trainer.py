@@ -6,7 +6,7 @@ from torch.optim.lr_scheduler import StepLR
 import matplotlib.pyplot as plt
 import json
 from torch.cuda.amp import autocast, GradScaler
-from model import BirdJEPA
+from model import BirdJEPA, EMA
 from data_class import BirdJEPA_Dataset, collate_fn
 from torch.utils.data import DataLoader
 import torch.nn.functional as F
@@ -14,625 +14,332 @@ import argparse
 import shutil
 from datetime import datetime
 import math
+from utils import load_model
 
 class ModelTrainer:
-    def __init__(self, model, train_loader, test_loader, optimizer, device, 
-                 max_steps=1000, eval_interval=100, save_interval=500,
-                 weights_save_dir="saved_weights", experiment_dir="experiments",
-                 trailing_avg_window=100, early_stopping=True, patience=4,
-                 ema_momentum=0.999, verbose=False, overfit_single_batch=False):
+    def __init__(
+        self, 
+        model, 
+        train_loader, 
+        test_loader, 
+        device, 
+        max_steps=1000, 
+        eval_interval=100, 
+        save_interval=500,
+        weights_save_dir="saved_weights", 
+        experiment_dir="experiments",
+        trailing_avg_window=100, 
+        early_stopping=True, 
+        patience=4,
+        ema_momentum=0.9,
+        verbose=False, 
+        overfit_single_batch=False,
+        encoder_lr=1e-4,
+        predictor_lr=1e-3,
+        decoder_lr=1e-4,
+        freeze_encoder_steps=0,
+        freeze_decoder_steps=0,
+        lr=None   # optional single-lr param from older code
+    ):
         self.model = model
+        self.model.ema_m = ema_momentum
         self.train_iter = train_loader
         self.test_iter = test_loader
-        self.optimizer = optimizer
         self.device = device
         self.max_steps = max_steps
         self.eval_interval = eval_interval
         self.save_interval = save_interval
+        self.weights_save_dir = weights_save_dir
+        self.experiment_dir = experiment_dir
         self.trailing_avg_window = trailing_avg_window
-        self.early_stopping = early_stopping  # Will be set by grid search
-        self.patience = patience            # Will be set by grid search
+        self.early_stopping = early_stopping
+        self.patience = patience
         self.verbose = verbose
         self.overfit_single_batch = overfit_single_batch
-        
-        # Print model parameter counts
+
+        # if user provided old single-lr, override
+        if lr is not None:
+            encoder_lr = lr
+            predictor_lr = lr
+            decoder_lr = lr
+
+        self.encoder_lr = encoder_lr
+        self.predictor_lr = predictor_lr
+        self.decoder_lr = decoder_lr
+        self.freeze_encoder_steps = freeze_encoder_steps
+        self.freeze_decoder_steps = freeze_decoder_steps
+
+        # set up separate optimizers
+        self.encoder_optimizer = torch.optim.AdamW(
+            self.model.context_encoder.parameters(),
+            lr=self.encoder_lr,
+            weight_decay=0.0
+        )
+        self.predictor_optimizer = torch.optim.AdamW(
+            self.model.predictor.parameters(),
+            lr=self.predictor_lr,
+            weight_decay=0.0
+        )
+        self.decoder_optimizer = torch.optim.AdamW(
+            self.model.decoder.parameters(),
+            lr=self.decoder_lr,
+            weight_decay=0.0
+        )
+
+        # print param counts
         context_params = sum(p.numel() for p in self.model.context_encoder.parameters())
-        target_params = sum(p.numel() for p in self.model.target_encoder.parameters())
+        target_params  = sum(p.numel() for p in self.model.target_encoder.parameters())
         predictor_params = sum(p.numel() for p in self.model.predictor.parameters())
-        decoder_params = sum(p.numel() for p in self.model.decoder.parameters())
-        total_params = sum(p.numel() for p in self.model.parameters())
-        
+        decoder_params   = sum(p.numel() for p in self.model.decoder.parameters())
+        total_params     = sum(p.numel() for p in self.model.parameters())
+
         print("\nModel Parameter Counts:")
         print(f"Context Encoder:  {context_params:,} parameters")
         print(f"Target Encoder:   {target_params:,} parameters")
         print(f"Predictor:        {predictor_params:,} parameters")
         print(f"Decoder:          {decoder_params:,} parameters")
         print(f"Total:            {total_params:,} parameters\n")
-        
-        # Setup directories
-        self.experiment_dir = experiment_dir
-        self.weights_save_dir = weights_save_dir
+
+        # directories
         os.makedirs(self.weights_save_dir, exist_ok=True)
-        
-        # Create predictions subfolder
         self.predictions_subfolder_path = os.path.join(self.experiment_dir, 'predictions')
         os.makedirs(self.predictions_subfolder_path, exist_ok=True)
-        
-        # Comment out learning rate scheduling parameters
-        # self.warmup_steps = 15 * 1000
-        # self.initial_lr = 5e-3
-        # self.peak_lr = 5e-3
-        # self.final_lr = 1e-6
-        
-        # Remove scheduler reference
-        # self.scheduler = None
-        
-        # Weight decay scheduler
-        # self.initial_wd = 0.04
-        # self.final_wd = 0.4
-        
-        # EMA momentum parameters
-        self.initial_momentum = ema_momentum
-        self.final_momentum = 1.0
-        
-        # Update model's EMA momentum
-        self.model.ema_m = ema_momentum
-        self.model.ema_updater = EMA(ema_momentum)
-        
-        # Replace existing scheduler with custom learning rate scheduling
-        # self.scheduler = None  # Remove the existing scheduler
 
-        # Print early stopping configuration
+        # store embedding stats for plotting
+        self.embedding_stats_history = {
+            'context_variance': [], 'context_distance': [], 'context_norm': [],
+            'target_variance': [], 'target_distance': [], 'target_norm': [],
+            'pred_variance': [],   'pred_distance': [],   'pred_norm': []
+        }
+
+        # early stopping info
         if self.early_stopping:
             print(f"\nEarly Stopping Configuration:")
             print(f"Patience: {self.patience} validation intervals")
             print(f"Will stop after {self.patience * self.eval_interval} steps without improvement")
 
         print(f"\nEMA Configuration:")
-        print(f"Initial momentum: {self.initial_momentum}")
-        print(f"Final momentum: {self.final_momentum}")
+        print(f"Initial momentum: {ema_momentum}")
+        print("Final momentum: 1.0")
 
     def embedding_variance(self, embeddings):
-        # Calculate variance of embeddings
-        # embeddings: (B,T,H)
         return embeddings.var().item()
 
-    def save_model(self, step, training_stats):
+    def save_model(self, step, training_stats, raw_loss_list=None, raw_val_loss_list=None):
+        # create checkpoint
         checkpoint = {
             'step': step,
             'model_state_dict': self.model.state_dict(),
-            'optimizer_state_dict': self.optimizer.state_dict(),
+            'encoder_optimizer_state': self.encoder_optimizer.state_dict(),
+            'predictor_optimizer_state': self.predictor_optimizer.state_dict(),
+            'decoder_optimizer_state': self.decoder_optimizer.state_dict(),
         }
-        
-        # Remove scheduler check and save
-        # if self.scheduler is not None:
-        #     checkpoint['scheduler_state_dict'] = self.scheduler.state_dict()
-        
-        checkpoint_path = os.path.join(self.weights_save_dir, f'checkpoint_{step}.pt')
-        torch.save(checkpoint, checkpoint_path)
-        
-        # Convert tensors to Python native types for JSON serialization
+
+        # store training stats in the checkpoint so we can continue training
+        checkpoint['training_stats'] = training_stats
+        checkpoint['raw_loss_list'] = raw_loss_list if raw_loss_list is not None else []
+        checkpoint['raw_val_loss_list'] = raw_val_loss_list if raw_val_loss_list is not None else []
+
+        # save
+        ckpt_path = os.path.join(self.weights_save_dir, f'checkpoint_{step}.pt')
+        torch.save(checkpoint, ckpt_path)
+
+        # store embedding stats
+        training_stats['embedding_stats_history'] = self.embedding_stats_history
+
+        # convert to json-safe format
         json_safe_stats = {}
-        for key, value in training_stats.items():
-            if isinstance(value, (list, tuple)) and len(value) > 0 and torch.is_tensor(value[0]):
-                json_safe_stats[key] = [float(v.cpu().detach()) if torch.is_tensor(v) else float(v) for v in value]
-            elif torch.is_tensor(value):
-                json_safe_stats[key] = float(value.cpu().detach())
+        for key, val in training_stats.items():
+            if isinstance(val, (list, tuple)) and len(val) and torch.is_tensor(val[0]):
+                # list of tensors
+                json_safe_stats[key] = [float(x.cpu().detach()) for x in val]
+            elif torch.is_tensor(val):
+                json_safe_stats[key] = float(val.cpu().detach())
+            elif key == 'embedding_stats_history':
+                # nested dict of lists
+                nested = {}
+                for k_, v_ in val.items():
+                    nested[k_] = [float(x) for x in v_]
+                json_safe_stats[key] = nested
             else:
-                json_safe_stats[key] = value
-        
-        # Save training statistics
-        stats_filename = "training_statistics.json"
-        stats_filepath = os.path.join(self.experiment_dir, stats_filename)
-        with open(stats_filepath, 'w') as json_file:
-            json.dump(json_safe_stats, json_file)
+                json_safe_stats[key] = val
 
-    def load_model(self, checkpoint_path):
-        checkpoint = torch.load(checkpoint_path)
+        stats_file = os.path.join(self.experiment_dir, "training_statistics.json")
+        with open(stats_file, 'w') as jf:
+            json.dump(json_safe_stats, jf)
+
+    def load_model(self, checkpoint_path=None, checkpoint=None):
+        """
+        load model and optimizer states from checkpoint
+        args:
+            checkpoint_path: path to checkpoint file (optional)
+            checkpoint: checkpoint dictionary (optional)
+            
+        one of checkpoint_path or checkpoint must be provided
+        """
+        if checkpoint is None and checkpoint_path is None:
+            raise ValueError("Either checkpoint_path or checkpoint must be provided")
+        
+        if checkpoint is None:
+            checkpoint = torch.load(checkpoint_path)
+        
         self.model.load_state_dict(checkpoint['model_state_dict'])
-        self.optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
-        self.scheduler.load_state_dict(checkpoint['scheduler_state_dict'])
-        return checkpoint['step'], checkpoint['training_stats']
+        self.encoder_optimizer.load_state_dict(checkpoint['encoder_optimizer_state'])
+        self.predictor_optimizer.load_state_dict(checkpoint['predictor_optimizer_state'])
+        self.decoder_optimizer.load_state_dict(checkpoint['decoder_optimizer_state'])
 
-    def create_large_canvas(self, context_outputs, target_outputs=None, image_idx=0, spec_shape=None, 
-                           context_spec=None, target_spec=None):
-        context_layers = context_outputs["layer_outputs"].shape[0]
-        total_rows = context_layers + 1  # +1 for input spectrograms
-        
-        # Use 2:1 aspect ratio for each subplot
-        fig, axes = plt.subplots(total_rows, 2, figsize=(20, 5*total_rows))
-        
-        # Plot input spectrograms
-        axes[0,0].imshow(context_spec.cpu()[image_idx].numpy(), aspect='auto', origin='lower')
-        axes[0,0].set_title("Input to Context Encoder")
-        axes[0,1].imshow(target_spec.cpu()[image_idx].numpy(), aspect='auto', origin='lower')
-        axes[0,1].set_title("Input to Target Encoder")
-        
-        # Plot intermediate layers - transpose to (H,T)
-        for i in range(context_layers):
-            # Context encoder layers
-            c_layer = context_outputs["layer_outputs"][i][image_idx].cpu().numpy().T
-            axes[i+1,0].imshow(c_layer, aspect='auto', origin='lower')
-            axes[i+1,0].set_title(f"Context Encoder Layer {i}")
-            
-            # Target encoder layers (now directly using tensor)
-            if target_outputs is not None:
-                t_layer = target_outputs[i][image_idx].cpu().numpy().T
-                axes[i+1,1].imshow(t_layer, aspect='auto', origin='lower')
-                axes[i+1,1].set_title(f"Target Encoder Layer {i}")
-            else:
-                axes[i+1,1].axis('off')
-        
-        # Remove legends and adjust layout
-        for ax in axes.flatten():
-            ax.set_xticks([])
-            ax.set_yticks([])
-        
-        plt.tight_layout()
+        # new logic for safely loading training stats
+        training_stats = checkpoint.get('training_stats', {})
+        raw_loss_list = checkpoint.get('raw_loss_list', [])
+        raw_val_loss_list = checkpoint.get('raw_val_loss_list', [])
+        last_step = checkpoint.get('step', 0)
 
-    def visualize_mse(self, output, mask, spec, step, full_spectrogram=None):
-        # Use 2:1 aspect ratio for each subplot
-        fig, axs = plt.subplots(2, 2, figsize=(20, 10))
-        axs = axs.flatten()
+        return last_step, training_stats, raw_loss_list, raw_val_loss_list
 
-        # Plot 1: Original spectrogram with mask overlay
-        im = axs[0].imshow(spec[0].cpu().numpy(), aspect='auto', origin='lower')
-        axs[0].set_title('Masked Input Spectrogram', fontsize=35, pad=20)
-        self._add_mask_overlay(axs[0], mask[0])
+    def train(self, continue_training=False, training_stats=None, last_step=0, raw_loss_list=None, raw_val_loss_list=None):
+        # if no arrays were passed in, init fresh
+        if raw_loss_list is None:
+            raw_loss_list = []
+        if raw_val_loss_list is None:
+            raw_val_loss_list = []
 
-        # Plot 2: Model's prediction
-        im = axs[1].imshow(output[0].cpu().detach().numpy(), aspect='auto', origin='lower')
-        axs[1].set_title('Model Prediction', fontsize=35, pad=20)
-        self._add_mask_overlay(axs[1], mask[0])
-
-        # Plot 3: Empty for now
-        axs[2].set_visible(False)
-
-        # Plot 4: Error heatmap
-        error_map = (output[0] - spec[0]).cpu().detach().numpy() ** 2
-        im = axs[3].imshow(error_map, aspect='auto', origin='lower', cmap='hot')
-        axs[3].set_title('Prediction Error Heatmap', fontsize=35, pad=20)
-
-        # Remove legends and ticks
-        for ax in axs:
-            if ax.get_visible():
-                ax.set_xticks([])
-                ax.set_yticks([])
-
-        plt.tight_layout()
-        plt.savefig(os.path.join(self.predictions_subfolder_path, f'MSE_Visualization_{step}.png'), format="png")
-        plt.close(fig)
-
-    def _add_mask_overlay(self, axis, mask):
-        """
-        Add mask overlay to plot
-        Args:
-            axis: matplotlib axis
-            mask: tensor of shape (T) or (D, T)
-        """
-        # If mask is 2D (D,T), reduce to 1D (T)
-        if mask.dim() > 1:
-            masked_tokens = mask.any(dim=0)  # Reduce along frequency dimension if present
-        else:
-            masked_tokens = mask
-        
-        y_min, y_max = axis.get_ylim()
-        mask_bar_position = y_max - 15
-        
-        # Convert to numpy for matplotlib
-        masked_tokens = masked_tokens.cpu().numpy()
-        
-        # Iterate over time steps
-        for t in range(len(masked_tokens)):
-            if masked_tokens[t]:
-                axis.add_patch(plt.Rectangle((t, mask_bar_position), 1, 15, 
-                                           edgecolor='none', facecolor='red'))
-
-    def visualize_masked_predictions(self, step, context_spec, target_spec, output, mask, all_outputs):
-        self.model.eval()
-        with torch.no_grad():
-            # Visualize MSE and predictions
-            self.visualize_mse(output=output, mask=mask, spec=target_spec, step=step)
-            
-            # Create visualization with both context and target - pass target_outputs directly
-            self.create_large_canvas(
-                context_outputs=all_outputs,
-                target_outputs=all_outputs["target_outputs"], 
-                image_idx=0, 
-                spec_shape=context_spec.shape,
-                context_spec=context_spec, 
-                target_spec=target_spec
-            )
-            
-            plt.savefig(os.path.join(self.predictions_subfolder_path, 
-                       f'Intermediate_Outputs_{step}.png'), format="png")
-            plt.close()
-
-    def visualize_latent_predictions(self, step, context_repr, target_repr, pred_sequence, mask):
-        """Visualize the latent space predictions"""
-        # Use 2:1 aspect ratio for each subplot
-        fig, axs = plt.subplots(2, 2, figsize=(20, 10))
-        axs = axs.flatten()
-
-        # Plot 1: Target embeddings
-        im = axs[0].imshow(target_repr[0].cpu().numpy().T, aspect='auto', origin='lower')
-        axs[0].set_title('Target Embeddings', fontsize=35, pad=20)
-        self._add_mask_overlay(axs[0], mask[0])
-
-        # Plot 2: Predicted embeddings
-        im = axs[1].imshow(pred_sequence[0].cpu().detach().numpy().T, aspect='auto', origin='lower')
-        axs[1].set_title('Predicted Embeddings', fontsize=35, pad=20)
-        self._add_mask_overlay(axs[1], mask[0])
-
-        # Plot 3: Error heatmap (only for masked regions)
-        mask_expanded = mask[0].unsqueeze(-1).expand(-1, pred_sequence.shape[-1])
-        error_map = ((pred_sequence[0] - target_repr[0]) * mask_expanded).cpu().detach().numpy().T ** 2
-        im = axs[2].imshow(error_map, aspect='auto', origin='lower', cmap='hot')
-        axs[2].set_title('Prediction Error Heatmap (Masked Regions)', fontsize=35, pad=20)
-
-        # Plot 4: Context embeddings
-        im = axs[3].imshow(context_repr[0].cpu().numpy().T, aspect='auto', origin='lower')
-        axs[3].set_title('Context Embeddings', fontsize=35, pad=20)
-
-        # Remove legends and ticks
-        for ax in axs:
-            ax.set_xticks([])
-            ax.set_yticks([])
-
-        plt.tight_layout()
-        plt.savefig(os.path.join(self.predictions_subfolder_path, f'Latent_Predictions_{step}.png'), format="png")
-        plt.close(fig)
-
-    def visualize_decoder_reconstruction(self, step, original_spec, decoded_pred, context_repr, mask):
-        """Visualize the decoder's reconstruction with context embeddings"""
-        # Ensure decoded_pred is in the right shape (B, D, T)
-        if decoded_pred.shape[1] != original_spec.shape[1]:
-            decoded_pred = decoded_pred.transpose(1, 2)
-        
-        # Use 2:1 aspect ratio for each subplot
-        fig, axs = plt.subplots(1, 3, figsize=(30, 5))
-
-        # Plot 1: Original input spectrogram
-        im = axs[0].imshow(original_spec[0].cpu().numpy(), aspect='auto', origin='lower')
-        axs[0].set_title('Input Spectrogram', fontsize=35, pad=20)
-
-        # Plot 2: Context embeddings
-        im = axs[1].imshow(context_repr[0].cpu().detach().numpy().T, aspect='auto', origin='lower')
-        axs[1].set_title('Context Embeddings', fontsize=35, pad=20)
-
-        # Plot 3: Decoder reconstruction
-        im = axs[2].imshow(decoded_pred[0].cpu().detach().numpy(), aspect='auto', origin='lower')
-        axs[2].set_title('Decoder Reconstruction', fontsize=35, pad=20)
-
-        # Remove legends and ticks
-        for ax in axs:
-            ax.set_xticks([])
-            ax.set_yticks([])
-
-        plt.tight_layout()
-        plt.savefig(os.path.join(self.predictions_subfolder_path, f'Decoder_Reconstruction_{step}.png'), format="png")
-        plt.close(fig)
-
-    def validate_model(self, step, context_spec, target_spec, mask, vocalization):
-        self.model.eval()
-        with torch.no_grad():
-            # Get model predictions (removed mask from predictor call)
-            context_repr, context_intermediate = self.model.context_encoder(context_spec)
-            target_repr, target_intermediate = self.model.target_encoder(target_spec)
-            
-            # Remove mask argument from predictor call
-            pred_sequence = self.model.predictor(context_repr)
-            
-            # Calculate latent space loss properly across all batches
-            masked_latent_loss = ((pred_sequence - target_repr)**2 * mask.unsqueeze(-1)).mean()
-            
-            # Get decoder predictions
-            decoded_pred = self.model.decoder(pred_sequence)
-            decoded_pred = decoded_pred.transpose(1, 2)
-            
-            # Calculate embedding variances
-            context_var = self.embedding_variance(context_repr)
-            target_var = self.embedding_variance(target_repr)
-            
-            # Generate visualizations at eval_interval
-            if step % self.eval_interval == 0:
-                # Latent predictions visualization
-                self.visualize_latent_predictions(
-                    step, context_repr=context_repr, target_repr=target_repr,
-                    pred_sequence=pred_sequence, mask=mask
-                )
-                
-                # Encoder states visualization
-                context_outputs_dict = {"layer_outputs": torch.stack(context_intermediate, dim=0),
-                                      "target_outputs": torch.stack(target_intermediate, dim=0)}
-                
-                self.create_large_canvas(
-                    context_outputs=context_outputs_dict,
-                    target_outputs=target_intermediate,
-                    image_idx=0,
-                    spec_shape=context_spec.shape,
-                    context_spec=context_spec,
-                    target_spec=target_spec
-                )
-                plt.savefig(os.path.join(self.predictions_subfolder_path, 
-                           f'Encoders_Activations_{step}.png'), format="png")
-                plt.close()
-
-            # Calculate sequence accuracies (for tracking)
-            mask_expanded = mask.unsqueeze(1)
-            masked_seq_acc = ((decoded_pred - target_spec)**2 * mask_expanded.float()).mean()
-            unmasked_seq_acc = ((decoded_pred - target_spec)**2 * (~mask_expanded).float()).mean()
-            
-            return masked_latent_loss.item(), masked_seq_acc.item(), unmasked_seq_acc.item()
-
-    def train_decoder(self, num_batches=100, step=0):
-        """Train decoder on unmasked data using context encoder in inference mode"""
-        print("\nTraining decoder...")
-        self.model.context_encoder.eval()  # Set context encoder to eval mode
-        self.model.decoder.train()  # Set decoder to training mode
-        decoder_optimizer = torch.optim.Adam(self.model.decoder.parameters(), lr=1e-3)
-        
-        # Get initial loss using test batch
-        test_batch = next(iter(self.test_iter))
-        full_spectrogram, _, _, _, _, _ = test_batch  # Use full_spectrogram (unmasked)
-        full_spectrogram = full_spectrogram.to(self.device)  # This is the unmasked version!
-        
-        # Get embeddings from frozen encoder using unmasked spectrogram
-        with torch.no_grad():
-            embeddings, _ = self.model.context_encoder(full_spectrogram)
-            decoded = self.model.decoder(embeddings)
-            decoded = decoded.transpose(1, 2)
-            initial_loss = F.mse_loss(decoded, full_spectrogram)
-        print(f"Initial decoder loss: {initial_loss.item():.6f}")
-        
-        # Train for multiple batches
-        train_iter = iter(self.train_iter)
-        running_loss = 0.0
-        
-        for batch_idx in range(num_batches):
-            try:
-                batch = next(train_iter)
-            except StopIteration:
-                train_iter = iter(self.train_iter)
-                batch = next(train_iter)
-                
-            # Unpack batch and use full_spectrogram (unmasked version)
-            full_spectrogram, _, _, _, _, _ = batch  # Use full_spectrogram
-            full_spectrogram = full_spectrogram.to(self.device)
-            
-            # Get embeddings from frozen encoder using unmasked spectrogram
-            with torch.no_grad():
-                embeddings, _ = self.model.context_encoder(full_spectrogram)
-            
-            # Forward pass through decoder
-            decoder_optimizer.zero_grad()
-            decoded = self.model.decoder(embeddings)
-            decoded = decoded.transpose(1, 2)
-            
-            # Compute loss using full spectrogram
-            decoder_loss = F.mse_loss(decoded, full_spectrogram)
-            
-            # Backward pass
-            decoder_loss.backward()
-            decoder_optimizer.step()
-            
-            running_loss += decoder_loss.item()
-            
-            if (batch_idx + 1) % 10 == 0:
-                avg_loss = running_loss / 10
-                print(f"Batch {batch_idx + 1}/{num_batches}, Average Loss: {avg_loss:.6f}")
-                running_loss = 0.0
-        
-        # Get final loss and visualize using test batch
-        test_batch = next(iter(self.test_iter))
-        full_spectrogram, _, _, _, _, _ = test_batch  # Use full_spectrogram
-        full_spectrogram = full_spectrogram.to(self.device)
-        with torch.no_grad():
-            embeddings, _ = self.model.context_encoder(full_spectrogram)
-            decoded = self.model.decoder(embeddings)
-            decoded = decoded.transpose(1, 2)
-            final_loss = F.mse_loss(decoded, full_spectrogram)
-            
-            # Visualize reconstruction
-            self.visualize_decoder_reconstruction(
-                step=step,
-                original_spec=full_spectrogram,  # Use full_spectrogram
-                decoded_pred=decoded,
-                context_repr=embeddings,
-                mask=None
-            )
-        
-        print(f"Final decoder loss: {final_loss.item():.6f}\n")
-
-    def moving_average(self, values, window):
-        if len(values) == 0:
-            return []
-        
-        # Exponential Moving Average
-        alpha = 2 / (window + 1)  # Smoothing factor
-        ema = [values[0]]  # Initialize with first value
-        for i in range(1, len(values)):
-            ema.append(alpha * values[i] + (1 - alpha) * ema[-1])
-        return ema
-
-    def get_network_stats(self, network, name):
-        """Get gradient and weight statistics for a network"""
-        grad_norm = 0
-        weight_norm = 0
-        grad_max = 0
-        weight_max = 0
-        param_count = 0
-        
-        for p in network.parameters():
-            if p.grad is not None:
-                grad_norm += p.grad.norm().item() ** 2
-                grad_max = max(grad_max, p.grad.abs().max().item())
-            weight_norm += p.norm().item() ** 2
-            weight_max = max(weight_max, p.abs().max().item())
-            param_count += p.numel()
-        
-        grad_norm = grad_norm ** 0.5
-        weight_norm = weight_norm ** 0.5
-        
-        return {
-            f"{name}_grad_norm": grad_norm,
-            f"{name}_grad_max": grad_max,
-            f"{name}_weight_norm": weight_norm,
-            f"{name}_weight_max": weight_max,
-            f"{name}_param_count": param_count
-        }
-
-    def adjust_learning_rate(self, step):
-        """Commented out custom learning rate schedule"""
-        # if step < self.warmup_steps:
-        #     # Linear warmup
-        #     lr = self.initial_lr + (self.peak_lr - self.initial_lr) * (step / self.warmup_steps)
-        # else:
-        #     # Cosine decay from peak_lr to final_lr
-        #     progress = (step - self.warmup_steps) / (self.max_steps - self.warmup_steps)
-        #     lr = self.final_lr + 0.5 * (self.peak_lr - self.final_lr) * (1 + math.cos(math.pi * progress))
-        
-        # Update learning rate
-        # for param_group in self.optimizer.param_groups:
-        #     param_group['lr'] = lr
-        
-        return self.optimizer.param_groups[0]['lr']  # Just return current learning rate
-
-    def adjust_weight_decay(self, step):
-        """Linear weight decay schedule (currently disabled)"""
-        # Commenting out weight decay adjustment
-        # progress = step / self.max_steps
-        # weight_decay = self.initial_wd + (self.final_wd - self.initial_wd) * progress
-        
-        # Update weight decay
-        # for param_group in self.optimizer.param_groups:
-        #     param_group['weight_decay'] = weight_decay
-        
-        return 0.0  # Return 0 since weight decay is disabled
-
-    def adjust_momentum(self, step):
-        """Linear momentum schedule for target encoder EMA"""
-        progress = step / self.max_steps
-        momentum = self.initial_momentum + (self.final_momentum - self.initial_momentum) * progress
-        
-        # Update momentum in model's EMA
-        self.model.ema_m = momentum
-        
-        return momentum
-
-    def train(self, continue_training=False, training_stats=None, last_step=0):
         step = last_step + 1 if continue_training else 0
         scaler = GradScaler()
 
-        if continue_training:
-            raw_loss_list = training_stats.get('training_loss', [])
-            raw_val_loss_list = training_stats.get('validation_loss', [])
-            raw_masked_seq_acc_list = training_stats.get('masked_seq_acc', [])
-            raw_unmasked_seq_acc_list = training_stats.get('unmasked_seq_acc', [])
-            steps_since_improvement = training_stats.get('steps_since_improvement', 0)
-            best_val_loss = training_stats.get('best_val_loss', float('inf'))
+        # initialize or load training stats
+        if not training_stats:
+            stats = {
+                'training_loss': [],
+                'validation_loss': [],
+                'steps_since_improvement': 0,
+                'best_val_loss': float('inf'),
+                'grad_stats': [],
+                'network_stats': [],
+                'embedding_stats': [],
+                'learning_rates': []
+            }
         else:
-            raw_loss_list = []
-            raw_val_loss_list = []
-            raw_masked_seq_acc_list = []
-            raw_unmasked_seq_acc_list = []
-            steps_since_improvement = 0
-            best_val_loss = float('inf')
+            stats = training_stats
+
+        best_val_loss = stats.get('best_val_loss', float('inf'))
+        steps_since_improvement = stats.get('steps_since_improvement', 0)
 
         train_iter = iter(self.train_iter)
         test_iter = iter(self.test_iter)
 
-        # Get single batch if overfitting
-        if self.overfit_single_batch:
-            train_batch = next(iter(self.train_iter))
-            val_batch = train_batch  # Use same batch for validation
-            print("\nOverfitting on single batch...")
-            
+        def has_gradients(optimizer):
+            for group in optimizer.param_groups:
+                for p in group['params']:
+                    if p.grad is not None:
+                        return True
+            return False
+
         while step < self.max_steps:
             try:
                 if not self.overfit_single_batch:
-                    train_batch = next(train_iter)
+                    batch = next(train_iter)
                     val_batch = next(test_iter)
             except StopIteration:
                 if not self.overfit_single_batch:
                     train_iter = iter(self.train_iter)
-                    test_iter = iter(self.test_iter)
+                    test_iter  = iter(self.test_iter)
                     continue
 
-            # Unpack batch with mask
-            full_spectrogram, target_spectrogram, context_spectrogram, ground_truth_labels, mask, file_names = train_batch
-            val_full_spect, val_target_spect, val_context_spect, val_labels, val_mask, val_file_names = val_batch
+            self.adjust_momentum(step)
             
-            # Move everything to device
-            context_spectrogram = context_spectrogram.to(self.device)
-            target_spectrogram = target_spectrogram.to(self.device)
-            mask = mask.to(self.device)  # Move mask to device
-            
-            # Training step with mask
+            full_spect, targ_spect, cont_spect, labels, mask, file_names = batch
+            cont_spect = cont_spect.to(self.device)
+            targ_spect = targ_spect.to(self.device)
+            mask       = mask.to(self.device)
+
             self.model.train()
+
+            self.encoder_optimizer.zero_grad(set_to_none=True)
+            self.predictor_optimizer.zero_grad(set_to_none=True)
+            self.decoder_optimizer.zero_grad(set_to_none=True)
+
             with autocast():
-                loss = self.model.training_step(context_spectrogram, target_spectrogram, mask)
+                loss, diff, pred, target_repr, context_repr = self.model.compute_latent_loss(
+                    cont_spect, targ_spect, mask
+                )
 
-            self.optimizer.zero_grad()
             scaler.scale(loss).backward()
-            scaler.step(self.optimizer)
-            scaler.update()
-            
-            # Periodically train decoder
-            if step % 1000 == 0:
-                self.train_decoder(step=step)
 
-            # Validation step
-            val_loss, masked_seq_acc, unmasked_seq_acc = self.validate_model(
-                step, context_spec=val_context_spect.to(self.device), 
-                target_spec=val_target_spect.to(self.device), 
+            if step >= self.freeze_encoder_steps and has_gradients(self.encoder_optimizer):
+                scaler.unscale_(self.encoder_optimizer)
+                scaler.step(self.encoder_optimizer)
+
+            if step >= self.freeze_decoder_steps and has_gradients(self.decoder_optimizer):
+                scaler.unscale_(self.decoder_optimizer)
+                scaler.step(self.decoder_optimizer)
+
+            if has_gradients(self.predictor_optimizer):
+                scaler.unscale_(self.predictor_optimizer)
+                scaler.step(self.predictor_optimizer)
+
+            scaler.update()
+
+            try:
+                val_full, val_target, val_cont, val_labels, val_mask, val_fnames = val_batch
+            except StopIteration:
+                test_iter = iter(self.test_iter)
+                val_batch = next(test_iter)
+                val_full, val_target, val_cont, val_labels, val_mask, val_fnames = val_batch
+
+            val_loss, _ = self.validate_model(
+                step,
+                context_spec=val_cont.to(self.device),
+                target_spec=val_target.to(self.device),
                 mask=val_mask.to(self.device),
-                vocalization=val_labels.to(self.device)  # Use val_labels instead of val_vocalization
+                vocalization=val_labels.to(self.device)
             )
 
-            # Update statistics
             raw_loss_list.append(loss.item())
             raw_val_loss_list.append(val_loss)
-            raw_masked_seq_acc_list.append(masked_seq_acc)
-            raw_unmasked_seq_acc_list.append(unmasked_seq_acc)
+
+            # record them in stats for continuity
+            stats['training_loss'].append(loss.item())
+            stats['validation_loss'].append(val_loss)
 
             if step % self.eval_interval == 0:
-                # Get current learning rate
-                current_lr = self.optimizer.param_groups[0]['lr']
-
-                # Get context encoder gradient norm
-                context_stats = self.get_network_stats(self.model.context_encoder, "context")
-                context_grad_norm = context_stats["context_grad_norm"]
-
-                # Calculate variances
-                with torch.no_grad():
-                    context_repr, _ = self.model.context_encoder(context_spectrogram)
-                    target_repr, _ = self.model.target_encoder(target_spectrogram)
-                    context_var = self.embedding_variance(context_repr)
-                    target_var = self.embedding_variance(target_repr)
-
-                # Calculate smoothed losses
                 if step == 0:
-                    # For first step, just use raw values
                     smoothed_training_loss = loss.item()
                     smoothed_val_loss = val_loss
                 else:
-                    # Use EMA for subsequent steps
-                    recent_train_losses = raw_loss_list[-self.trailing_avg_window:]
-                    recent_val_losses = raw_val_loss_list[-self.trailing_avg_window:]
-                    
-                    smoothed_values = self.moving_average(recent_train_losses, self.trailing_avg_window)
-                    smoothed_training_loss = smoothed_values[-1] if smoothed_values else loss.item()
-                    
-                    smoothed_values = self.moving_average(recent_val_losses, self.trailing_avg_window)
-                    smoothed_val_loss = smoothed_values[-1] if smoothed_values else val_loss
+                    def ema(vals, w):
+                        alpha = 2/(w+1)
+                        out = [vals[0]]
+                        for x in vals[1:]:
+                            out.append(alpha*x + (1-alpha)*out[-1])
+                        return out
+                    train_recent = raw_loss_list[-self.trailing_avg_window:]
+                    val_recent   = raw_val_loss_list[-self.trailing_avg_window:]
+
+                    s_train = ema(train_recent, self.trailing_avg_window)
+                    s_val   = ema(val_recent,   self.trailing_avg_window)
+
+                    smoothed_training_loss = s_train[-1] if s_train else loss.item()
+                    smoothed_val_loss      = s_val[-1]   if s_val   else val_loss
+
+                enc_lr = self.encoder_optimizer.param_groups[0]['lr']
+                dec_lr = self.decoder_optimizer.param_groups[0]['lr']
+                pred_lr= self.predictor_optimizer.param_groups[0]['lr']
+
+                c_stats = self.get_network_stats(self.model.context_encoder, "context")
+                gnorm   = c_stats["context_grad_norm"]
+
+                with torch.no_grad():
+                    c_repr, _ = self.model.context_encoder(cont_spect)
+                    t_repr, _ = self.model.target_encoder(targ_spect)
+                    c_var = self.embedding_variance(c_repr)
+                    t_var = self.embedding_variance(t_repr)
 
                 print(f"\nStep [{step}/{self.max_steps}] - "
                       f"Smoothed Train Loss: {smoothed_training_loss:.4f}, "
                       f"Smoothed Val Loss: {smoothed_val_loss:.4f}, "
-                      f"Vars [C/T]: {context_var:.4f}/{target_var:.4f} - "
-                      f"Grad Norm: {context_grad_norm:.2e} - "
-                      f"LR: {current_lr:.2e}")
+                      f"Vars [C/T]: {c_var:.4f}/{t_var:.4f} - "
+                      f"GradNorm: {gnorm:.2e} - "
+                      f"LRs: enc={enc_lr:.2e}, pred={pred_lr:.2e}, dec={dec_lr:.2e}")
 
                 if smoothed_val_loss < best_val_loss:
                     best_val_loss = smoothed_val_loss
@@ -641,184 +348,340 @@ class ModelTrainer:
                     steps_since_improvement += 1
 
                 if self.early_stopping and steps_since_improvement >= self.patience:
-                    print(f"\nEarly stopping triggered at step {step}. No improvement for {self.patience} intervals.")
+                    print(f"\nEarly stopping triggered at step {step}. no improvement for {self.patience} intervals.")
+                    # save final checkpoint before stopping
+                    stats['best_val_loss'] = best_val_loss
+                    stats['steps_since_improvement'] = steps_since_improvement
+                    self.save_model(step, stats, raw_loss_list, raw_val_loss_list)
                     break
 
-            if step % self.save_interval == 0:
-                training_stats = {
-                    'training_loss': raw_loss_list,
-                    'validation_loss': raw_val_loss_list,
-                    'masked_seq_acc': raw_masked_seq_acc_list,
-                    'unmasked_seq_acc': raw_unmasked_seq_acc_list,
-                    'best_val_loss': best_val_loss,
-                    'steps_since_improvement': steps_since_improvement
+                c_stats = self.get_network_stats(self.model.context_encoder, "context")
+                lr_stats = {
+                    'encoder_lr': self.encoder_optimizer.param_groups[0]['lr'],
+                    'predictor_lr': self.predictor_optimizer.param_groups[0]['lr'],
+                    'decoder_lr': self.decoder_optimizer.param_groups[0]['lr']
                 }
-                self.save_model(step, training_stats)
+                emb_stats = {
+                    'context_var': c_var,
+                    'target_var': t_var,
+                    'grad_norm': gnorm
+                }
+                stats['grad_stats'].append(c_stats)
+                stats['learning_rates'].append(lr_stats)
+                stats['embedding_stats'].append(emb_stats)
+
+            if step % self.save_interval == 0:
+                stats['best_val_loss'] = best_val_loss
+                stats['steps_since_improvement'] = steps_since_improvement
+                self.save_model(step, stats, raw_loss_list, raw_val_loss_list)
 
             step += 1
-            # Update target encoder EMA
             self.model.update_ema()
 
+        # done loop
+        final_stats = {
+            'training_loss': stats['training_loss'],
+            'validation_loss': stats['validation_loss'],
+            'best_val_loss': best_val_loss,
+            'steps_since_improvement': steps_since_improvement
+        }
+        # merge final with existing stats
+        stats.update(final_stats)
+        self.save_model(step-1, stats, raw_loss_list, raw_val_loss_list)
         return raw_loss_list, raw_val_loss_list
 
-    def plot_results(self, save_plot=True, config=None):
-        stats_filename = "training_statistics.json"
-        stats_filepath = os.path.join(self.experiment_dir, stats_filename)
-        
-        with open(stats_filepath, 'r') as json_file:
-            training_stats = json.load(json_file)
-        
-        steps = list(range(len(training_stats['training_loss'])))
-        training_losses = training_stats['training_loss']
-        validation_losses = training_stats['validation_loss']
-        masked_seq_acc = training_stats['masked_seq_acc']
-        unmasked_seq_acc = training_stats['unmasked_seq_acc']
+    def validate_model(self, step, context_spec, target_spec, mask, vocalization):
+        self.model.eval()
+        with torch.no_grad():
+            loss, diff, pred_sequence, target_repr, context_repr = self.model.compute_latent_loss(
+                context_spec, target_spec, mask
+            )
+            c_stats = self.compute_embedding_stats(context_repr)
+            t_stats = self.compute_embedding_stats(target_repr)
+            p_stats = self.compute_embedding_stats(pred_sequence)
+            self.update_embedding_stats(context_repr, target_repr, pred_sequence)
 
-        # Calculate smoothed values
-        smoothed_training_losses = self.moving_average(training_losses, self.trailing_avg_window)
-        smoothed_validation_losses = self.moving_average(validation_losses, self.trailing_avg_window)
-        smoothed_masked_seq_acc = self.moving_average(masked_seq_acc, self.trailing_avg_window)
-        smoothed_unmasked_seq_acc = self.moving_average(unmasked_seq_acc, self.trailing_avg_window)
+            if step % self.eval_interval == 0:
+                print("\nEmbedding Statistics:")
+                print(f"Context var={c_stats['embedding_variance']:.4f}, dist={c_stats['avg_pairwise_distance']:.4f}, norm={c_stats['avg_embedding_norm']:.4f}")
+                print(f"Target  var={t_stats['embedding_variance']:.4f}, dist={t_stats['avg_pairwise_distance']:.4f}, norm={t_stats['avg_embedding_norm']:.4f}")
+                print(f"Pred    var={p_stats['embedding_variance']:.4f}, dist={p_stats['avg_pairwise_distance']:.4f}, norm={p_stats['avg_embedding_norm']:.4f}")
 
-        # Generate learning rate schedule for plotting
-        lr_schedule = []
-        for step in range(self.max_steps):
-            lr_schedule.append(self.adjust_learning_rate(step))
-        lr_steps = list(range(len(lr_schedule)))
+                self.visualize_latent_predictions(
+                    step=step,
+                    context_spectrogram=context_spec,
+                    target_spectrogram=target_spec,
+                    context_repr=context_repr,
+                    pred_sequence=pred_sequence,
+                    target_repr=target_repr,
+                    mask=mask
+                )
 
-        # Create corresponding steps arrays that match the smoothed data lengths
-        smoothed_steps = steps[:len(smoothed_training_losses)]
+            return loss.item(), {}
 
-        plt.figure(figsize=(16, 12))
+    def visualize_latent_predictions(
+        self, 
+        step,
+        context_spectrogram,
+        target_spectrogram,
+        context_repr,
+        pred_sequence,
+        target_repr,
+        mask
+    ):
+        fig, axs = plt.subplots(2, 3, figsize=(20,10))
+        axs = axs.flatten()
 
-        # Plot 1: Training and Validation Loss
-        plt.subplot(2, 2, 1)
-        if len(smoothed_training_losses) > 0 and len(smoothed_validation_losses) > 0:
-            plt.plot(smoothed_steps, smoothed_training_losses, label='Smoothed Training Loss')
-            plt.plot(smoothed_steps, smoothed_validation_losses, label='Smoothed Validation Loss')
-        else:
-            plt.plot(steps, training_losses, label='Training Loss')
-            plt.plot(steps, validation_losses, label='Validation Loss')
-        plt.xlabel('Step')
-        plt.ylabel('Loss')
-        plt.title('Smoothed Training and Validation Loss')
-        plt.legend()
+        img0 = axs[0].imshow(context_spectrogram[0].cpu().numpy(), aspect='auto', origin='lower')
+        axs[0].set_title("context spectrogram")
+        self._add_mask_overlay(axs[0], mask[0])
 
-        # Plot 2: Masked and Unmasked Sequence Loss
-        plt.subplot(2, 2, 2)
-        if len(smoothed_masked_seq_acc) > 0 and len(smoothed_unmasked_seq_acc) > 0:
-            plt.plot(smoothed_steps, smoothed_masked_seq_acc, label='Smoothed Masked Seq Loss')
-            plt.plot(smoothed_steps, smoothed_unmasked_seq_acc, label='Smoothed Unmasked Seq Loss')
-        else:
-            plt.plot(steps, masked_seq_acc, label='Masked Seq Loss')
-            plt.plot(steps, unmasked_seq_acc, label='Unmasked Seq Loss')
-        plt.xlabel('Step')
-        plt.ylabel('Loss')
-        plt.title('Masked and Unmasked Validation Loss')
-        plt.legend()
+        img1 = axs[1].imshow(target_spectrogram[0].cpu().numpy(), aspect='auto', origin='lower')
+        axs[1].set_title("target spectrogram")
+        self._add_mask_overlay(axs[1], ~mask[0])
 
-        # Plot 3: Raw Losses
-        plt.subplot(2, 2, 3)
-        plt.plot(steps, training_losses, label='Raw Training Loss', alpha=0.7)
-        plt.plot(steps, validation_losses, label='Raw Validation Loss', alpha=0.7)
-        plt.xlabel('Step')
-        plt.ylabel('Loss')
-        plt.title('Raw Training and Validation Loss')
-        plt.legend()
+        mask_expanded = mask.unsqueeze(-1)
+        lat_error = ((pred_sequence - target_repr)**2 * mask_expanded)[0].cpu().numpy().T
+        axs[2].imshow(lat_error, aspect='auto', origin='lower', cmap='hot')
+        axs[2].set_title("latent error heatmap (masked)")
 
-        # Plot 4: Learning Rate Schedule
-        plt.subplot(2, 2, 4)
-        plt.plot(lr_steps, lr_schedule, label='Learning Rate', color='green')
-        plt.xlabel('Step')
-        plt.ylabel('Learning Rate')
-        plt.title('Learning Rate Schedule')
-        plt.yscale('log')  # Use log scale for better visualization
-        plt.grid(True)
-        plt.legend()
+        c_repr_disp = context_repr[0].cpu().numpy().T
+        axs[3].imshow(c_repr_disp, aspect='auto', origin='lower')
+        axs[3].set_title("context embeddings")
+
+        t_repr_disp = target_repr[0].cpu().numpy().T
+        axs[4].imshow(t_repr_disp, aspect='auto', origin='lower')
+        axs[4].set_title("target embeddings")
+
+        p_repr_disp = pred_sequence[0].cpu().numpy().T
+        axs[5].imshow(p_repr_disp, aspect='auto', origin='lower')
+        axs[5].set_title("predicted embeddings")
+
+        for ax in axs:
+            ax.set_xticks([])
+            ax.set_yticks([])
 
         plt.tight_layout()
+        fname = os.path.join(self.predictions_subfolder_path, f"latent_vis_{step}.png")
+        plt.savefig(fname, dpi=100)
+        plt.close(fig)
 
+    def _add_mask_overlay(self, axis, mask_1d):
+        if mask_1d.dim() > 1:
+            mask_1d = mask_1d.any(dim=0)
+        mask_1d = mask_1d.cpu().numpy()
+
+        y_min, y_max = axis.get_ylim()
+        bar_pos = y_max - 10
+        for t, is_masked in enumerate(mask_1d):
+            if is_masked:
+                axis.add_patch(plt.Rectangle((t, bar_pos), 1, 10, edgecolor='none', facecolor='red'))
+
+    def compute_embedding_stats(self, embeddings):
+        with torch.no_grad():
+            var_ = embeddings.var(dim=-1).mean().item()
+            B,T,H = embeddings.shape
+            flat = embeddings.reshape(-1,H)
+            if flat.shape[0] > 1000:
+                idx = torch.randperm(flat.shape[0])[:1000]
+                flat = flat[idx]
+            dmat = torch.cdist(flat, flat)
+            avg_dist = dmat.mean().item()
+            avg_norm = embeddings.norm(dim=-1).mean().item()
+            return {
+                'embedding_variance': var_,
+                'avg_pairwise_distance': avg_dist,
+                'avg_embedding_norm': avg_norm
+            }
+
+    def update_embedding_stats(self, c_repr, t_repr, p_repr):
+        c = self.compute_embedding_stats(c_repr)
+        t = self.compute_embedding_stats(t_repr)
+        p = self.compute_embedding_stats(p_repr)
+
+        self.embedding_stats_history['context_variance'].append(c['embedding_variance'])
+        self.embedding_stats_history['context_distance'].append(c['avg_pairwise_distance'])
+        self.embedding_stats_history['context_norm'].append(c['avg_embedding_norm'])
+
+        self.embedding_stats_history['target_variance'].append(t['embedding_variance'])
+        self.embedding_stats_history['target_distance'].append(t['avg_pairwise_distance'])
+        self.embedding_stats_history['target_norm'].append(t['avg_embedding_norm'])
+
+        self.embedding_stats_history['pred_variance'].append(p['embedding_variance'])
+        self.embedding_stats_history['pred_distance'].append(p['avg_pairwise_distance'])
+        self.embedding_stats_history['pred_norm'].append(p['avg_embedding_norm'])
+
+    def get_network_stats(self, network, name):
+        grad_norm=0
+        weight_norm=0
+        grad_max=0
+        weight_max=0
+        param_count=0
+
+        for p in network.parameters():
+            if p.grad is not None:
+                gn = p.grad.norm().item()
+                grad_norm += gn**2
+                gmax = p.grad.abs().max().item()
+                grad_max = max(grad_max, gmax)
+            pn = p.norm().item()
+            weight_norm += pn**2
+            weight_max = max(weight_max, p.abs().max().item())
+            param_count += p.numel()
+
+        grad_norm = grad_norm**0.5
+        weight_norm=weight_norm**0.5
+
+        return {
+            f"{name}_grad_norm": grad_norm,
+            f"{name}_grad_max":  grad_max,
+            f"{name}_weight_norm": weight_norm,
+            f"{name}_weight_max": weight_max,
+            f"{name}_param_count": param_count
+        }
+
+    def moving_average(self, values, window):
+        if not len(values):
+            return []
+        alpha= 2/(window+1)
+        out = [values[0]]
+        for x in values[1:]:
+            out.append(alpha*x + (1-alpha)*out[-1])
+        return out
+
+    def plot_results(self, save_plot=True, config=None):
+        stats_file = os.path.join(self.experiment_dir, "training_statistics.json")
+        with open(stats_file, 'r') as jf:
+            training_stats = json.load(jf)
+
+        steps = list(range(len(training_stats['training_loss'])))
+        train_losses = training_stats['training_loss']
+        val_losses   = training_stats['validation_loss']
+
+        s_train = self.moving_average(train_losses, self.trailing_avg_window)
+        s_val   = self.moving_average(val_losses,   self.trailing_avg_window)
+
+        fig = plt.figure(figsize=(20,15))
+        ax1 = fig.add_subplot(2,2,1)
+        ax1.plot(steps, s_train, label='Smoothed Train Loss')
+        ax1.plot(steps, s_val,   label='Smoothed Val Loss')
+        ax1.legend()
+        ax1.set_xlabel('Step')
+        ax1.set_ylabel('Loss')
+        ax1.set_title('Training & Validation Loss')
+
+        emb = training_stats['embedding_stats_history']
+        ax2 = fig.add_subplot(2,2,2)
+        ax2.plot(steps, emb['context_variance'], label='Context Var')
+        ax2.plot(steps, emb['target_variance'],  label='Target Var')
+        ax2.plot(steps, emb['pred_variance'],    label='Pred Var')
+        ax2.legend()
+        ax2.set_title('Embedding Variance')
+
+        ax3 = fig.add_subplot(2,2,3)
+        ax3.plot(steps, emb['context_distance'], label='Context Dist')
+        ax3.plot(steps, emb['target_distance'],  label='Target Dist')
+        ax3.plot(steps, emb['pred_distance'],    label='Pred Dist')
+        ax3.legend()
+        ax3.set_title('Avg Pairwise Distance')
+
+        ax4 = fig.add_subplot(2,2,4)
+        ax4.plot(steps, emb['context_norm'], label='Context Norm')
+        ax4.plot(steps, emb['target_norm'],  label='Target Norm')
+        ax4.plot(steps, emb['pred_norm'],    label='Pred Norm')
+        ax4.legend()
+        ax4.set_title('Avg Embedding Norm')
+
+        plt.tight_layout()
         if save_plot:
-            plt.savefig(os.path.join(self.experiment_dir, 'training_validation_loss_plots.png'))
+            plt.savefig(os.path.join(self.experiment_dir, 'training_plots.png'))
         else:
             plt.show()
+        plt.close()
+
+    def adjust_momentum(self, step):
+        progress = step / self.max_steps
+        new_m = self.model.ema_m + (1.0 - self.model.ema_m)*progress
+        self.model.ema_m = new_m
+        return new_m
 
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser()
     parser.add_argument('--train_dir', type=str, required=True)
-    parser.add_argument('--test_dir', type=str, required=True)
-    parser.add_argument('--steps', type=int, default=1000)
-    parser.add_argument('--batch_size', type=int, default=42)
-    parser.add_argument('--lr', type=float, default=1e-3)
-    parser.add_argument('--name', type=str, required=True, help='Name of the experiment')
-    parser.add_argument('--eval_interval', type=int, default=100, help='How often to run validation')
-    parser.add_argument('--input_dim', type=int, default=513, help='Input dimension (frequency bins)')
-    parser.add_argument('--hidden_dim', type=int, default=256, help='Hidden dimension for encoders')
-    parser.add_argument('--num_layers', type=int, default=6, help='Number of transformer layers for encoders')
-    parser.add_argument('--num_heads', type=int, default=4, help='Number of attention heads for encoders')
-    parser.add_argument('--dropout', type=float, default=0.1, help='Dropout rate')
-    parser.add_argument('--mlp_dim', type=int, default=512, help='MLP hidden dimension for encoders')
-    parser.add_argument('--pred_hidden_dim', type=int, default=256, help='Hidden dimension for predictor')
-    parser.add_argument('--pred_num_layers', type=int, default=3, help='Number of transformer layers for predictor')
-    parser.add_argument('--pred_num_heads', type=int, default=4, help='Number of attention heads for predictor')
-    parser.add_argument('--pred_mlp_ratio', type=float, default=2.0, help='MLP ratio for predictor')
-    parser.add_argument('--max_seq_len', type=int, default=500, help='Maximum sequence length for predictor')
-    parser.add_argument('--overfit_batch', action='store_true', 
-                       help='Whether to overfit on a single batch (default: False)')
-    parser.add_argument('--mask_ratio', type=float, default=0.5,
-                       help='Ratio of timesteps to mask (default: 0.5)')
-    parser.add_argument('--verbose', action='store_true',
-                       help='Enable verbose output during training')
+    parser.add_argument('--test_dir',  type=str, required=True)
+    parser.add_argument('--steps',     type=int, default=50000)
+    parser.add_argument('--batch_size',type=int, default=64)
+    parser.add_argument('--lr',        type=float, default=1e-4)
+    parser.add_argument('--name',      type=str, required=True)
+    parser.add_argument('--eval_interval', type=int, default=500)
+    parser.add_argument('--input_dim', type=int, default=513)
+    parser.add_argument('--hidden_dim',type=int, default=256)
+    parser.add_argument('--num_layers',type=int, default=3)
+    parser.add_argument('--num_heads', type=int, default=4)
+    parser.add_argument('--dropout',   type=float, default=0.0)
+    parser.add_argument('--mlp_dim',   type=int, default=512)
+    parser.add_argument('--pred_hidden_dim', type=int, default=256)
+    parser.add_argument('--pred_num_layers', type=int, default=2)
+    parser.add_argument('--pred_num_heads',  type=int, default=4)
+    parser.add_argument('--pred_mlp_dim',    type=int, default=512)
+    parser.add_argument('--max_seq_len',     type=int, default=500)
+    parser.add_argument('--overfit_batch',   action='store_true')
+    parser.add_argument('--mask_ratio',      type=float, default=0.3)
+    parser.add_argument('--verbose',         action='store_true')
+    parser.add_argument('--encoder_lr',      type=float, default=1e-4)
+    parser.add_argument('--predictor_lr',    type=float, default=1e-4)
+    parser.add_argument('--decoder_lr',      type=float, default=1e-4)
+    parser.add_argument('--freeze_encoder_steps', type=int, default=0)
+    parser.add_argument('--freeze_decoder_steps', type=int, default=0)
+    parser.add_argument('--patience',        type=int, default=4)
+    parser.add_argument('--ema_momentum',    type=float, default=0.9)
+    parser.add_argument('--continue_training', action='store_true', help='Continue training from checkpoint')
+    
     args = parser.parse_args()
 
     root_exp_dir = "experiments"
-    archive_dir = os.path.join(root_exp_dir, "archive")
+    archive_dir  = os.path.join(root_exp_dir, "archive")
     experiment_dir = os.path.join(root_exp_dir, args.name)
-    
-    # Create archive directory if it doesn't exist
     os.makedirs(archive_dir, exist_ok=True)
 
-    # If experiment directory already exists and we're not continuing training
-    if os.path.exists(experiment_dir):
-        # Create timestamped name for archived experiment
+    if os.path.exists(experiment_dir) and not args.continue_training:
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
         archived_name = f"{args.name}_{timestamp}"
         archived_path = os.path.join(archive_dir, archived_name)
-        
-        # Move existing experiment to archive
         shutil.move(experiment_dir, archived_path)
         print(f"Archived existing experiment to: {archived_path}")
 
-    # Create new experiment directory
     os.makedirs(experiment_dir, exist_ok=True)
     weights_dir = os.path.join(experiment_dir, 'saved_weights')
-
     os.makedirs(experiment_dir, exist_ok=True)
+
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
     dl_train = DataLoader(
         BirdJEPA_Dataset(data_dir=args.train_dir, segment_len=args.max_seq_len, verbose=False),
         batch_size=args.batch_size,
         shuffle=True,
-        collate_fn=lambda batch: collate_fn(batch, 
-                                          segment_length=args.max_seq_len, 
-                                          mask_p=args.mask_ratio, 
-                                          verbose=False)
+        collate_fn=lambda batch: collate_fn(
+            batch,
+            segment_length=args.max_seq_len,
+            mask_p=args.mask_ratio,
+            verbose=False
+        )
     )
-
     dl_test = DataLoader(
         BirdJEPA_Dataset(data_dir=args.test_dir, segment_len=args.max_seq_len, verbose=False),
         batch_size=args.batch_size,
         shuffle=True,
-        collate_fn=lambda batch: collate_fn(batch, 
-                                          segment_length=args.max_seq_len, 
-                                          mask_p=args.mask_ratio, 
-                                          verbose=False)
+        collate_fn=lambda batch: collate_fn(
+            batch,
+            segment_length=args.max_seq_len,
+            mask_p=args.mask_ratio,
+            verbose=False
+        )
     )
 
-    # ensure input_dim matches D from dataset
-    # set input_dim=... (e.g., 256)
+    from model import BirdJEPA
     model = BirdJEPA(
         input_dim=args.input_dim,
         hidden_dim=args.hidden_dim,
@@ -829,70 +692,90 @@ if __name__ == '__main__':
         pred_hidden_dim=args.pred_hidden_dim,
         pred_num_layers=args.pred_num_layers,
         pred_num_heads=args.pred_num_heads,
-        pred_mlp_ratio=args.pred_mlp_ratio,
+        pred_mlp_dim=args.pred_mlp_dim,
         max_seq_len=args.max_seq_len
     ).to(device)
-    opt = torch.optim.AdamW(
-        list(model.context_encoder.parameters()) + 
-        list(model.predictor.parameters()) + 
-        list(model.decoder.parameters()),
-        lr=args.lr,  # Now using the learning rate from argparse
-        weight_decay=0.0
-    )
 
-    # Create config dictionary
     config = {
-        # Data parameters
-        "input_dim": args.input_dim,
-        "max_seq_len": args.max_seq_len,
-        "mask_ratio": args.mask_ratio,
-        
-        # Model architecture
-        "hidden_dim": args.hidden_dim,
-        "num_layers": args.num_layers,
-        "num_heads": args.num_heads,
-        "dropout": args.dropout,
-        "mlp_dim": args.mlp_dim,
-        
-        # Predictor parameters
+        "input_dim":      args.input_dim,
+        "max_seq_len":    args.max_seq_len,
+        "mask_ratio":     args.mask_ratio,
+        "hidden_dim":     args.hidden_dim,
+        "num_layers":     args.num_layers,
+        "num_heads":      args.num_heads,
+        "dropout":        args.dropout,
+        "mlp_dim":        args.mlp_dim,
         "pred_hidden_dim": args.pred_hidden_dim,
         "pred_num_layers": args.pred_num_layers,
-        "pred_num_heads": args.pred_num_heads,
-        "pred_mlp_ratio": args.pred_mlp_ratio,
-        
-        # Training parameters
-        "batch_size": args.batch_size,
-        "learning_rate": args.lr,
-        "max_steps": args.steps,
-        "eval_interval": args.eval_interval,
-        
-        # Paths and names
+        "pred_num_heads":  args.pred_num_heads,
+        "pred_mlp_dim":    args.pred_mlp_dim,
+        "batch_size":      args.batch_size,
+        "learning_rate":   args.lr,
+        "max_steps":       args.steps,
+        "eval_interval":   args.eval_interval,
         "experiment_name": args.name,
-        "train_dir": args.train_dir,
-        "test_dir": args.test_dir,
-        
-        # Additional info
+        "train_dir":       args.train_dir,
+        "test_dir":        args.test_dir,
         "device": str(device),
         "timestamp": datetime.now().strftime("%Y%m%d_%H%M%S")
     }
-    
-    # Save config
+
     config_path = os.path.join(experiment_dir, 'config.json')
     with open(config_path, 'w') as f:
         json.dump(config, f, indent=4)
-    
-    trainer = ModelTrainer(model=model, 
-                          train_loader=dl_train, 
-                          test_loader=dl_test, 
-                          optimizer=opt, 
-                          device=device, 
-                          max_steps=args.steps, 
-                          eval_interval=args.eval_interval,
-                          save_interval=500, 
-                          weights_save_dir=weights_dir,
-                          experiment_dir=experiment_dir,
-                          verbose=args.verbose,
-                          overfit_single_batch=args.overfit_batch)
 
-    trainer.train()
-    trainer.plot_results(save_plot=True)
+    if args.continue_training:
+        model, checkpoint, config = load_model(os.path.join("experiments", args.name), return_checkpoint=True)
+        model = model.to(device)
+        
+        trainer = ModelTrainer(
+            model=model,
+            train_loader=dl_train,
+            test_loader=dl_test,
+            device=device,
+            max_steps=args.steps,
+            eval_interval=args.eval_interval,
+            save_interval=500,
+            weights_save_dir=weights_dir,
+            experiment_dir=experiment_dir,
+            verbose=args.verbose,
+            overfit_single_batch=args.overfit_batch,
+            encoder_lr=config.get('encoder_lr', args.encoder_lr),
+            predictor_lr=config.get('predictor_lr', args.predictor_lr),
+            decoder_lr=config.get('decoder_lr', args.decoder_lr),
+            freeze_encoder_steps=args.freeze_encoder_steps,
+            freeze_decoder_steps=args.freeze_decoder_steps,
+            lr=args.lr
+        )
+        
+        last_step, training_stats, raw_loss_list, raw_val_loss_list = trainer.load_model(checkpoint=checkpoint)
+        trainer.train(
+            continue_training=True,
+            training_stats=training_stats,
+            last_step=last_step,
+            raw_loss_list=raw_loss_list,
+            raw_val_loss_list=raw_val_loss_list
+        )
+    else:
+        trainer = ModelTrainer(
+            model=model,
+            train_loader=dl_train,
+            test_loader=dl_test,
+            device=device,
+            max_steps=args.steps,
+            eval_interval=args.eval_interval,
+            save_interval=500,
+            weights_save_dir=weights_dir,
+            experiment_dir=experiment_dir,
+            verbose=args.verbose,
+            overfit_single_batch=args.overfit_batch,
+            encoder_lr=args.encoder_lr,
+            predictor_lr=args.predictor_lr,
+            decoder_lr=args.decoder_lr,
+            freeze_encoder_steps=args.freeze_encoder_steps,
+            freeze_decoder_steps=args.freeze_decoder_steps,
+            lr=args.lr
+        )
+
+        trainer.train()
+        trainer.plot_results(save_plot=True)

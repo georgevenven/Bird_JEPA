@@ -1,8 +1,8 @@
 #!/bin/bash
 
-EXPERIMENT_FOLDER="experiments/bird_jepa_combined_run_1"
+EXPERIMENT_FOLDER="experiments/long_train_1"
 DATA_DIRS=("/media/george-vengrovski/George-SSD/llb_stuff/llb3_test") # replace with actual dirs
-SAVE_NAME="bird_jepa_combined_run_1"
+SAVE_NAME="test"
 
 # Add the path to the src directory
 cd "$(dirname "$0")/.." # Move up one directory from shell_scripts

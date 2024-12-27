@@ -1,4 +1,5 @@
-import torch
+
+# ~~~~ import torch
 import json
 import os
 from model import BirdJEPA
@@ -12,26 +13,25 @@ def load_config(config_path):
 def load_weights(dir, model):
     """Load weights from a checkpoint file"""
     checkpoint = torch.load(dir, map_location='cpu')
-    # Extract just the model state dict from the checkpoint
     model.load_state_dict(checkpoint['model_state_dict'])
     return model
 
-def load_model(experiment_folder):
+def load_model(experiment_folder, return_checkpoint=False):
     """
-    Load a trained BirdJEPA model from an experiment folder.
+    load a trained BirdJEPA model from an experiment folder.
     
-    Args:
-        experiment_folder (str): Path to the experiment folder containing saved weights
+    args:
+        experiment_folder (str): path to the experiment folder containing saved weights
+        return_checkpoint (bool): if true, returns full checkpoint dict for continued training
         
-    Returns:
-        model: Loaded BirdJEPA model with weights
+    returns:
+        model: loaded BirdJEPA model with weights
+        checkpoint (optional): full checkpoint dict if return_checkpoint=true
     """
-    # Load config
     config_path = os.path.join(experiment_folder, 'config.json')
     with open(config_path, 'r') as f:
         config = json.load(f)
     
-    # Initialize model with saved config
     model = BirdJEPA(
         input_dim=config['input_dim'],
         hidden_dim=config['hidden_dim'],
@@ -41,12 +41,11 @@ def load_model(experiment_folder):
         mlp_dim=config['mlp_dim'],
         pred_hidden_dim=config['pred_hidden_dim'],
         pred_num_layers=config['pred_num_layers'],
-        pred_num_heads=config['pred_num_heads'],
-        pred_mlp_ratio=config['pred_mlp_ratio'],
+        pred_num_heads=config.get('pred_num_heads', config['num_heads']),
+        pred_mlp_dim=config['pred_mlp_dim'],
         max_seq_len=config['max_seq_len']
     )
     
-    # Find latest checkpoint
     weights_dir = os.path.join(experiment_folder, 'saved_weights')
     checkpoints = glob.glob(os.path.join(weights_dir, 'checkpoint_*.pt'))
     if not checkpoints:
@@ -57,10 +56,8 @@ def load_model(experiment_folder):
             print("\n".join(os.listdir(weights_dir)))
         raise ValueError(f"No checkpoints found in {weights_dir}")
     
-    # Sort by step number and get latest
     latest_checkpoint = max(checkpoints, key=lambda x: int(x.split('_')[-1].split('.')[0]))
     
-    # Load weights
     checkpoint = torch.load(latest_checkpoint)
     model.load_state_dict(checkpoint['model_state_dict'])
     
@@ -68,9 +65,13 @@ def load_model(experiment_folder):
     print(f"Path: {latest_checkpoint}")
     print(f"Training step: {checkpoint['step']}")
     print(f"Model state keys: {list(checkpoint['model_state_dict'].keys())}")
-    if 'optimizer_state_dict' in checkpoint:
-        print(f"Optimizer state included: Yes")
-    if 'scheduler_state_dict' in checkpoint:
-        print(f"Scheduler state included: Yes")
+    if 'encoder_optimizer_state' in checkpoint:
+        print(f"Encoder optimizer state included: Yes")
+    if 'predictor_optimizer_state' in checkpoint:
+        print(f"Predictor optimizer state included: Yes")
+    if 'decoder_optimizer_state' in checkpoint:
+        print(f"Decoder optimizer state included: Yes")
     
+    if return_checkpoint:
+        return model, checkpoint, config
     return model
