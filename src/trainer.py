@@ -637,6 +637,8 @@ if __name__ == '__main__':
     parser.add_argument('--patience',        type=int, default=4)
     parser.add_argument('--ema_momentum',    type=float, default=0.9)
     parser.add_argument('--continue_training', action='store_true', help='Continue training from checkpoint')
+    parser.add_argument('--zero_predictor_input', action='store_true',
+                      help='If set, the predictor input is zeroed out at masked positions')
     
     args = parser.parse_args()
 
@@ -693,7 +695,8 @@ if __name__ == '__main__':
         pred_num_layers=args.pred_num_layers,
         pred_num_heads=args.pred_num_heads,
         pred_mlp_dim=args.pred_mlp_dim,
-        max_seq_len=args.max_seq_len
+        max_seq_len=args.max_seq_len,
+        zero_predictor_input=args.zero_predictor_input
     ).to(device)
 
     config = {

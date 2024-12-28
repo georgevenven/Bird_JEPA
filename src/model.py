@@ -129,7 +129,8 @@ class BirdJEPA(nn.Module):
                  pred_num_layers=6,
                  pred_num_heads=4,
                  pred_mlp_dim=1024,
-                 max_seq_len=512):
+                 max_seq_len=512,
+                 zero_predictor_input=False):
         super().__init__()
         
         # Store configuration
@@ -139,6 +140,7 @@ class BirdJEPA(nn.Module):
         self.num_heads = num_heads
         self.dropout = dropout
         self.mlp_dim = mlp_dim
+        self.zero_predictor_input = zero_predictor_input
         
         # If pred_num_heads not specified, use same as encoder
         if pred_num_heads is None:
@@ -204,6 +206,12 @@ class BirdJEPA(nn.Module):
         # Encode context
         context_repr, _ = self.context_encoder(context_clean)
         
+        # Add new logic to zero out masked embeddings
+        if self.zero_predictor_input:
+            mask_3d = mask.unsqueeze(-1).expand_as(context_repr)
+            context_repr = context_repr.clone()
+            context_repr[mask_3d] = 0
+        
         # Encode target with frozen encoder
         with torch.no_grad():
             target_repr, _ = self.target_encoder(target_spectrogram)
@@ -221,6 +229,13 @@ class BirdJEPA(nn.Module):
         """Computes loss in embedding space between predictor output and target encoding"""
         # Get context representation and predict target
         context_repr, _ = self.context_encoder(context_spectrogram)  # (B,T,H)
+        
+        # Add new logic to zero out masked embeddings
+        if self.zero_predictor_input:
+            mask_3d = mask.unsqueeze(-1).expand_as(context_repr)
+            context_repr = context_repr.clone()
+            context_repr[mask_3d] = 0
+        
         pred = self.predictor(context_repr)  # (B,T,H)
         
         # Get target representation (with no grad since it's the target)

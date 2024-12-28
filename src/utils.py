@@ -1,9 +1,10 @@
 
-# ~~~~ import torch
+import torch
 import json
 import os
 from model import BirdJEPA
 import glob
+
 
 def load_config(config_path):
     with open(config_path, 'r') as f:

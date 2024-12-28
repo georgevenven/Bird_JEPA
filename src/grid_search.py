@@ -1,3 +1,6 @@
+# TO DO:
+# - add the mask to predictor parameters 
+
 import argparse
 import itertools
 import os
