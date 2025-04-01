@@ -17,13 +17,17 @@ LEARNING_RATE=3e-4                # learning rate for training
 MULTI_THREAD=true                 # set to false for single-thread spectrogram generation
 STEP_SIZE=119                     # step size for spectrogram generation
 NFFT=1024                         # number of fft points for spectrogram
-MAX_STEPS=1                   # maximum training steps
+MAX_STEPS=5                   # maximum training steps
 EVAL_INTERVAL=1                   # evaluation interval
 INPUT_DIM=513                     # input dimension (frequency bins)
 HIDDEN_DIM=64                    # hidden dimension
 MAX_SEQ_LEN=500                   # maximum sequence length
 MASK_RATIO=0.3                    # mask ratio for training
 DEBUG=true                       # debug mode flag (lowercase)
+# If debug mode is enabled, inform the user
+if [ "$DEBUG" = "true" ]; then
+    echo "Debug mode enabled - detailed logs will be saved to experiments/$EXPERIMENT_NAME/debug_log.txt"
+fi
 
 # New flexible architecture configuration
 # Format: "type:param,type:param,..." where type is "local" or "global"
@@ -38,6 +42,10 @@ python_import="from model import LocalAttentionBlock, GlobalAttentionBlock"
 TEMP_DIR="./temp"
 TRAIN_FILE_LIST="$TEMP_DIR/train_files.txt"
 TEST_FILE_LIST="$TEMP_DIR/test_files.txt"
+# Define the experiment directory at the beginning
+EXPERIMENT_DIR="experiments/$EXPERIMENT_NAME"
+mkdir -p "$EXPERIMENT_DIR"
+echo "Created experiment directory: $EXPERIMENT_DIR"
 
 # remove the temp directory if it exists to avoid interference
 if [ -d "$TEMP_DIR" ]; then
@@ -174,9 +182,6 @@ else
 fi
 
 # 10. save file lists into the experiment folder
-EXPERIMENT_DIR="experiments/$EXPERIMENT_NAME"
-mkdir -p "$EXPERIMENT_DIR"
-
 cp "$TRAIN_FILE_LIST" "$EXPERIMENT_DIR/train_files.txt"
 cp "$TEST_FILE_LIST" "$EXPERIMENT_DIR/test_files.txt"
 echo "copied train and test file lists to: $EXPERIMENT_DIR"

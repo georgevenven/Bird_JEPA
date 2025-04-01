@@ -15,6 +15,38 @@ import shutil
 from datetime import datetime
 import math
 from utils import load_model
+import sys
+import io
+
+class LogCapture:
+    def __init__(self, log_file_path, terminal_output=True):
+        self.terminal = sys.stdout
+        # Make sure the directory exists
+        log_dir = os.path.dirname(log_file_path)
+        os.makedirs(log_dir, exist_ok=True)
+        self.log_file = open(log_file_path, 'w')
+        self.log_file_path = log_file_path
+        self.terminal_output = terminal_output
+        print(f"Debug logging enabled - output will be saved to: {log_file_path}")
+        if not terminal_output:
+            print(f"Terminal debug output suppressed - check log file for details")
+        
+    def write(self, message):
+        if self.terminal_output:
+            self.terminal.write(message)
+        self.log_file.write(message)
+        # Flush more frequently to ensure logs are written even if the program crashes
+        self.flush()
+        
+    def flush(self):
+        self.terminal.flush()
+        self.log_file.flush()
+        
+    def close(self):
+        if self.log_file:
+            self.flush()
+            self.log_file.close()
+            self.log_file = None
 
 class ModelTrainer:
     def __init__(
@@ -59,6 +91,15 @@ class ModelTrainer:
         self.verbose = verbose
         self.overfit_single_batch = overfit_single_batch
         self.debug = debug
+        
+        # Set up log capturing if debug mode is enabled
+        if self.debug:
+            log_file_path = os.path.join(self.experiment_dir, 'debug_log.txt')
+            # Only display critical debug info to terminal, full logs go to file
+            self.log_capture = LogCapture(log_file_path, terminal_output=False)
+            sys.stdout = self.log_capture
+            # Write a message to the terminal before redirecting
+            print(f"Debug logging enabled - output will be saved to: {log_file_path}")
 
         # if user provided old single-lr, override
         if lr is not None:
@@ -128,6 +169,15 @@ class ModelTrainer:
     def embedding_variance(self, embeddings):
         return embeddings.var().item()
 
+    def print_to_terminal(self, message):
+        """Print a message directly to the terminal, bypassing the log redirection."""
+        if self.debug and hasattr(self, 'log_capture'):
+            original_stdout = self.log_capture.terminal
+            original_stdout.write(message + "\n")
+            original_stdout.flush()
+        else:
+            print(message)
+
     def save_model(self, step, training_stats, raw_loss_list=None, raw_val_loss_list=None):
         # create checkpoint
         checkpoint = {
@@ -171,6 +221,10 @@ class ModelTrainer:
         with open(stats_file, 'w') as jf:
             json.dump(json_safe_stats, jf)
 
+        # Make sure any captured logs are flushed to disk
+        if self.debug and hasattr(self, 'log_capture'):
+            self.log_capture.flush()
+
     def load_model(self, checkpoint_path=None, checkpoint=None):
         """
         load model and optimizer states from checkpoint
@@ -200,6 +254,28 @@ class ModelTrainer:
         return last_step, training_stats, raw_loss_list, raw_val_loss_list
 
     def train(self, continue_training=False, training_stats=None, last_step=0, raw_loss_list=None, raw_val_loss_list=None):
+        # Add device information at start of training
+        print(f"\nTraining on device: {self.device}")
+        if torch.cuda.is_available():
+            print(f"CUDA is available. Using GPU: {torch.cuda.get_device_name(0)}")
+            print(f"Initial GPU memory: {torch.cuda.memory_allocated()/1024**2:.1f}MB allocated, {torch.cuda.memory_reserved()/1024**2:.1f}MB reserved")
+        else:
+            print("CUDA is not available. Using CPU only.")
+        
+        # Ensure the experiment directory exists
+        os.makedirs(self.experiment_dir, exist_ok=True)
+        
+        # Ensure debug log is properly set up
+        if self.debug and not hasattr(self, 'log_capture'):
+            log_file_path = os.path.join(self.experiment_dir, 'debug_log.txt')
+            self.log_capture = LogCapture(log_file_path, terminal_output=False)
+            sys.stdout = self.log_capture
+            # Make sure this message appears in the terminal before redirection
+            print(f"Debug logging initialized at start of training")
+        
+        # Counter to flush logs regularly
+        flush_every = max(1, min(10, self.eval_interval // 10))  # Adjust this to control flush frequency
+        
         # if no arrays were passed in, init fresh
         if raw_loss_list is None:
             raw_loss_list = []
@@ -337,12 +413,16 @@ class ModelTrainer:
                     c_var = self.embedding_variance(c_repr)
                     t_var = self.embedding_variance(t_repr)
 
-                print(f"\nStep [{step}/{self.max_steps}] - "
-                      f"Smoothed Train Loss: {smoothed_training_loss:.4f}, "
-                      f"Smoothed Val Loss: {smoothed_val_loss:.4f}, "
-                      f"Vars [C/T]: {c_var:.4f}/{t_var:.4f} - "
-                      f"GradNorm: {gnorm:.2e} - "
-                      f"LRs: enc={enc_lr:.2e}, pred={pred_lr:.2e}, dec={dec_lr:.2e}")
+                # Use our new method to print progress to terminal
+                progress_msg = f"\nStep [{step}/{self.max_steps}] - " \
+                               f"Smoothed Train Loss: {smoothed_training_loss:.4f}, " \
+                               f"Smoothed Val Loss: {smoothed_val_loss:.4f}, " \
+                               f"Vars [C/T]: {c_var:.4f}/{t_var:.4f} - " \
+                               f"GradNorm: {gnorm:.2e} - " \
+                               f"LRs: enc={enc_lr:.2e}, pred={pred_lr:.2e}, dec={dec_lr:.2e}"
+                self.print_to_terminal(progress_msg)
+                # Also log it to the file
+                print(progress_msg)
 
                 if smoothed_val_loss < best_val_loss:
                     best_val_loss = smoothed_val_loss
@@ -351,7 +431,9 @@ class ModelTrainer:
                     steps_since_improvement += 1
 
                 if self.early_stopping and steps_since_improvement >= self.patience:
-                    print(f"\nEarly stopping triggered at step {step}. no improvement for {self.patience} intervals.")
+                    early_stop_msg = f"\nEarly stopping triggered at step {step}. no improvement for {self.patience} intervals."
+                    self.print_to_terminal(early_stop_msg)
+                    print(early_stop_msg)  # Also log to file
                     # save final checkpoint before stopping
                     stats['best_val_loss'] = best_val_loss
                     stats['steps_since_improvement'] = steps_since_improvement
@@ -380,6 +462,13 @@ class ModelTrainer:
 
             step += 1
             self.model.update_ema()
+            
+            # Flush the logs periodically to ensure they are saved
+            if self.debug and hasattr(self, 'log_capture'):
+                if step % flush_every == 0:  # Flush more frequently than eval_interval
+                    self.log_capture.flush()
+                    if step % (flush_every * 10) == 0:  # Occasionally log progress to file
+                        print(f"[Training step {step}/{self.max_steps}] in progress...")
 
         # done loop
         final_stats = {
@@ -397,6 +486,9 @@ class ModelTrainer:
         self.model.eval()
         if self.debug:
             print("\n[VALIDATION] Beginning validation forward pass")
+            # Flush the log after validation starts
+            if hasattr(self, 'log_capture'):
+                self.log_capture.flush()
         with torch.no_grad():
             # First get intermediate outputs from context encoder directly
             context_repr, context_intermediate = self.model.context_encoder(context_spec)
@@ -414,10 +506,18 @@ class ModelTrainer:
             self.update_embedding_stats(context_repr, target_repr, pred_sequence)
 
             if step % self.eval_interval == 0:
-                print("\nEmbedding Statistics:")
-                print(f"Context var={c_stats['embedding_variance']:.4f}, dist={c_stats['avg_pairwise_distance']:.4f}, norm={c_stats['avg_embedding_norm']:.4f}")
-                print(f"Target  var={t_stats['embedding_variance']:.4f}, dist={t_stats['avg_pairwise_distance']:.4f}, norm={t_stats['avg_embedding_norm']:.4f}")
-                print(f"Pred    var={p_stats['embedding_variance']:.4f}, dist={p_stats['avg_pairwise_distance']:.4f}, norm={p_stats['avg_embedding_norm']:.4f}")
+                embed_stats_msg = "\nEmbedding Statistics:"
+                embed_stats_msg += f"\nContext var={c_stats['embedding_variance']:.4f}, dist={c_stats['avg_pairwise_distance']:.4f}, norm={c_stats['avg_embedding_norm']:.4f}"
+                embed_stats_msg += f"\nTarget  var={t_stats['embedding_variance']:.4f}, dist={t_stats['avg_pairwise_distance']:.4f}, norm={t_stats['avg_embedding_norm']:.4f}"
+                embed_stats_msg += f"\nPred    var={p_stats['embedding_variance']:.4f}, dist={p_stats['avg_pairwise_distance']:.4f}, norm={p_stats['avg_embedding_norm']:.4f}"
+                
+                # Print to both terminal and log file
+                self.print_to_terminal(embed_stats_msg)
+                print(embed_stats_msg)
+                
+                # Flush the log after printing stats
+                if self.debug and hasattr(self, 'log_capture'):
+                    self.log_capture.flush()
 
                 self.visualize_latent_predictions(
                     step=step,
@@ -438,6 +538,10 @@ class ModelTrainer:
                     target_intermediate=target_intermediate,
                     mask=mask
                 )
+            
+            # Flush the log after the whole validation step
+            if self.debug and hasattr(self, 'log_capture'):
+                self.log_capture.flush()
 
             return loss.item(), {}
 
@@ -859,60 +963,66 @@ if __name__ == '__main__':
     with open(config_path, 'w') as f:
         json.dump(config, f, indent=4)
 
-    if args.continue_training:
-        model, checkpoint, config = load_model(os.path.join("experiments", args.name), return_checkpoint=True)
-        model = model.to(device)
-        
-        trainer = ModelTrainer(
-            model=model,
-            train_loader=dl_train,
-            test_loader=dl_test,
-            device=device,
-            max_steps=args.steps,
-            eval_interval=args.eval_interval,
-            save_interval=500,
-            weights_save_dir=weights_dir,
-            experiment_dir=experiment_dir,
-            verbose=args.verbose,
-            overfit_single_batch=args.overfit_batch,
-            encoder_lr=config.get('encoder_lr', args.encoder_lr),
-            predictor_lr=config.get('predictor_lr', args.predictor_lr),
-            decoder_lr=config.get('decoder_lr', args.decoder_lr),
-            freeze_encoder_steps=args.freeze_encoder_steps,
-            freeze_decoder_steps=args.freeze_decoder_steps,
-            debug=args.debug,
-            lr=args.lr
-        )
-        
-        last_step, training_stats, raw_loss_list, raw_val_loss_list = trainer.load_model(checkpoint=checkpoint)
-        trainer.train(
-            continue_training=True,
-            training_stats=training_stats,
-            last_step=last_step,
-            raw_loss_list=raw_loss_list,
-            raw_val_loss_list=raw_val_loss_list
-        )
-    else:
-        trainer = ModelTrainer(
-            model=model,
-            train_loader=dl_train,
-            test_loader=dl_test,
-            device=device,
-            max_steps=args.steps,
-            eval_interval=args.eval_interval,
-            save_interval=500,
-            weights_save_dir=weights_dir,
-            experiment_dir=experiment_dir,
-            verbose=args.verbose,
-            overfit_single_batch=args.overfit_batch,
-            encoder_lr=args.encoder_lr,
-            predictor_lr=args.predictor_lr,
-            decoder_lr=args.decoder_lr,
-            freeze_encoder_steps=args.freeze_encoder_steps,
-            freeze_decoder_steps=args.freeze_decoder_steps,
-            debug=args.debug,
-            lr=args.lr
-        )
-
-        trainer.train()
-        trainer.plot_results(save_plot=True)
+    try:
+        if args.continue_training:
+            model, checkpoint, config = load_model(os.path.join("experiments", args.name), return_checkpoint=True)
+            model = model.to(device)
+            
+            trainer = ModelTrainer(
+                model=model,
+                train_loader=dl_train,
+                test_loader=dl_test,
+                device=device,
+                max_steps=args.steps,
+                eval_interval=args.eval_interval,
+                save_interval=500,
+                weights_save_dir=weights_dir,
+                experiment_dir=experiment_dir,
+                verbose=args.verbose,
+                overfit_single_batch=args.overfit_batch,
+                encoder_lr=config.get('encoder_lr', args.encoder_lr),
+                predictor_lr=config.get('predictor_lr', args.predictor_lr),
+                decoder_lr=config.get('decoder_lr', args.decoder_lr),
+                freeze_encoder_steps=args.freeze_encoder_steps,
+                freeze_decoder_steps=args.freeze_decoder_steps,
+                debug=args.debug,
+                lr=args.lr
+            )
+            
+            last_step, training_stats, raw_loss_list, raw_val_loss_list = trainer.load_model(checkpoint=checkpoint)
+            trainer.train(
+                continue_training=True,
+                training_stats=training_stats,
+                last_step=last_step,
+                raw_loss_list=raw_loss_list,
+                raw_val_loss_list=raw_val_loss_list
+            )
+        else:
+            trainer = ModelTrainer(
+                model=model,
+                train_loader=dl_train,
+                test_loader=dl_test,
+                device=device,
+                max_steps=args.steps,
+                eval_interval=args.eval_interval,
+                save_interval=500,
+                weights_save_dir=weights_dir,
+                experiment_dir=experiment_dir,
+                verbose=args.verbose,
+                overfit_single_batch=args.overfit_batch,
+                encoder_lr=args.encoder_lr,
+                predictor_lr=args.predictor_lr,
+                decoder_lr=args.decoder_lr,
+                freeze_encoder_steps=args.freeze_encoder_steps,
+                freeze_decoder_steps=args.freeze_decoder_steps,
+                debug=args.debug,
+                lr=args.lr
+            )
+            
+            trainer.train()
+            trainer.plot_results(save_plot=True)
+    finally:
+        # Restore stdout and close log file
+        if args.debug and 'trainer' in locals() and hasattr(trainer, 'log_capture'):
+            sys.stdout = trainer.log_capture.terminal
+            trainer.log_capture.close()

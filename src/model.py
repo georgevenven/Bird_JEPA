@@ -577,6 +577,7 @@ class BirdJEPA(nn.Module):
             
             b, t = mask.shape
             print(f"  mask: {mask.shape} (Batch: {b}, Time: {t})")
+            print(f"  {get_memory_usage()} at start of compute_latent_loss")
 
         # ensure shape
         if context_spectrogram.dim() == 3:
@@ -591,9 +592,11 @@ class BirdJEPA(nn.Module):
         # encode context
         if self.debug:
             print("\n[BirdJEPA] Encoding context...")
+            print(f"  {get_memory_usage()} before context encoding")
         context_repr, _ = self.context_encoder(context_spectrogram)
         if self.debug:
             print(f"  context_repr after encoding: {context_repr.shape}")
+            print(f"  {get_memory_usage()} after context encoding")
 
         if self.zero_predictor_input:
             mask_3d = mask.unsqueeze(-1).expand_as(context_repr)
@@ -602,12 +605,6 @@ class BirdJEPA(nn.Module):
             if self.debug:
                 print(f"  context_repr after masking: {context_repr.shape}")
 
-        if self.debug:
-            print("\n[BirdJEPA] Running predictor...")
-        pred = self.predictor(context_repr)
-        if self.debug:
-            print(f"  prediction output shape: {pred.shape}")
-
         # encode target
         if self.debug:
             print("\n[BirdJEPA] Encoding target...")
@@ -615,6 +612,13 @@ class BirdJEPA(nn.Module):
             target_repr, _ = self.target_encoder(target_spectrogram)
         if self.debug:
             print(f"  target_repr shape: {target_repr.shape}")
+
+        # predictor
+        if self.debug:
+            print("\n[BirdJEPA] Running predictor...")
+        pred = self.predictor(context_repr)
+        if self.debug:
+            print(f"  prediction output shape: {pred.shape}")
 
         # compute mse in latent space
         if self.debug:
