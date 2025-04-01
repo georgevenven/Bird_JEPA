@@ -12,17 +12,27 @@ TEST_PERCENTAGE=20
 EXPERIMENT_NAME="BirdJEPA_Test"
 
 # change default parameters (if needed)
-BATCH_SIZE=128                    # training batch size
+BATCH_SIZE=12                    # training batch size
 LEARNING_RATE=3e-4                # learning rate for training
 MULTI_THREAD=true                 # set to false for single-thread spectrogram generation
 STEP_SIZE=119                     # step size for spectrogram generation
 NFFT=1024                         # number of fft points for spectrogram
-MAX_STEPS=10000                   # maximum training steps
-EVAL_INTERVAL=100                 # evaluation interval
+MAX_STEPS=1                   # maximum training steps
+EVAL_INTERVAL=1                   # evaluation interval
 INPUT_DIM=513                     # input dimension (frequency bins)
-HIDDEN_DIM=256                    # hidden dimension
+HIDDEN_DIM=64                    # hidden dimension
 MAX_SEQ_LEN=500                   # maximum sequence length
 MASK_RATIO=0.3                    # mask ratio for training
+DEBUG=true                       # debug mode flag (lowercase)
+
+# New flexible architecture configuration
+# Format: "type:param,type:param,..." where type is "local" or "global"
+# For local blocks, param is window size
+# For global blocks, param is stride
+ARCHITECTURE="local:8,global:100,local:16,global:50"
+
+# Import statement for block classes (add to trainer.py)
+python_import="from model import LocalAttentionBlock, GlobalAttentionBlock"
 
 # don't change
 TEMP_DIR="./temp"
@@ -116,7 +126,9 @@ python3 src/spectrogram_generator.py \
         --song_detection_json_path "$SONG_DETECTION_JSON_PATH" \
         --step_size "$STEP_SIZE" \
         --nfft "$NFFT" \
-        --single_threaded "$([[ "$MULTI_THREAD" == false ]] && echo 'true' || echo 'false')"
+        --single_threaded "$([[ "$MULTI_THREAD" == false ]] && echo 'true' || echo 'false')" \
+        --generate_random_files_number 10
+
         
 python3 src/spectrogram_generator.py \
         --src_dir "$TEST_WAV_DIR" \
@@ -124,10 +136,14 @@ python3 src/spectrogram_generator.py \
         --song_detection_json_path "$SONG_DETECTION_JSON_PATH" \
         --step_size "$STEP_SIZE" \
         --nfft "$NFFT" \
-        --single_threaded "$([[ "$MULTI_THREAD" == false ]] && echo 'true' || echo 'false')"
+        --single_threaded "$([[ "$MULTI_THREAD" == false ]] && echo 'true' || echo 'false')" \
+        --generate_random_files_number 10
+
 
 # run trainer with BirdJEPA model
-python3 src/trainer.py \
+# Pass the debug flag conditionally
+if [ "$DEBUG" = "true" ]; then
+    python3 src/trainer.py \
         --name "$EXPERIMENT_NAME" \
         --train_dir "$TRAIN_DIR" \
         --test_dir "$TEST_DIR" \
@@ -138,7 +154,24 @@ python3 src/trainer.py \
         --input_dim "$INPUT_DIM" \
         --hidden_dim "$HIDDEN_DIM" \
         --max_seq_len "$MAX_SEQ_LEN" \
-        --mask_ratio "$MASK_RATIO"
+        --mask_ratio "$MASK_RATIO" \
+        --architecture "$ARCHITECTURE" \
+        --debug
+else
+    python3 src/trainer.py \
+        --name "$EXPERIMENT_NAME" \
+        --train_dir "$TRAIN_DIR" \
+        --test_dir "$TEST_DIR" \
+        --batch_size "$BATCH_SIZE" \
+        --lr "$LEARNING_RATE" \
+        --steps "$MAX_STEPS" \
+        --eval_interval "$EVAL_INTERVAL" \
+        --input_dim "$INPUT_DIM" \
+        --hidden_dim "$HIDDEN_DIM" \
+        --max_seq_len "$MAX_SEQ_LEN" \
+        --mask_ratio "$MASK_RATIO" \
+        --architecture "$ARCHITECTURE"
+fi
 
 # 10. save file lists into the experiment folder
 EXPERIMENT_DIR="experiments/$EXPERIMENT_NAME"

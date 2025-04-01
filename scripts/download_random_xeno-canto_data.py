@@ -1,5 +1,12 @@
 import requests, random, os
+import argparse
 from tqdm import tqdm
+
+# Parse command-line arguments
+parser = argparse.ArgumentParser(description='Download random recordings from Xeno-canto.')
+parser.add_argument('--num_recordings', type=int, default=1000, 
+                    help='Number of recordings to download (default: 1000)')
+args = parser.parse_args()
 
 # Set your output directory here
 output_dir = 'xeno_mp3s'
@@ -30,11 +37,11 @@ if num_recordings == 0:
     exit(1)
 
 recordings = {}
-# keep sampling random pages until we have at least 1000 unique recordings
+# keep sampling random pages until we have the requested number of unique recordings
 # or until we've tried a reasonable number of times
 max_attempts = 100
 attempts = 0
-target_recordings = min(1000, num_recordings)  # Don't try to get more than exist
+target_recordings = min(args.num_recordings, num_recordings)  # Don't try to get more than exist
 
 pbar = tqdm(total=target_recordings, desc="Collecting recordings")
 while len(recordings) < target_recordings and attempts < max_attempts:
@@ -54,8 +61,8 @@ while len(recordings) < target_recordings and attempts < max_attempts:
     except Exception as e:
         print(f"Error fetching page {page}: {str(e)}")
 
-# slice to 1000 recordings
-selected = list(recordings.values())[:1000]
+# slice to the requested number of recordings
+selected = list(recordings.values())[:target_recordings]
 print(f"\nCollected {len(selected)} unique recordings")
 
 # create a directory to store the files

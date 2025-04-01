@@ -31,7 +31,6 @@ class BirdJEPA_Dataset(Dataset):
             spec = data['s']  # we assume shape: (F,T)
             ground_truth_labels = data['labels']  # shape: T
             
-
             # F stands for frequency bins, T stands for time frames
             F, T = spec.shape
 
@@ -76,7 +75,9 @@ class BirdJEPA_Dataset(Dataset):
             if self.verbose:
                 print(f"Returning segment with shape: {segment.shape} (D,T)")
                 print(f"Returning labels with shape: {segment_labels.shape} (T)")
-            return segment, segment_labels
+            
+            # Return filename as well
+            return segment, segment_labels, os.path.basename(fpath)
         except Exception as e:
             if self.verbose:
                 print(f"Error loading file {fpath}: {e}, trying another file.")
@@ -84,7 +85,7 @@ class BirdJEPA_Dataset(Dataset):
 
 def collate_fn(batch, segment_length=500, mask_p=0.75, verbose=False):
     # Unzip the batch into separate lists
-    specs, labels = zip(*batch)
+    specs, labels, filenames = zip(*batch)  # Now unpacking filenames too
     
     # stack -> (B,F,T)
     segs = torch.stack(specs, dim=0)  # (B,F,T)
@@ -94,14 +95,15 @@ def collate_fn(batch, segment_length=500, mask_p=0.75, verbose=False):
     full_spectrogram = segs.clone()  # This should be completely unmasked
     
     # Get batch size and sequence length
-    B, F, T = segs.shape  # Define B here before using it
+    B, F, T = segs.shape
     
     if verbose:
         print(f"DEBUG: full_spectrogram shape before any processing: {full_spectrogram.shape}")
         print(f"DEBUG: full_spectrogram contains -1?: {(full_spectrogram == -1).any().item()}")
+        print(f"DEBUG: Using actual filenames: {filenames}")
     
     # Create mask
-    mask = torch.zeros(B, T, dtype=torch.bool)  # Now B is defined
+    mask = torch.zeros(B, T, dtype=torch.bool)
     
     # Create mask along time dimension (T)
     for b in range(B):
@@ -120,9 +122,6 @@ def collate_fn(batch, segment_length=500, mask_p=0.75, verbose=False):
     for b in range(B):
         context_spectrogram[b, :, mask[b]] = 0  # Replace with zeros for masked regions
         target_spectrogram[b, :, ~mask[b]] = 0  # Zero out unmasked regions in target
-
-    # Return mask tensor directly
-    file_names = [f"dummy_{i}.npy" for i in range(B)]
     
     # Add shape and value range debugging
     if verbose:
@@ -138,5 +137,5 @@ def collate_fn(batch, segment_length=500, mask_p=0.75, verbose=False):
         print(f"target_spectrogram: min={target_spectrogram.min().item():.3f}, max={target_spectrogram.max().item():.3f}, avg={target_spectrogram.mean().item():.3f}")
         print(f"context_spectrogram: min={context_spectrogram.min().item():.3f}, max={context_spectrogram.max().item():.3f}, avg={context_spectrogram.mean().item():.3f}")
 
-    
-    return full_spectrogram, target_spectrogram, context_spectrogram, labels, mask, file_names
+    # Use actual file names instead of dummy ones
+    return full_spectrogram, target_spectrogram, context_spectrogram, labels, mask, filenames

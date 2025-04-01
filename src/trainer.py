@@ -39,10 +39,12 @@ class ModelTrainer:
         decoder_lr=1e-4,
         freeze_encoder_steps=0,
         freeze_decoder_steps=0,
+        debug=False,
         lr=None   # optional single-lr param from older code
     ):
         self.model = model
         self.model.ema_m = ema_momentum
+        self.model.debug = debug
         self.train_iter = train_loader
         self.test_iter = test_loader
         self.device = device
@@ -56,6 +58,7 @@ class ModelTrainer:
         self.patience = patience
         self.verbose = verbose
         self.overfit_single_batch = overfit_single_batch
+        self.debug = debug
 
         # if user provided old single-lr, override
         if lr is not None:
@@ -392,9 +395,18 @@ class ModelTrainer:
 
     def validate_model(self, step, context_spec, target_spec, mask, vocalization):
         self.model.eval()
+        if self.debug:
+            print("\n[VALIDATION] Beginning validation forward pass")
         with torch.no_grad():
-            loss, diff, pred_sequence, target_repr, context_repr = self.model.compute_latent_loss(
-                context_spec, target_spec, mask
+            # First get intermediate outputs from context encoder directly
+            context_repr, context_intermediate = self.model.context_encoder(context_spec)
+            
+            # Then get intermediate outputs from target encoder
+            target_repr, target_intermediate = self.model.target_encoder(target_spec)
+            
+            # Now compute loss as normal
+            loss, diff, pred_sequence, _, _ = self.model.compute_latent_loss(
+                context_spec, target_spec, mask, is_eval_step=True
             )
             c_stats = self.compute_embedding_stats(context_repr)
             t_stats = self.compute_embedding_stats(target_repr)
@@ -414,6 +426,16 @@ class ModelTrainer:
                     context_repr=context_repr,
                     pred_sequence=pred_sequence,
                     target_repr=target_repr,
+                    mask=mask
+                )
+                
+                # Add call to the new visualization method
+                self.visualize_stacked_layers(
+                    step=step,
+                    context_spectrogram=context_spec,
+                    target_spectrogram=target_spec,
+                    context_intermediate=context_intermediate,
+                    target_intermediate=target_intermediate,
                     mask=mask
                 )
 
@@ -605,6 +627,89 @@ class ModelTrainer:
         self.model.ema_m = new_m
         return new_m
 
+    def visualize_stacked_layers(
+        self, 
+        step,
+        context_spectrogram,
+        target_spectrogram,
+        context_intermediate,
+        target_intermediate,
+        mask
+    ):
+        """
+        Visualizes all layers of both encoders side by side, stacked vertically.
+        
+        Args:
+            step: Current training step
+            context_spectrogram: Input to context encoder
+            target_spectrogram: Input to target encoder
+            context_intermediate: List of intermediate outputs from context encoder
+            target_intermediate: List of intermediate outputs from target encoder
+            mask: Mask used for training
+        """
+        # Ensure we have the same number of layers from both encoders
+        assert len(context_intermediate) == len(target_intermediate), \
+            f"Context and target encoder have different number of layers: {len(context_intermediate)} vs {len(target_intermediate)}"
+        
+        num_layers = len(context_intermediate)
+        
+        # Create a figure with two columns (left: context, right: target)
+        # and rows for: input spectrogram + each intermediate layer
+        fig, axs = plt.subplots(num_layers + 1, 2, figsize=(16, 3 * (num_layers + 1)))
+        
+        # Plot the input spectrograms
+        axs[0, 0].imshow(context_spectrogram[0].cpu().numpy(), aspect='auto', origin='lower')
+        axs[0, 0].set_title("Context Spectrogram (Input)")
+        self._add_mask_overlay(axs[0, 0], mask[0])
+        
+        axs[0, 1].imshow(target_spectrogram[0].cpu().numpy(), aspect='auto', origin='lower')
+        axs[0, 1].set_title("Target Spectrogram (Input)")
+        self._add_mask_overlay(axs[0, 1], ~mask[0])  # Inverse mask for target
+        
+        # Determine layer types by examining attention_blocks directly
+        attention_blocks = self.model.context_encoder.attention_blocks
+        
+        # Generate names for each layer
+        layer_names = ["Initial Encoding"]
+        
+        for i, block in enumerate(attention_blocks):
+            block_name = block.__class__.__name__
+            if "LocalAttention" in block_name:
+                window_size = block.window_size
+                layer_names.append(f"Local Attention (window={window_size})")
+            elif "GlobalAttention" in block_name:
+                stride = block.global_stride
+                layer_names.append(f"Global Attention (stride={stride})")
+            else:
+                layer_names.append(f"Layer {i+1}")
+        
+        # Ensure we have enough names
+        while len(layer_names) < num_layers + 1:
+            layer_names.append(f"Layer {len(layer_names)}")
+        
+        # Plot each layer's representation
+        for i in range(num_layers):
+            # Context encoder layers (left column)
+            layer_vis = context_intermediate[i][0].cpu().numpy().T
+            im = axs[i+1, 0].imshow(layer_vis, aspect='auto', origin='lower')
+            axs[i+1, 0].set_title(f"Context: {layer_names[i+1]}")
+            
+            # Target encoder layers (right column)
+            layer_vis = target_intermediate[i][0].cpu().numpy().T
+            im = axs[i+1, 1].imshow(layer_vis, aspect='auto', origin='lower')
+            axs[i+1, 1].set_title(f"Target: {layer_names[i+1]}")
+        
+        # Clean up axes
+        for row in axs:
+            for ax in row:
+                ax.set_xticks([])
+                ax.set_yticks([])
+        
+        plt.tight_layout()
+        fname = os.path.join(self.predictions_subfolder_path, f"all_layers_stacked_{step}.png")
+        plt.savefig(fname, dpi=100)
+        plt.close(fig)
+
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser()
@@ -639,6 +744,12 @@ if __name__ == '__main__':
     parser.add_argument('--continue_training', action='store_true', help='Continue training from checkpoint')
     parser.add_argument('--zero_predictor_input', action='store_true',
                       help='If set, the predictor input is zeroed out at masked positions')
+    parser.add_argument('--debug', action='store_true', 
+                        help='Enable debug mode for additional logging and model inspection')
+    
+    # Attention configuration - use flexible architecture parameter
+    parser.add_argument('--architecture', type=str, default="local:8,global:100",
+                       help='Comma-separated architecture specification: "type:param,type:param,..."')
     
     args = parser.parse_args()
 
@@ -684,6 +795,23 @@ if __name__ == '__main__':
     )
 
     from model import BirdJEPA
+    
+    # Parse the architecture string to create blocks_config
+    blocks_config = []
+    for block_spec in args.architecture.split(','):
+        parts = block_spec.split(':')
+        if len(parts) != 2:
+            raise ValueError(f"Invalid block specification: {block_spec}")
+        
+        block_type, param = parts
+        if block_type.lower() == "local":
+            blocks_config.append({"type": "local", "window_size": int(param)})
+        elif block_type.lower() == "global":
+            blocks_config.append({"type": "global", "stride": int(param)})
+        else:
+            raise ValueError(f"Unknown block type: {block_type}")
+
+    # Create the model with only the necessary parameters
     model = BirdJEPA(
         input_dim=args.input_dim,
         hidden_dim=args.hidden_dim,
@@ -696,7 +824,9 @@ if __name__ == '__main__':
         pred_num_heads=args.pred_num_heads,
         pred_mlp_dim=args.pred_mlp_dim,
         max_seq_len=args.max_seq_len,
-        zero_predictor_input=args.zero_predictor_input
+        zero_predictor_input=args.zero_predictor_input,
+        debug=args.debug,
+        blocks_config=blocks_config
     ).to(device)
 
     config = {
@@ -720,7 +850,9 @@ if __name__ == '__main__':
         "train_dir":       args.train_dir,
         "test_dir":        args.test_dir,
         "device": str(device),
-        "timestamp": datetime.now().strftime("%Y%m%d_%H%M%S")
+        "timestamp": datetime.now().strftime("%Y%m%d_%H%M%S"),
+        "debug": args.debug,
+        "architecture": args.architecture
     }
 
     config_path = os.path.join(experiment_dir, 'config.json')
@@ -748,6 +880,7 @@ if __name__ == '__main__':
             decoder_lr=config.get('decoder_lr', args.decoder_lr),
             freeze_encoder_steps=args.freeze_encoder_steps,
             freeze_decoder_steps=args.freeze_decoder_steps,
+            debug=args.debug,
             lr=args.lr
         )
         
@@ -777,6 +910,7 @@ if __name__ == '__main__':
             decoder_lr=args.decoder_lr,
             freeze_encoder_steps=args.freeze_encoder_steps,
             freeze_decoder_steps=args.freeze_decoder_steps,
+            debug=args.debug,
             lr=args.lr
         )
 
