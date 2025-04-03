@@ -70,7 +70,7 @@ class WavtoSpec:
         audio_files = [
             os.path.join(root, file)
             for root, dirs, files in os.walk(self.src_dir)
-            for file in files if file.lower().endswith(('.wav', '.mp3'))
+            for file in files if file.lower().endswith(('.wav', '.mp3', '.ogg'))
         ]
 
         # Handle random file selection if user requested

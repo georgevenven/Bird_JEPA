@@ -1,4 +1,3 @@
-
 import torch
 import json
 import os
@@ -33,6 +32,22 @@ def load_model(experiment_folder, return_checkpoint=False):
     with open(config_path, 'r') as f:
         config = json.load(f)
     
+    # Parse the architecture string to create blocks_config
+    blocks_config = []
+    if 'architecture' in config:
+        for block_spec in config['architecture'].split(','):
+            parts = block_spec.split(':')
+            if len(parts) != 2:
+                raise ValueError(f"Invalid block specification: {block_spec}")
+            
+            block_type, param = parts
+            if block_type.lower() == "local":
+                blocks_config.append({"type": "local", "window_size": int(param)})
+            elif block_type.lower() == "global":
+                blocks_config.append({"type": "global", "stride": int(param)})
+            else:
+                raise ValueError(f"Unknown block type: {block_type}")
+    
     model = BirdJEPA(
         input_dim=config['input_dim'],
         hidden_dim=config['hidden_dim'],
@@ -44,7 +59,8 @@ def load_model(experiment_folder, return_checkpoint=False):
         pred_num_layers=config['pred_num_layers'],
         pred_num_heads=config.get('pred_num_heads', config['num_heads']),
         pred_mlp_dim=config['pred_mlp_dim'],
-        max_seq_len=config['max_seq_len']
+        max_seq_len=config['max_seq_len'],
+        blocks_config=blocks_config  # Pass the parsed blocks_config
     )
     
     weights_dir = os.path.join(experiment_folder, 'saved_weights')
