@@ -24,18 +24,20 @@ AUDIO_PATH=""  # Path to the audio file or directory for inference
 OUTPUT_FILE=""  # Path to save predictions for inference
 
 # Optional parameters with defaults
-VAL_PERCENTAGE=10.0
-BATCH_SIZE=16
+VAL_PERCENTAGE=20.0
+BATCH_SIZE=12
 LEARNING_RATE=1e-4
-EPOCHS=30
+EPOCHS=5
 EARLY_STOPPING_PATIENCE=5
-MAX_SAMPLES_PER_SPECIES=100
+MAX_SAMPLES_PER_SPECIES=10
 FREEZE_ENCODER=true
 MULTI_THREAD=true
 STEP_SIZE=119
 NFFT=1024
 SONG_DETECTION_JSON_PATH="None"  # Default to None
 TEMP_DIR="$OUTPUT_DIR/temp_finetuning"
+SAVE_INTERVAL=1   # Save checkpoints every 5 epochs
+EVAL_INTERVAL=1   # Evaluate metrics every epoch
 
 # For testing/debugging
 DEBUG_MODE=true  # Set to false for full run
@@ -69,6 +71,8 @@ echo "Learning rate: $LEARNING_RATE"
 echo "Epochs: $EPOCHS"
 echo "Step size: $STEP_SIZE"
 echo "NFFT: $NFFT"
+echo "Save interval: $SAVE_INTERVAL epochs"
+echo "Eval interval: $EVAL_INTERVAL epoch(s)"
 echo "-------------------------"
 
 # Create output directory
@@ -95,6 +99,8 @@ run_training() {
         --early_stopping_patience "$EARLY_STOPPING_PATIENCE"
         --max_samples_per_species "$MAX_SAMPLES_PER_SPECIES"
         --temp_dir "$TEMP_DIR"
+        --save_interval "$SAVE_INTERVAL"
+        --eval_interval "$EVAL_INTERVAL"
     )
 
     # Add optional parameters

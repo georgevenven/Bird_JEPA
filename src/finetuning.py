@@ -17,12 +17,45 @@ import subprocess
 import shutil
 import glob
 import sys
+import time
+from datetime import datetime
 
 # Import from project modules
 from model import BirdJEPA
 from utils import load_model
 from spectrogram_generator import WavtoSpec
 from data_class import BirdJEPA_Dataset, collate_fn as data_class_collate_fn
+
+# Kaggle scoring function
+class ParticipantVisibleError(Exception):
+    pass
+
+def kaggle_score(solution, submission, row_id_column_name=None):
+    '''
+    Version of macro-averaged ROC-AUC score that ignores all classes that have no true positive labels.
+    '''
+    if row_id_column_name is not None:
+        if row_id_column_name in solution:
+            del solution[row_id_column_name]
+        if row_id_column_name in submission:
+            del submission[row_id_column_name]
+
+    # Check for valid numeric data
+    for col in submission.columns:
+        if not pd.api.types.is_numeric_dtype(submission[col]):
+            bad_dtypes = {x: submission[x].dtype for x in submission.columns if not pd.api.types.is_numeric_dtype(submission[x])}
+            raise ParticipantVisibleError(f'Invalid submission data types found: {bad_dtypes}')
+
+    # Get columns with positive labels
+    solution_sums = solution.sum(axis=0)
+    scored_columns = list(solution_sums[solution_sums > 0].index)
+    assert len(scored_columns) > 0
+
+    try:
+        return roc_auc_score(solution[scored_columns].values, submission[scored_columns].values, average='macro')
+    except Exception as e:
+        print(f"Error in scoring: {e}")
+        return 0.0
 
 class BirdCLEFDataset(Dataset):
     """
@@ -803,12 +836,33 @@ def finetune_model(
     epochs=30,
     early_stopping_patience=5,
     max_samples_per_species=None,
-    device=None
+    device=None,
+    save_interval=5,  # Save checkpoints every N epochs
+    eval_interval=1   # Evaluate and log metrics every N epochs
 ):
     """
     Fine-tune a pretrained BirdJEPA model for BirdCLEF classification
     using pre-generated spectrograms
     """
+    # Create a timestamp for this run
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    run_dir = os.path.join(output_dir, f"run_{timestamp}")
+    os.makedirs(run_dir, exist_ok=True)
+    
+    # Create subdirectories for checkpoints, logs, and plots
+    checkpoint_dir = os.path.join(run_dir, "checkpoints")
+    log_dir = os.path.join(run_dir, "logs")
+    plot_dir = os.path.join(run_dir, "plots")
+    
+    os.makedirs(checkpoint_dir, exist_ok=True)
+    os.makedirs(log_dir, exist_ok=True)
+    os.makedirs(plot_dir, exist_ok=True)
+    
+    # Set up logging
+    log_file = os.path.join(log_dir, "training_log.csv")
+    with open(log_file, 'w') as f:
+        f.write("epoch,train_loss,val_loss,train_auc,val_auc,kaggle_score,time_taken\n")
+    
     # Set device
     if device is None:
         device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -822,7 +876,7 @@ def finetune_model(
     base_model, _, config = load_model(pretrained_model_path, return_checkpoint=True)
     
     # Save model config to output directory
-    with open(os.path.join(output_dir, 'config.json'), 'w') as f:
+    with open(os.path.join(run_dir, 'config.json'), 'w') as f:
         json.dump(config, f, indent=4)
     
     # Create datasets
@@ -889,15 +943,28 @@ def finetune_model(
     
     # Training loop
     best_val_auc = 0
+    best_kaggle_score = 0
     early_stopping_counter = 0
     train_losses = []
     val_losses = []
+    train_aucs = []
     val_aucs = []
+    kaggle_scores = []
+    times = []
     
+    # Get species IDs for metrics
+    species_ids = train_dataset.species_ids
+    
+    print(f"Starting training for {epochs} epochs")
     for epoch in range(epochs):
+        epoch_start_time = time.time()
+        
         # Training
         classifier.train()
         epoch_loss = 0
+        all_train_outputs = []
+        all_train_labels = []
+        
         progress_bar = tqdm(train_loader, desc=f"Epoch {epoch+1}/{epochs} [Train]")
         
         for batch_data in progress_bar:
@@ -918,15 +985,37 @@ def finetune_model(
             
             epoch_loss += loss.item()
             progress_bar.set_postfix(loss=loss.item())
+            
+            # Collect outputs and labels for AUC calculation
+            all_train_outputs.append(outputs.detach().cpu().numpy())
+            all_train_labels.append(labels.detach().cpu().numpy())
         
         train_loss = epoch_loss / len(train_loader)
         train_losses.append(train_loss)
         
+        # Calculate training AUC
+        all_train_outputs = np.vstack(all_train_outputs)
+        all_train_labels = np.vstack(all_train_labels)
+        
+        # Compute per-class AUC and average for training
+        train_aucs_per_class = []
+        for i in range(train_dataset.num_classes):
+            # Only compute AUC if there are positive examples
+            if np.sum(all_train_labels[:, i]) > 0:
+                try:
+                    auc = roc_auc_score(all_train_labels[:, i], all_train_outputs[:, i])
+                    train_aucs_per_class.append(auc)
+                except:
+                    pass
+        
+        train_auc = np.mean(train_aucs_per_class) if train_aucs_per_class else 0
+        train_aucs.append(train_auc)
+        
         # Validation
         classifier.eval()
         val_loss = 0
-        all_outputs = []
-        all_labels = []
+        all_val_outputs = []
+        all_val_labels = []
         
         with torch.no_grad():
             progress_bar = tqdm(val_loader, desc=f"Epoch {epoch+1}/{epochs} [Val]")
@@ -945,87 +1034,271 @@ def finetune_model(
                 progress_bar.set_postfix(loss=loss.item())
                 
                 # Collect outputs and labels for AUC calculation
-                all_outputs.append(outputs.cpu().numpy())
-                all_labels.append(labels.cpu().numpy())
+                all_val_outputs.append(outputs.cpu().numpy())
+                all_val_labels.append(labels.cpu().numpy())
         
-        # Compute validation loss and AUC
+        # Compute validation loss
         val_loss = val_loss / len(val_loader)
         val_losses.append(val_loss)
         
-        all_outputs = np.vstack(all_outputs)
-        all_labels = np.vstack(all_labels)
+        # Stack all outputs and labels
+        all_val_outputs = np.vstack(all_val_outputs)
+        all_val_labels = np.vstack(all_val_labels)
         
-        # Compute per-class AUC and average
-        aucs = []
+        # Compute per-class AUC and average for validation
+        val_aucs_per_class = []
         for i in range(train_dataset.num_classes):
             # Only compute AUC if there are positive examples
-            if np.sum(all_labels[:, i]) > 0:
+            if np.sum(all_val_labels[:, i]) > 0:
                 try:
-                    auc = roc_auc_score(all_labels[:, i], all_outputs[:, i])
-                    aucs.append(auc)
+                    auc = roc_auc_score(all_val_labels[:, i], all_val_outputs[:, i])
+                    val_aucs_per_class.append(auc)
                 except:
                     pass
         
-        val_auc = np.mean(aucs) if aucs else 0
+        val_auc = np.mean(val_aucs_per_class) if val_aucs_per_class else 0
         val_aucs.append(val_auc)
         
-        print(f"Epoch {epoch+1}/{epochs}, Train Loss: {train_loss:.4f}, Val Loss: {val_loss:.4f}, Val AUC: {val_auc:.4f}")
+        # Calculate Kaggle score
+        # Create DataFrame format similar to competition submissions
+        val_pred_df = pd.DataFrame(all_val_outputs, columns=species_ids)
+        val_true_df = pd.DataFrame(all_val_labels, columns=species_ids)
+        
+        # Add a dummy row_id column
+        val_pred_df['row_id'] = range(len(val_pred_df))
+        val_true_df['row_id'] = range(len(val_true_df))
+        
+        kaggle_val_score = kaggle_score(val_true_df, val_pred_df, row_id_column_name='row_id')
+        kaggle_scores.append(kaggle_val_score)
+        
+        # Calculate time taken for this epoch
+        epoch_time = time.time() - epoch_start_time
+        times.append(epoch_time)
+        
+        # Log results
+        print(f"Epoch {epoch+1}/{epochs}, Train Loss: {train_loss:.4f}, Val Loss: {val_loss:.4f}, "
+              f"Train AUC: {train_auc:.4f}, Val AUC: {val_auc:.4f}, Kaggle Score: {kaggle_val_score:.4f}, "
+              f"Time: {epoch_time:.2f}s")
+        
+        # Save to log file
+        with open(log_file, 'a') as f:
+            f.write(f"{epoch+1},{train_loss:.6f},{val_loss:.6f},{train_auc:.6f},{val_auc:.6f},{kaggle_val_score:.6f},{epoch_time:.2f}\n")
         
         # Update learning rate scheduler
-        scheduler.step(val_auc)
+        scheduler.step(kaggle_val_score)  # Use Kaggle score for scheduling
         
-        # Check if this is the best model
-        if val_auc > best_val_auc:
-            best_val_auc = val_auc
-            early_stopping_counter = 0
-            
+        # Check if this is the best model by Kaggle score
+        is_best_kaggle = kaggle_val_score > best_kaggle_score
+        if is_best_kaggle:
+            best_kaggle_score = kaggle_val_score
             # Save model
-            model_path = os.path.join(output_dir, f"best_model.pt")
+            model_path = os.path.join(run_dir, f"best_kaggle_score_model.pt")
             torch.save({
                 'epoch': epoch,
                 'model_state_dict': classifier.state_dict(),
                 'optimizer_state_dict': optimizer.state_dict(),
                 'val_auc': val_auc,
+                'kaggle_score': kaggle_val_score,
                 'train_loss': train_loss,
                 'val_loss': val_loss
             }, model_path)
-            print(f"Saved best model with AUC {val_auc:.4f}")
+            print(f"Saved best Kaggle score model with score {kaggle_val_score:.4f}")
+        
+        # Check if this is the best model by AUC
+        is_best_auc = val_auc > best_val_auc
+        if is_best_auc:
+            best_val_auc = val_auc
+            early_stopping_counter = 0
+            
+            # Save model
+            model_path = os.path.join(run_dir, f"best_auc_model.pt")
+            torch.save({
+                'epoch': epoch,
+                'model_state_dict': classifier.state_dict(),
+                'optimizer_state_dict': optimizer.state_dict(),
+                'val_auc': val_auc,
+                'kaggle_score': kaggle_val_score,
+                'train_loss': train_loss,
+                'val_loss': val_loss
+            }, model_path)
+            print(f"Saved best AUC model with AUC {val_auc:.4f}")
+            
+            # Create a symlink to the best model in the output directory
+            best_model_link = os.path.join(output_dir, "best_model.pt")
+            if os.path.exists(best_model_link):
+                os.remove(best_model_link)
+            try:
+                os.symlink(model_path, best_model_link)
+            except OSError:
+                # Fallback to copy if symlink fails
+                shutil.copy2(model_path, best_model_link)
         else:
             early_stopping_counter += 1
             if early_stopping_counter >= early_stopping_patience:
                 print(f"Early stopping triggered after {epoch+1} epochs")
                 break
+        
+        # Save checkpoint at regular intervals
+        if (epoch + 1) % save_interval == 0 or (epoch + 1) == epochs:
+            checkpoint_path = os.path.join(checkpoint_dir, f"checkpoint_epoch_{epoch+1}.pt")
+            torch.save({
+                'epoch': epoch,
+                'model_state_dict': classifier.state_dict(),
+                'optimizer_state_dict': optimizer.state_dict(),
+                'scheduler_state_dict': scheduler.state_dict(),
+                'val_auc': val_auc,
+                'kaggle_score': kaggle_val_score,
+                'train_loss': train_loss,
+                'val_loss': val_loss,
+                'train_auc': train_auc,
+                'all_train_losses': train_losses,
+                'all_val_losses': val_losses,
+                'all_train_aucs': train_aucs,
+                'all_val_aucs': val_aucs,
+                'all_kaggle_scores': kaggle_scores
+            }, checkpoint_path)
+            print(f"Saved checkpoint at epoch {epoch+1}")
+        
+        # Generate and save plots at evaluation intervals
+        if (epoch + 1) % eval_interval == 0 or (epoch + 1) == epochs or is_best_auc or is_best_kaggle:
+            # Plot training history
+            plt.figure(figsize=(15, 10))
+            
+            # Plot losses
+            plt.subplot(2, 2, 1)
+            plt.plot(train_losses, label='Train Loss')
+            plt.plot(val_losses, label='Val Loss')
+            plt.title('Loss')
+            plt.xlabel('Epoch')
+            plt.legend()
+            plt.grid(True)
+            
+            # Plot AUC
+            plt.subplot(2, 2, 2)
+            plt.plot(train_aucs, label='Train AUC')
+            plt.plot(val_aucs, label='Val AUC')
+            plt.title('AUC')
+            plt.xlabel('Epoch')
+            plt.legend()
+            plt.grid(True)
+            
+            # Plot Kaggle Score
+            plt.subplot(2, 2, 3)
+            plt.plot(kaggle_scores, label='Kaggle Score')
+            plt.title('Kaggle Score')
+            plt.xlabel('Epoch')
+            plt.legend()
+            plt.grid(True)
+            
+            # Plot epoch time
+            plt.subplot(2, 2, 4)
+            plt.plot(times, label='Time per Epoch (s)')
+            plt.title('Training Time')
+            plt.xlabel('Epoch')
+            plt.legend()
+            plt.grid(True)
+            
+            plt.tight_layout()
+            plt.savefig(os.path.join(plot_dir, f'training_metrics_epoch_{epoch+1}.png'))
+            plt.close()
+            
+            # Also save the latest plot as a fixed filename for easy viewing
+            plt.figure(figsize=(15, 10))
+            
+            plt.subplot(2, 2, 1)
+            plt.plot(train_losses, label='Train Loss')
+            plt.plot(val_losses, label='Val Loss')
+            plt.title('Loss')
+            plt.xlabel('Epoch')
+            plt.legend()
+            plt.grid(True)
+            
+            plt.subplot(2, 2, 2)
+            plt.plot(train_aucs, label='Train AUC')
+            plt.plot(val_aucs, label='Val AUC')
+            plt.title('AUC')
+            plt.xlabel('Epoch')
+            plt.legend()
+            plt.grid(True)
+            
+            plt.subplot(2, 2, 3)
+            plt.plot(kaggle_scores, label='Kaggle Score')
+            plt.title('Kaggle Score')
+            plt.xlabel('Epoch')
+            plt.legend()
+            plt.grid(True)
+            
+            plt.subplot(2, 2, 4)
+            plt.plot(times, label='Time per Epoch (s)')
+            plt.title('Training Time')
+            plt.xlabel('Epoch')
+            plt.legend()
+            plt.grid(True)
+            
+            plt.tight_layout()
+            plt.savefig(os.path.join(plot_dir, 'latest_training_metrics.png'))
+            plt.close()
+            
+            # Generate and save per-class AUC plot if we have validation data
+            if len(all_val_labels) > 0:
+                # Calculate per-class AUC for visualization
+                class_aucs = []
+                class_names = []
+                
+                for i, species_id in enumerate(species_ids):
+                    if np.sum(all_val_labels[:, i]) > 0:
+                        try:
+                            auc = roc_auc_score(all_val_labels[:, i], all_val_outputs[:, i])
+                            class_aucs.append(auc)
+                            class_names.append(species_id)
+                        except:
+                            pass
+                
+                # Sort by AUC for better visualization
+                sorted_indices = np.argsort(class_aucs)
+                sorted_aucs = [class_aucs[i] for i in sorted_indices]
+                sorted_names = [class_names[i] for i in sorted_indices]
+                
+                # Plot per-class AUC
+                plt.figure(figsize=(12, max(8, len(class_names) * 0.25)))
+                plt.barh(sorted_names, sorted_aucs)
+                plt.xlabel('AUC')
+                plt.title(f'Per-Class AUC (Epoch {epoch+1})')
+                plt.grid(True, axis='x')
+                plt.tight_layout()
+                plt.savefig(os.path.join(plot_dir, f'per_class_auc_epoch_{epoch+1}.png'))
+                plt.close()
     
-    # Save training history
+    # Save final training history
     history = {
         'train_loss': train_losses,
         'val_loss': val_losses,
-        'val_auc': val_aucs
+        'train_auc': train_aucs,
+        'val_auc': val_aucs,
+        'kaggle_score': kaggle_scores,
+        'epoch_time': times
     }
     
-    with open(os.path.join(output_dir, 'history.json'), 'w') as f:
+    with open(os.path.join(run_dir, 'training_history.json'), 'w') as f:
         json.dump(history, f, indent=4)
     
-    # Plot training history
-    plt.figure(figsize=(12, 5))
+    # Also save as CSV for easier analysis
+    history_df = pd.DataFrame({
+        'epoch': range(1, len(train_losses) + 1),
+        'train_loss': train_losses,
+        'val_loss': val_losses,
+        'train_auc': train_aucs,
+        'val_auc': val_aucs,
+        'kaggle_score': kaggle_scores,
+        'epoch_time': times
+    })
+    history_df.to_csv(os.path.join(run_dir, 'training_history.csv'), index=False)
     
-    plt.subplot(1, 2, 1)
-    plt.plot(train_losses, label='Train Loss')
-    plt.plot(val_losses, label='Val Loss')
-    plt.title('Loss')
-    plt.legend()
+    print(f"Training completed. Best validation AUC: {best_val_auc:.4f}, Best Kaggle Score: {best_kaggle_score:.4f}")
+    print(f"All training artifacts saved to {run_dir}")
     
-    plt.subplot(1, 2, 2)
-    plt.plot(val_aucs, label='Val AUC')
-    plt.title('AUC')
-    plt.legend()
-    
-    plt.savefig(os.path.join(output_dir, 'training_history.png'))
-    plt.close()
-    
-    print(f"Training completed. Best validation AUC: {best_val_auc:.4f}")
-    
-    return os.path.join(output_dir, "best_model.pt")
+    # Create symbolic links to best models in output directory
+    return os.path.join(run_dir, "best_auc_model.pt")
 
 def inference(
     model_path,
@@ -1259,6 +1532,8 @@ def main():
     parser.add_argument('--max_files', type=int, help='Maximum number of files to process (for testing)')
     parser.add_argument('--max_random_files', type=int, help='Maximum number of random files to process for spectrograms (for testing)')
     parser.add_argument('--song_detection_json_path', type=str, default=None, help='Path to song detection JSON file')
+    parser.add_argument('--save_interval', type=int, default=5, help='Save checkpoints every N epochs')
+    parser.add_argument('--eval_interval', type=int, default=1, help='Evaluate and log metrics every N epochs')
     
     # Inference parameters
     parser.add_argument('--model_path', type=str, help='Path to fine-tuned model (.pt file)')
@@ -1336,7 +1611,9 @@ def main():
             batch_size=args.batch_size,
             epochs=args.epochs,
             early_stopping_patience=args.early_stopping_patience,
-            max_samples_per_species=args.max_samples_per_species
+            max_samples_per_species=args.max_samples_per_species,
+            save_interval=args.save_interval,
+            eval_interval=args.eval_interval
         )
         
         # Clean up temporary directory
