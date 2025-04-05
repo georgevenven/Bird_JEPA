@@ -6,24 +6,25 @@ set -euo pipefail
 cd ..
 
 # required parameters
-INPUT_DIR="/Users/georgev/Documents/codebases/BirdJEPA/xeno_mp3s"
+INPUT_DIR="/home/george-vengrovski/Documents/projects/Bird_JEPA/xeno_subset"
 SONG_DETECTION_JSON_PATH=None
 TEST_PERCENTAGE=20
 EXPERIMENT_NAME="BirdJEPA_Test"
 
 # change default parameters (if needed)
-BATCH_SIZE=12                    # training batch size
+BATCH_SIZE=48                    # training batch size
 LEARNING_RATE=3e-4                # learning rate for training
 MULTI_THREAD=true                 # set to false for single-thread spectrogram generation
 STEP_SIZE=119                     # step size for spectrogram generation
 NFFT=1024                         # number of fft points for spectrogram
-MAX_STEPS=5                   # maximum training steps
-EVAL_INTERVAL=1                   # evaluation interval
+MAX_STEPS=15                   # maximum training steps
+EVAL_INTERVAL=5                   # evaluation interval
 INPUT_DIM=513                     # input dimension (frequency bins)
 HIDDEN_DIM=64                    # hidden dimension
 MAX_SEQ_LEN=500                   # maximum sequence length
 MASK_RATIO=0.3                    # mask ratio for training
 DEBUG=true                       # debug mode flag (lowercase)
+
 # If debug mode is enabled, inform the user
 if [ "$DEBUG" = "true" ]; then
     echo "Debug mode enabled - detailed logs will be saved to experiments/$EXPERIMENT_NAME/debug_log.txt"
@@ -33,7 +34,7 @@ fi
 # Format: "type:param,type:param,..." where type is "local" or "global"
 # For local blocks, param is window size
 # For global blocks, param is stride
-ARCHITECTURE="local:8,global:100,local:16,global:50"
+ARCHITECTURE="local:8,global:100,local:16,global:50,local:32,global:100"
 
 # Import statement for block classes (add to trainer.py)
 python_import="from model import LocalAttentionBlock, GlobalAttentionBlock"

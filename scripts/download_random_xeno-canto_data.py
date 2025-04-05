@@ -9,7 +9,7 @@ parser.add_argument('--num_recordings', type=int, default=1000,
 args = parser.parse_args()
 
 # Set your output directory here
-output_dir = 'xeno_mp3s'
+output_dir = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), 'xeno_mp3s')
 
 print("Starting Xeno-canto download script...")
 

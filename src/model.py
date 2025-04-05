@@ -3,6 +3,9 @@ import torch.nn as nn
 import torch.nn.functional as F
 import math
 import torch.cuda
+import time
+from timing_utils import Timer, timed_operation, timing_stats
+import sys
 
 ################################################################################
 # LOCAL AND GLOBAL ATTENTION IMPLEMENTATIONS
@@ -29,11 +32,10 @@ class LocalAttentionBlock(nn.Module):
         self.norm1 = nn.LayerNorm(d_model)
         self.norm2 = nn.LayerNorm(d_model)
 
+    @timed_operation("local_attention_forward")
     def forward(self, x, debug=False):
         # x shape: (B, T, d_model)
-        if debug:
-            print(f"[LocalAttentionBlock] input: {x.shape}")
-        
+        # No individual timers for operations within this method
         # create local attention mask (band mask) for each query position
         # so each token attends to [i-window_size : i+window_size]
         B, T, _ = x.shape
@@ -57,9 +59,7 @@ class LocalAttentionBlock(nn.Module):
         x_norm = self.norm2(x)
         mlp_output = self.mlp(x_norm)
         x = x + mlp_output
-        
-        if debug:
-            print(f"[LocalAttentionBlock] output: {x.shape}")
+            
         return x
 
 
@@ -87,11 +87,10 @@ class GlobalAttentionBlock(nn.Module):
         self.norm1 = nn.LayerNorm(d_model)
         self.norm2 = nn.LayerNorm(d_model)
 
+    @timed_operation("global_attention_forward")
     def forward(self, x, debug=False):
         # x shape: (B, T, d_model)
-        if debug:
-            print(f"[GlobalAttentionBlock] input: {x.shape}")
-        
+        # No individual timers for operations within this method
         B, T, _ = x.shape
         # create a mask that allows tokens at multiples of stride
         # to attend to all tokens, while others attend only to themselves
@@ -116,9 +115,7 @@ class GlobalAttentionBlock(nn.Module):
         x_norm = self.norm2(x)
         mlp_output = self.mlp(x_norm)
         x = x + mlp_output
-
-        if debug:
-            print(f"[GlobalAttentionBlock] output: {x.shape}")
+            
         return x
 
 ################################################################################
@@ -133,8 +130,10 @@ class SinePositionalEncoding(nn.Module):
         super().__init__()
         self.d_model = d_model
 
+    @timed_operation("positional_encoding_forward")
     def forward(self, x):
         # x shape: (B, T, d_model)
+        # No inner timer
         B, T, D = x.shape
         device = x.device
 
@@ -179,38 +178,26 @@ class BirdCLEF_ConvolutionalFeatureExtractor(nn.Module):
         self.conv4 = nn.Conv2d(128, 128, kernel_size=(7,7), stride=(2,1), padding=(3,3))
         self.bn4 = nn.BatchNorm2d(128)
 
+    @timed_operation("conv_feature_extractor_forward")
     def forward(self, x):
         # x shape: (B, 1, F, T)
-        if self.debug:
-            b, c, f, t = x.shape
-            print(f"[ConvExtractor] input: {x.shape} (Batch: {b}, Channels: {c}, Freq bins: {f}, Time: {t})")
-
+        # No individual timers for operations within this method
         x = self.conv1(x)
         x = self.bn1(x)
         x = F.gelu(x)
-        if self.debug:
-            b, c, f, t = x.shape
-            print(f"[ConvExtractor] after conv1: {x.shape} (Batch: {b}, Channels: {c}, Freq bins: {f}, Time: {t})")
 
         x = self.conv2(x)
         x = self.bn2(x)
         x = F.gelu(x)
-        if self.debug:
-            print(f"[ConvExtractor] after conv2: {x.shape}")
 
         x = self.conv3(x)
         x = self.bn3(x)
         x = F.gelu(x)
-        if self.debug:
-            print(f"[ConvExtractor] after conv3: {x.shape}")
 
         x = self.conv4(x)
         x = self.bn4(x)
         x = F.gelu(x)
-        if self.debug:
-            print(f"[ConvExtractor] after conv4: {x.shape}")
-
-        # return shape: (B, out_channels=128, freq_reduced, T)
+        
         return x
 
 ################################################################################
@@ -240,11 +227,12 @@ class BirdCLEFEncoder(nn.Module):
         self.feature_extractor = BirdCLEF_ConvolutionalFeatureExtractor(in_channels=1, debug=debug)
 
         # pass a dummy input to figure out the flattened dimension
-        dummy = torch.zeros(1, 1, input_dim, max_len)
-        with torch.no_grad():
-            test_out = self.feature_extractor(dummy)
-        _, c_out, freq_out, _ = test_out.shape
-        self.flattened_dim = c_out * freq_out
+        with Timer("encoder_dimension_calculation", debug=debug):
+            dummy = torch.zeros(1, 1, input_dim, max_len)
+            with torch.no_grad():
+                test_out = self.feature_extractor(dummy)
+            _, c_out, freq_out, _ = test_out.shape
+            self.flattened_dim = c_out * freq_out
 
         # linear projection to transformer dimension
         self.input_proj = nn.Linear(self.flattened_dim, hidden_dim)
@@ -264,39 +252,39 @@ class BirdCLEFEncoder(nn.Module):
             ]
             
         # Create blocks according to config
-        for block in blocks_config:
-            if block["type"] == "local":
-                self.attention_blocks.append(
-                    LocalAttentionBlock(
-                        d_model=hidden_dim,
-                        num_heads=8,
-                        window_size=block["window_size"],
-                        mlp_dim=mlp_dim,
-                        dropout=dropout
+        with Timer("encoder_block_creation", debug=debug):
+            for block in blocks_config:
+                if block["type"] == "local":
+                    self.attention_blocks.append(
+                        LocalAttentionBlock(
+                            d_model=hidden_dim,
+                            num_heads=8,
+                            window_size=block["window_size"],
+                            mlp_dim=mlp_dim,
+                            dropout=dropout
+                        )
                     )
-                )
-            elif block["type"] == "global":
-                self.attention_blocks.append(
-                    GlobalAttentionBlock(
-                        d_model=hidden_dim,
-                        num_heads=8,
-                        global_stride=block["stride"],
-                        mlp_dim=mlp_dim,
-                        dropout=dropout
+                elif block["type"] == "global":
+                    self.attention_blocks.append(
+                        GlobalAttentionBlock(
+                            d_model=hidden_dim,
+                            num_heads=8,
+                            global_stride=block["stride"],
+                            mlp_dim=mlp_dim,
+                            dropout=dropout
+                        )
                     )
-                )
 
+    @timed_operation("encoder_forward")
     def forward(self, x):
         """
         x shape: (B,1,D,T) or (B,D,T)
         returns final hidden representation of shape (B, T, hidden_dim)
         plus a list of intermediate outputs if needed.
         """
+        # No individual timers for operations within this method
         if x.dim() == 3:
             x = x.unsqueeze(1)
-
-        if self.debug:
-            print(f"[BirdCLEFEncoder] input: {x.shape}")
 
         # pass through convolutional feature extractor
         x = self.feature_extractor(x)
@@ -323,10 +311,6 @@ class BirdCLEFEncoder(nn.Module):
             x = block(x, debug=self.debug)
             intermediate_outputs.append(x.clone())
         
-        if self.debug:
-            print(f"[BirdCLEFEncoder] final output: {x.shape}")
-            print(f"[BirdCLEFEncoder] collected {len(intermediate_outputs) - 1} intermediate outputs")
-
         return x, intermediate_outputs[1:]  # Now returning meaningful intermediate outputs
 
 ################################################################################
@@ -341,6 +325,7 @@ class Predictor(nn.Module):
             nn.Linear(dim, dim),
         )
 
+    @timed_operation("predictor_forward")
     def forward(self, x):
         return self.net(x)
 
@@ -379,15 +364,17 @@ class PredictorViT(nn.Module):
             for _ in range(depth)
         ])
 
+    @timed_operation("predictor_vit_forward")
     def forward(self, x):
         # x shape: (B, T, H)
-        if self.debug:
-            print(f"[PredictorViT] input: {x.shape}")
+        # No individual timers for operations within this method
         x = self.input_proj(x)
+            
         for layer in self.layers:
             ln_out = layer[0](x)  # layer norm
             ff_out = layer[1:](ln_out)
             x = x + ff_out
+            
         return x
 
 ################################################################################
@@ -399,6 +386,7 @@ class EMA:
         super().__init__()
         self.beta = beta
 
+    @timed_operation("ema_update")
     def update_average(self, old, new):
         if old is None:
             return new
@@ -436,295 +424,183 @@ class BirdJEPA(nn.Module):
 
         # we preserve the same 'context_encoder' and 'target_encoder' naming
         # but we'll create them with our new block structure
-        self.context_encoder = BirdCLEFEncoder(
-            input_dim=input_dim,
-            hidden_dim=hidden_dim,
-            blocks_config=blocks_config,
-            mlp_dim=mlp_dim,
-            dropout=dropout,
-            max_len=max_seq_len,
-            debug=debug
-        )
-        self.target_encoder = BirdCLEFEncoder(
-            input_dim=input_dim,
-            hidden_dim=hidden_dim,
-            blocks_config=blocks_config,
-            mlp_dim=mlp_dim,
-            dropout=dropout,
-            max_len=max_seq_len,
-            debug=False  # typically we keep target encoder quiet
-        )
+        with Timer("model_initialization", debug=debug):
+            self.context_encoder = BirdCLEFEncoder(
+                input_dim=input_dim,
+                hidden_dim=hidden_dim,
+                blocks_config=blocks_config,
+                mlp_dim=mlp_dim,
+                dropout=dropout,
+                max_len=max_seq_len,
+                debug=debug
+            )
+            self.target_encoder = BirdCLEFEncoder(
+                input_dim=input_dim,
+                hidden_dim=hidden_dim,
+                blocks_config=blocks_config,
+                mlp_dim=mlp_dim,
+                dropout=dropout,
+                max_len=max_seq_len,
+                debug=False  # typically we keep target encoder quiet
+            )
 
-        # predictor
-        self.predictor = PredictorViT(
-            hidden_dim=hidden_dim,
-            depth=pred_num_layers,
-            num_heads=pred_num_heads,
-            mlp_dim=pred_mlp_dim,
-            dropout=dropout,
-            max_len=max_seq_len,
-            debug=debug
-        )
+            # predictor
+            self.predictor = PredictorViT(
+                hidden_dim=hidden_dim,
+                depth=pred_num_layers,
+                num_heads=pred_num_heads,
+                mlp_dim=pred_mlp_dim,
+                dropout=dropout,
+                max_len=max_seq_len,
+                debug=debug
+            )
 
-        # decoder
-        self.decoder = nn.Sequential(
-            nn.LayerNorm(hidden_dim),
-            nn.Linear(hidden_dim, input_dim),
-            nn.GELU()
-        )
+            # decoder
+            self.decoder = nn.Sequential(
+                nn.LayerNorm(hidden_dim),
+                nn.Linear(hidden_dim, input_dim),
+                nn.GELU()
+            )
 
-        # EMA
-        self.ema_updater = EMA(0.95)
-        self.ema_m = 0.95
+            # EMA
+            self.ema_updater = EMA(0.95)
+            self.ema_m = 0.95
 
-        if self.debug:
-            # debug prints: count trainable params
-            context_trainable = sum(p.numel() for p in self.context_encoder.parameters() if p.requires_grad)
-            decoder_trainable = sum(p.numel() for p in self.decoder.parameters() if p.requires_grad)
-            print(f"[BirdJEPA] context encoder trainable params: {context_trainable}")
-            print(f"[BirdJEPA] decoder trainable params: {decoder_trainable}")
+            if self.debug:
+                # debug prints: count trainable params
+                context_trainable = sum(p.numel() for p in self.context_encoder.parameters() if p.requires_grad)
+                decoder_trainable = sum(p.numel() for p in self.decoder.parameters() if p.requires_grad)
+                print(f"[BirdJEPA] context encoder trainable params: {context_trainable}")
+                print(f"[BirdJEPA] decoder trainable params: {decoder_trainable}")
 
     @torch.no_grad()
+    @timed_operation("model_update_ema")
     def update_ema(self):
         for param_q, param_k in zip(self.context_encoder.parameters(), self.target_encoder.parameters()):
             param_k.data = self.ema_updater.update_average(param_k.data, param_q.data)
 
+    @timed_operation("model_forward")
     def forward(self, context_spectrogram, target_spectrogram, use_no_mask=False):
-        """
-        context_spectrogram: (B,1,D,T)
-        target_spectrogram:  (B,1,D,T)
-        """
-        if self.debug:
-            print("\n[BirdJEPA] forward - Input shapes:")
-            b, c, d, t = context_spectrogram.shape
-            print(f"  context_spectrogram: {context_spectrogram.shape} (Batch: {b}, Channels: {c}, Freq bins: {d}, Time: {t})")
-            b, c, d, t = target_spectrogram.shape
-            print(f"  target_spectrogram: {target_spectrogram.shape} (Batch: {b}, Channels: {c}, Freq bins: {d}, Time: {t})")
-            print(f"  {get_memory_usage()} at start of forward pass")
-
-        # quick mask check if needed (but here we won't do anything special)
-        mask = (context_spectrogram == 0.0).any(dim=1)
-        if self.debug:
-            b, t = mask.shape
-            print(f"  mask shape: {mask.shape} (Batch: {b}, Time: {t})")
-
+        # No individual timers for operations within this method
         # encode context
-        if self.debug:
-            print("\n[BirdJEPA] Encoding context...")
-            print(f"  {get_memory_usage()} before context encoding")
         context_repr, inter_ctx = self.context_encoder(context_spectrogram)
-        if self.debug:
-            b, t, d = context_repr.shape
-            print(f"  context_repr shape: {context_repr.shape} (Batch: {b}, Time: {t}, Hidden dim: {d})")
-            print(f"  {get_memory_usage()} after context encoding")
 
         if self.zero_predictor_input:
             mask_3d = mask.unsqueeze(-1).expand_as(context_repr)
             context_repr = context_repr.clone()
             context_repr[mask_3d] = 0
-            if self.debug:
-                print(f"  context_repr after masking: {context_repr.shape}")
 
         # encode target w/ no grad
-        if self.debug:
-            print("\n[BirdJEPA] Encoding target...")
-            print(f"  {get_memory_usage()} before target encoding")
         with torch.no_grad():
             target_repr, _ = self.target_encoder(target_spectrogram)
-        if self.debug:
-            print(f"  target_repr shape: {target_repr.shape}")
-            print(f"  {get_memory_usage()} after target encoding")
 
         # predictor
-        if self.debug:
-            print("\n[BirdJEPA] Running predictor...")
-            print(f"  {get_memory_usage()} before predictor")
         pred = self.predictor(context_repr)
-        if self.debug:
-            print(f"  prediction shape: {pred.shape}")
-            print(f"  {get_memory_usage()} after predictor")
 
         # decode
-        if self.debug:
-            print("\n[BirdJEPA] Decoding predictions...")
-            print(f"  {get_memory_usage()} before decoder")
         decoded = self.decoder(pred)  # (B,T,input_dim)
-        if self.debug:
-            print(f"  decoded shape: {decoded.shape}")
         decoded = decoded.transpose(1, 2)  # (B,input_dim,T)
-        if self.debug:
-            print(f"  decoded after transpose: {decoded.shape}")
-            print(f"  {get_memory_usage()} after decoder")
-
+        
         return decoded, target_repr
 
+    @timed_operation("model_compute_latent_loss")
     def compute_latent_loss(self, context_spectrogram, target_spectrogram, mask, is_eval_step=False):
-        if self.debug:
-            print("\n[BirdJEPA] compute_latent_loss - Input shapes:")
-            if context_spectrogram.dim() == 4:
-                b, c, d, t = context_spectrogram.shape
-                print(f"  context_spectrogram: {context_spectrogram.shape} (Batch: {b}, Channels: {c}, Freq bins: {d}, Time: {t})")
-            else:
-                b, d, t = context_spectrogram.shape
-                print(f"  context_spectrogram: {context_spectrogram.shape} (Batch: {b}, Freq bins: {d}, Time: {t})")
-            
-            if target_spectrogram.dim() == 4:
-                b, c, d, t = target_spectrogram.shape
-                print(f"  target_spectrogram: {target_spectrogram.shape} (Batch: {b}, Channels: {c}, Freq bins: {d}, Time: {t})")
-            else:
-                b, d, t = target_spectrogram.shape
-                print(f"  target_spectrogram: {target_spectrogram.shape} (Batch: {b}, Freq bins: {d}, Time: {t})")
-            
-            b, t = mask.shape
-            print(f"  mask: {mask.shape} (Batch: {b}, Time: {t})")
-            print(f"  {get_memory_usage()} at start of compute_latent_loss")
-
+        # No individual timers for operations within this method
         # ensure shape
         if context_spectrogram.dim() == 3:
             context_spectrogram = context_spectrogram.unsqueeze(1)
-            if self.debug:
-                print(f"  context_spectrogram after unsqueeze: {context_spectrogram.shape}")
         if target_spectrogram.dim() == 3:
             target_spectrogram = target_spectrogram.unsqueeze(1)
-            if self.debug:
-                print(f"  target_spectrogram after unsqueeze: {target_spectrogram.shape}")
 
         # encode context
-        if self.debug:
-            print("\n[BirdJEPA] Encoding context...")
-            print(f"  {get_memory_usage()} before context encoding")
         context_repr, _ = self.context_encoder(context_spectrogram)
-        if self.debug:
-            print(f"  context_repr after encoding: {context_repr.shape}")
-            print(f"  {get_memory_usage()} after context encoding")
 
         if self.zero_predictor_input:
             mask_3d = mask.unsqueeze(-1).expand_as(context_repr)
             context_repr = context_repr.clone()
             context_repr[mask_3d] = 0
-            if self.debug:
-                print(f"  context_repr after masking: {context_repr.shape}")
 
         # encode target
-        if self.debug:
-            print("\n[BirdJEPA] Encoding target...")
         with torch.no_grad():
             target_repr, _ = self.target_encoder(target_spectrogram)
-        if self.debug:
-            print(f"  target_repr shape: {target_repr.shape}")
 
         # predictor
-        if self.debug:
-            print("\n[BirdJEPA] Running predictor...")
         pred = self.predictor(context_repr)
-        if self.debug:
-            print(f"  prediction output shape: {pred.shape}")
 
         # compute mse in latent space
-        if self.debug:
-            print("\n[BirdJEPA] Computing loss...")
         mask = mask.unsqueeze(-1)  # (B,T,1)
-        if self.debug:
-            print(f"  expanded mask shape: {mask.shape}")
         diff = (pred - target_repr) ** 2 * mask
-        if self.debug:
-            print(f"  diff shape: {diff.shape}")
         total_loss = diff.sum()
         num_masked = mask.sum()
         avg_loss = total_loss / (num_masked + 1e-8)
         if self.debug or is_eval_step:
-            print(f"[BirdJEPA] sum_loss={total_loss.item():.4f}, avg_loss={avg_loss.item():.4f}, num_masked={num_masked.item()}")
+            # Use stdout.log_file.write instead of print to ensure file-only logging
+            msg = f"[BirdJEPA] sum_loss={total_loss.item():.4f}, avg_loss={avg_loss.item():.4f}, num_masked={num_masked.item()}"
+            if hasattr(sys.stdout, 'log_file'):
+                sys.stdout.log_file.write(msg + "\n")
+                sys.stdout.log_file.flush()
+            else:
+                print(msg)
 
         loss = avg_loss
         return loss, diff, pred, target_repr, context_repr
 
+    @timed_operation("model_training_step")
     def training_step(self, context_spectrogram, target_spectrogram, mask):
         return self.compute_latent_loss(context_spectrogram, target_spectrogram, mask)
 
+    @timed_operation("model_train_forward")
     def train_forward(self, context_spectrogram, target_spectrogram):
         """
         context_spectrogram: (B,D,T) masked
         target_spectrogram: (B,D,T) unmasked
         """
-        if self.debug:
-            print("\n[BirdJEPA] train_forward - Input shapes:")
-            print(f"  context_spectrogram: {context_spectrogram.shape}")
-            print(f"  target_spectrogram: {target_spectrogram.shape}")
-
+        # No individual timers for operations within this method
         # add channel dimension
         if context_spectrogram.dim() == 3:
             context_spectrogram = context_spectrogram.unsqueeze(1)
-            if self.debug:
-                print(f"  context_spectrogram after unsqueeze: {context_spectrogram.shape}")
         if target_spectrogram.dim() == 3:
             target_spectrogram = target_spectrogram.unsqueeze(1)
-            if self.debug:
-                print(f"  target_spectrogram after unsqueeze: {target_spectrogram.shape}")
 
         # encode context
-        if self.debug:
-            print("\n[BirdJEPA] Encoding context...")
         context_repr, inter_ctx = self.context_encoder(context_spectrogram)
-        if self.debug:
-            print(f"  context_repr shape: {context_repr.shape}")
 
         # encode target
-        if self.debug:
-            print("\n[BirdJEPA] Encoding target...")
         with torch.no_grad():
             target_repr, inter_tgt = self.target_encoder(target_spectrogram)
-        if self.debug:
-            print(f"  target_repr shape: {target_repr.shape}")
 
         # predictor + decode
-        if self.debug:
-            print("\n[BirdJEPA] Running predictor and decoding...")
         pred = self.predictor(context_repr)
-        if self.debug:
-            print(f"  pred shape: {pred.shape}")
         decoded_pred = self.decoder(pred)    # (B,T,D)
-        if self.debug:
-            print(f"  decoded_pred shape: {decoded_pred.shape}")
         decoded_pred = decoded_pred.transpose(1,2)  # (B,D,T)
-        if self.debug:
-            print(f"  decoded_pred after transpose: {decoded_pred.shape}")
-
+        
         return decoded_pred, None, target_spectrogram, {
             "layer_outputs": torch.stack([]),
             "target_outputs": torch.stack([])
         }
 
+    @timed_operation("model_inference_forward")
     def inference_forward(self, x):
         """
         run model in inference mode (no masking).
         x: (B,1,T,F) from analysis code => we will reorder to (B,F,T)
         returns (context_repr, layers)
         """
-        if self.debug:
-            print("\n[BirdJEPA] inference_forward - Input shape:")
-            print(f"  x: {x.shape}")
-        
+        # No individual timers for operations within this method
         # reorder
         x = x.squeeze(1)         # (B,T,F)
-        if self.debug:
-            print(f"  x after squeeze: {x.shape}")
         x = x.transpose(1,2)     # (B,F,T)
-        if self.debug:
-            print(f"  x after transpose: {x.shape}")
         
         # encode
-        if self.debug:
-            print("\n[BirdJEPA] Encoding for inference...")
         context_repr, intermediate_outputs = self.context_encoder(x.unsqueeze(1))
-        if self.debug:
-            print(f"  context_repr shape: {context_repr.shape}")
-            print(f"  Number of intermediate outputs: {len(intermediate_outputs)}")
         
         # format intermediate outputs (placeholder)
         layers = []
+        
         return context_repr, layers
 
 # Helper function to get memory usage in a readable format
+@timed_operation("get_memory_usage")
 def get_memory_usage():
     if torch.cuda.is_available():
         mem_allocated = torch.cuda.memory_allocated() / 1024**2  # MB

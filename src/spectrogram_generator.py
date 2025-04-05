@@ -16,6 +16,9 @@ from scipy.signal import ellip, filtfilt
 import time
 from multiprocessing import Pool, TimeoutError
 import logging
+import torch
+import torchaudio
+from timing_utils import Timer, timed_operation, timing_stats
 
 class WavtoSpec:
     def __init__(
@@ -317,7 +320,7 @@ class WavtoSpec:
                     segment_spec_file_path = os.path.join(
                         self.dst_dir, f"{spec_filename}_segment_{i}.npz"
                     )
-                    np.savez_compressed(  # Use compressed version to save disk space
+                    np.savez(  # Use uncompressed version
                         segment_spec_file_path,
                         s=segment_Sxx_log,
                         vocalization=segment_vocalization,
@@ -380,6 +383,162 @@ class WavtoSpec:
 
         logging.info(f"File {file_name} skipped: no matching entry found in {song_detection_json_path}")
         return None, None
+
+class SpectrogramGenerator:
+    def __init__(self, sample_rate=16000, n_fft=1024, hop_length=512, n_mels=128, debug=False):
+        self.sample_rate = sample_rate
+        self.n_fft = n_fft
+        self.hop_length = hop_length
+        self.n_mels = n_mels
+        self.debug = debug
+
+        with Timer("spectrogram_generator_initialization", debug=debug):
+            self.mel_transform = torchaudio.transforms.MelSpectrogram(
+                sample_rate=sample_rate,
+                n_fft=n_fft,
+                hop_length=hop_length,
+                n_mels=n_mels,
+                power=2.0
+            )
+
+    @timed_operation("generate_spectrogram")
+    def generate_spectrogram(self, audio):
+        """
+        Generate mel spectrogram from audio waveform.
+        Args:
+            audio (torch.Tensor): Audio waveform of shape (1, T) or (T,)
+        Returns:
+            torch.Tensor: Mel spectrogram of shape (n_mels, T)
+        """
+        with Timer("audio_preprocessing", debug=self.debug):
+            # Ensure audio is the right shape
+            if audio.dim() == 1:
+                audio = audio.unsqueeze(0)
+
+        with Timer("mel_spectrogram_computation", debug=self.debug):
+            # Generate mel spectrogram
+            mel_spec = self.mel_transform(audio)
+
+        with Timer("spectrogram_postprocessing", debug=self.debug):
+            # Convert to log scale
+            mel_spec = torch.log(mel_spec + 1e-9)
+
+            # Normalize
+            mel_spec = (mel_spec - mel_spec.mean()) / (mel_spec.std() + 1e-9)
+
+        return mel_spec
+
+    @timed_operation("generate_batch_spectrograms")
+    def generate_batch_spectrograms(self, audio_batch):
+        """
+        Generate mel spectrograms for a batch of audio waveforms.
+        Args:
+            audio_batch (torch.Tensor): Batch of audio waveforms of shape (B, 1, T) or (B, T)
+        Returns:
+            torch.Tensor: Batch of mel spectrograms of shape (B, n_mels, T)
+        """
+        with Timer("batch_preprocessing", debug=self.debug):
+            # Ensure audio batch is the right shape
+            if audio_batch.dim() == 2:
+                audio_batch = audio_batch.unsqueeze(1)
+
+        with Timer("batch_spectrogram_generation", debug=self.debug):
+            # Generate spectrograms for each audio in the batch
+            spectrograms = []
+            for audio in audio_batch:
+                spec = self.generate_spectrogram(audio)
+                spectrograms.append(spec)
+
+        with Timer("batch_postprocessing", debug=self.debug):
+            # Stack spectrograms into a batch
+            batch_spec = torch.stack(spectrograms)
+
+        return batch_spec
+
+    @timed_operation("apply_augmentation")
+    def apply_augmentation(self, spectrogram, augmentation_type='time_mask'):
+        """
+        Apply augmentation to a spectrogram.
+        Args:
+            spectrogram (torch.Tensor): Mel spectrogram of shape (n_mels, T)
+            augmentation_type (str): Type of augmentation to apply
+        Returns:
+            torch.Tensor: Augmented mel spectrogram
+        """
+        with Timer("augmentation_application", debug=self.debug):
+            if augmentation_type == 'time_mask':
+                # Time masking
+                time_masking_param = 80
+                freq_masking_param = 80
+                
+                B, C, T = spectrogram.shape
+                for i in range(B):
+                    for _ in range(2):  # Apply 2 time masks
+                        t = np.random.randint(0, time_masking_param)
+                        t_zero = np.random.randint(0, T - t)
+                        spectrogram[i, :, t_zero:t_zero + t] = 0
+                        
+                    for _ in range(2):  # Apply 2 frequency masks
+                        f = np.random.randint(0, freq_masking_param)
+                        f_zero = np.random.randint(0, C - f)
+                        spectrogram[i, f_zero:f_zero + f, :] = 0
+
+            elif augmentation_type == 'noise':
+                # Add Gaussian noise
+                noise = torch.randn_like(spectrogram) * 0.005
+                spectrogram = spectrogram + noise
+
+            elif augmentation_type == 'pitch_shift':
+                # Simulate pitch shift by shifting frequencies
+                shift = np.random.randint(-4, 4)
+                spectrogram = torch.roll(spectrogram, shifts=shift, dims=1)
+
+        return spectrogram
+
+    @timed_operation("generate_masked_spectrogram")
+    def generate_masked_spectrogram(self, spectrogram, mask_ratio=0.15):
+        """
+        Generate a masked version of the spectrogram for training.
+        Args:
+            spectrogram (torch.Tensor): Original mel spectrogram
+            mask_ratio (float): Ratio of the spectrogram to mask
+        Returns:
+            tuple: (masked_spectrogram, mask)
+        """
+        with Timer("mask_generation", debug=self.debug):
+            # Create random mask
+            mask = torch.rand_like(spectrogram) < mask_ratio
+
+        with Timer("mask_application", debug=self.debug):
+            # Apply mask
+            masked_spectrogram = spectrogram.clone()
+            masked_spectrogram[mask] = 0
+
+        return masked_spectrogram, mask
+
+    @timed_operation("process_audio_file")
+    def process_audio_file(self, audio_path):
+        """
+        Process an audio file into a spectrogram.
+        Args:
+            audio_path (str): Path to the audio file
+        Returns:
+            torch.Tensor: Mel spectrogram
+        """
+        with Timer("audio_loading", debug=self.debug):
+            # Load audio file
+            waveform, sample_rate = torchaudio.load(audio_path)
+            
+            # Resample if necessary
+            if sample_rate != self.sample_rate:
+                resampler = torchaudio.transforms.Resample(sample_rate, self.sample_rate)
+                waveform = resampler(waveform)
+
+        with Timer("spectrogram_generation", debug=self.debug):
+            # Generate spectrogram
+            spectrogram = this.generate_spectrogram(waveform)
+
+        return spectrogram
 
 def main():
     parser = argparse.ArgumentParser(description="Convert WAV files to spectrograms.")

@@ -1,141 +1,201 @@
-# data_class.py
 import torch
 from torch.utils.data import Dataset
 import random
 import os
 import numpy as np
+import torchaudio
+import time
+from pathlib import Path
+from timing_utils import Timer, timed_operation, timing_stats
 
 class BirdJEPA_Dataset(Dataset):
     def __init__(self, data_dir, segment_len=50, verbose=False):
-        # we assume each file has spec shape: (D,T)
-        # we want to extract a contiguous segment of length segment_len along time dimension T
-        self.files = [os.path.join(data_dir, f) for f in os.listdir(data_dir)]
+        self.data_dir = data_dir
         self.segment_len = segment_len
         self.verbose = verbose
-        self.epoch_size = 10000  # number of samples per epoch
-
+        
+        # preload file paths into memory for fast access
+        self.file_paths = [entry.path for entry in os.scandir(data_dir)]
+        self.file_count = len(self.file_paths)
+        
         if self.verbose:
-            print(f"Initialized dataset with {len(self.files)} files.")
-
+            print(f"Initialized dataset with {self.file_count} files.")
+                
     def __len__(self):
-        return self.epoch_size
+        # return a very large number to simulate an infinite dataset
+        return int(1e5)
+    
+    def _get_random_file(self):
+        """Get a random file path from the preloaded file paths."""
+        idx = random.randint(0, self.file_count - 1)
+        return self.file_paths[idx]
+    
+    def _load_file(self, file_path):
+        """Load file with memory mapping for efficient partial reads."""
+        return np.load(file_path, allow_pickle=True, mmap_mode='r')
 
+    @timed_operation("data_loading")
     def __getitem__(self, idx):
-        # pick a random file
-        fpath = random.choice(self.files)
+        # ignore the provided idx and select a random file
+        file_path = self._get_random_file()
+        
+        # Load with memory mapping
+        data = self._load_file(file_path)
+        spec = data['s']  # Memory-mapped array
+        ground_truth_labels = data['labels'] # Memory-mapped array
+
+        F, T = spec.shape
+        
         if self.verbose:
-            print(f"Selected file: {fpath}")
+            print(f"Loaded file: {file_path}")
+            print(f"Original spectrogram shape: {spec.shape}")
+            print(f"Original labels shape: {ground_truth_labels.shape}")
 
-        try:
-            data = np.load(fpath)
-            spec = data['s']  # we assume shape: (F,T)
-            ground_truth_labels = data['labels']  # shape: T
-            
-            # F stands for frequency bins, T stands for time frames
-            F, T = spec.shape
-
+        if T < self.segment_len:
+            # pad both spectrogram and labels
             if self.verbose:
-                print(f"Initial spec shape: {spec.shape}")
-                print(f"Initial ground_truth_labels shape: {ground_truth_labels.shape}")
+                print(f"Padding short segment from length {T} to {self.segment_len}")
+            
+            padded_spec = np.zeros((F, self.segment_len))
+            padded_spec[:, :T] = spec
+            
+            padded_labels = np.zeros(self.segment_len, dtype=ground_truth_labels.dtype)
+            padded_labels[:T] = ground_truth_labels
+            
+            spec = padded_spec
+            ground_truth_labels = padded_labels
+            T = self.segment_len
 
-            if T < self.segment_len:
-                # Pad both spectrogram and labels
-                if self.verbose:
-                    print(f"Padding short segment from length {T} to {self.segment_len}")
-                
-                # Create padded spectrogram with zeros
-                padded_spec = np.zeros((F, self.segment_len))
-                padded_spec[:, :T] = spec  # Copy original data
-                
-                # Create padded labels with zeros (or another padding value if needed)
-                padded_labels = np.zeros(self.segment_len, dtype=ground_truth_labels.dtype)
-                padded_labels[:T] = ground_truth_labels  # Copy original labels
-                
-                spec = padded_spec
-                ground_truth_labels = padded_labels
-                T = self.segment_len  # Update T to new length
-
-            # select a time slice of length segment_len
+            # Directly slice the memmapped arrays
             start = random.randint(0, T - self.segment_len)
-            if self.verbose:
-                print(f"Selected start index: {start}")
+            segment = spec[:, start:start+self.segment_len].copy()  # Copy forces load into memory
+            segment_labels = ground_truth_labels[start:start+self.segment_len].copy()
+        else:
+            # Directly slice the memmapped arrays
+            start = random.randint(0, T - self.segment_len)
+            segment = spec[:, start:start+self.segment_len].copy()  # Copy forces load into memory
+            segment_labels = ground_truth_labels[start:start+self.segment_len].copy()
 
-            # extract segment and corresponding labels
-            segment = spec[:, start:start+self.segment_len]
-            segment_labels = ground_truth_labels[start:start+self.segment_len]  # Get corresponding labels
+        # global z-score normalization
+        mean_val = np.mean(segment)
+        std_val = np.std(segment)
+        segment = (segment - mean_val) / (std_val + 1e-8)
 
-            # Replace column-wise z-score normalization with global z-score normalization
-            mean_val = np.mean(segment)    # Single scalar mean
-            std_val = np.std(segment)      # Single scalar std
-            segment = (segment - mean_val) / (std_val + 1e-8)    # Add epsilon for numerical stability
+        segment = torch.from_numpy(segment).float()
+        segment_labels = torch.from_numpy(segment_labels).long()
+                
+        return segment, segment_labels, os.path.basename(file_path)
 
-            segment = torch.from_numpy(segment).float()  # shape (D, segment_len)
-            segment_labels = torch.from_numpy(segment_labels).long()  # Convert labels to tensor
-            
-            if self.verbose:
-                print(f"Returning segment with shape: {segment.shape} (D,T)")
-                print(f"Returning labels with shape: {segment_labels.shape} (T)")
-            
-            # Return filename as well
-            return segment, segment_labels, os.path.basename(fpath)
-        except Exception as e:
-            if self.verbose:
-                print(f"Error loading file {fpath}: {e}, trying another file.")
-            return self.__getitem__(random.randint(0, len(self.files)-1))
-
+@timed_operation("collate_fn")
 def collate_fn(batch, segment_length=500, mask_p=0.75, verbose=False):
-    # Unzip the batch into separate lists
-    specs, labels, filenames = zip(*batch)  # Now unpacking filenames too
+    # Simplified collate function without timing blocks
+    specs, labels, filenames = zip(*batch)
     
-    # stack -> (B,F,T)
-    segs = torch.stack(specs, dim=0)  # (B,F,T)
-    labels = torch.stack(labels, dim=0)  # (B,T)
+    # Stack tensors
+    segs = torch.stack(specs, dim=0)
+    labels = torch.stack(labels, dim=0)
     
-    # Create full_spectrogram before any masking
-    full_spectrogram = segs.clone()  # This should be completely unmasked
+    # Create copies for masking
+    full_spectrogram = segs.clone()
+    context_spectrogram = segs.clone()
+    target_spectrogram = segs.clone()
     
-    # Get batch size and sequence length
+    # Get batch size and dimensions
     B, F, T = segs.shape
     
-    if verbose:
-        print(f"DEBUG: full_spectrogram shape before any processing: {full_spectrogram.shape}")
-        print(f"DEBUG: full_spectrogram contains -1?: {(full_spectrogram == -1).any().item()}")
-        print(f"DEBUG: Using actual filenames: {filenames}")
-    
-    # Create mask
+    # Create the mask
     mask = torch.zeros(B, T, dtype=torch.bool)
-    
-    # Create mask along time dimension (T)
     for b in range(B):
         remaining_timesteps_to_mask = int(mask_p * T)
         while remaining_timesteps_to_mask > 0:
-            block_size = random.randint(1, remaining_timesteps_to_mask)
+            block_size = min(random.randint(1, 10), remaining_timesteps_to_mask)
             t_start = random.randint(0, T - block_size)
             mask[b, t_start:t_start+block_size] = True
             remaining_timesteps_to_mask -= block_size
-
-    # Clone spectrograms
-    context_spectrogram = segs.clone()    # (B,F,T)
-    target_spectrogram = segs.clone()     # (B,F,T)
-
-    # Apply masking using zeros instead of noise
+    
+    # Apply the mask
     for b in range(B):
-        context_spectrogram[b, :, mask[b]] = 0  # Replace with zeros for masked regions
+        context_spectrogram[b, :, mask[b]] = 0  # Zero out masked regions in context
         target_spectrogram[b, :, ~mask[b]] = 0  # Zero out unmasked regions in target
     
-    # Add shape and value range debugging
     if verbose:
-        print("\nShape Information:")
-        print(f"full_spectrogram: {full_spectrogram.shape}")
-        print(f"target_spectrogram: {target_spectrogram.shape}")
-        print(f"context_spectrogram: {context_spectrogram.shape}")
-        print(f"labels: {labels.shape}")
-        print(f"mask: {mask.shape}")
-        
-        print("\nValue Ranges:")
-        print(f"full_spectrogram: min={full_spectrogram.min().item():.3f}, max={full_spectrogram.max().item():.3f}, avg={full_spectrogram.mean().item():.3f}")
-        print(f"target_spectrogram: min={target_spectrogram.min().item():.3f}, max={target_spectrogram.max().item():.3f}, avg={target_spectrogram.mean().item():.3f}")
-        print(f"context_spectrogram: min={context_spectrogram.min().item():.3f}, max={context_spectrogram.max().item():.3f}, avg={context_spectrogram.mean().item():.3f}")
-
-    # Use actual file names instead of dummy ones
+        print(f"Batch shapes - Input: {segs.shape}, Mask: {mask.shape}")
+    
     return full_spectrogram, target_spectrogram, context_spectrogram, labels, mask, filenames
+
+class BirdCLEFDataset(Dataset):
+    def __init__(self, root_dir, transform=None, debug=False):
+        with Timer("clef_dataset_initialization", debug=debug):
+            self.root_dir = Path(root_dir)
+            self.transform = transform
+            self.debug = debug
+            self.files = []
+            for file_path in self.root_dir.rglob('*.mp3'):
+                self.files.append(file_path)
+            if self.debug:
+                print(f"[Dataset] Found {len(self.files)} files")
+    def __len__(self):
+        return len(self.files)
+    @timed_operation("clef_dataset_getitem")
+    def __getitem__(self, idx):
+        audio_path = self.files[idx]
+        with Timer("audio_loading", debug=self.debug):
+            waveform, sample_rate = torchaudio.load(audio_path)
+            if waveform.shape[0] > 1:
+                waveform = torch.mean(waveform, dim=0, keepdim=True)
+            if self.transform:
+                waveform = self.transform(waveform)
+            spectrogram = torchaudio.transforms.MelSpectrogram()(waveform)
+            spectrogram = torch.log(spectrogram + 1e-9)
+            spectrogram = (spectrogram - spectrogram.mean()) / (spectrogram.std() + 1e-9)
+            if self.debug and idx % 100 == 0:
+                print(f"[Dataset] Loaded item {idx}")
+            return spectrogram
+
+def worker_init_fn(worker_id):
+    worker_seed = torch.initial_seed() % 2**32 + worker_id
+    np.random.seed(worker_seed)
+    random.seed(worker_seed)
+
+class BirdCLEFDataModule:
+    def __init__(self, data_dir, batch_size=32, num_workers=4, debug=False):
+        with Timer("data_module_initialization", debug=debug):
+            self.data_dir = Path(data_dir)
+            self.batch_size = batch_size
+            self.num_workers = num_workers
+            self.debug = debug
+            self.train_dataset = BirdCLEFDataset(
+                self.data_dir / 'train',
+                debug=debug
+            )
+            self.val_dataset = BirdCLEFDataset(
+                self.data_dir / 'val',
+                debug=debug
+            )
+            if self.debug:
+                print(f"[DataModule] Train samples: {len(self.train_dataset)}")
+                print(f"[DataModule] Val samples: {len(self.val_dataset)}")
+    @timed_operation("data_module_setup")
+    def setup(self):
+        self.train_loader = torch.utils.data.DataLoader(
+            self.train_dataset,
+            batch_size=self.batch_size,
+            shuffle=True,
+            num_workers=self.num_workers,
+            pin_memory=True,
+            worker_init_fn=worker_init_fn
+        )
+        self.val_loader = torch.utils.data.DataLoader(
+            self.val_dataset,
+            batch_size=self.batch_size,
+            shuffle=False,
+            num_workers=self.num_workers,
+            pin_memory=True
+        )
+        if self.debug:
+            print(f"[DataModule] Train batches: {len(self.train_loader)}")
+            print(f"[DataModule] Val batches: {len(self.val_loader)}")
+    def get_train_loader(self):
+        return self.train_loader
+    def get_val_loader(self):
+        return self.val_loader
