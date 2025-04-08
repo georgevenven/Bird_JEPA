@@ -276,11 +276,14 @@ class BirdCLEFEncoder(nn.Module):
                     )
 
     @timed_operation("encoder_forward")
-    def forward(self, x):
+    def forward(self, x, layer_index=None, dict_key=None):
         """
         x shape: (B,1,D,T) or (B,D,T)
         returns final hidden representation of shape (B, T, hidden_dim)
         plus a list of intermediate outputs if needed.
+        
+        If layer_index and dict_key are provided, returns only the output
+        from the specified layer for inference optimization.
         """
         # No individual timers for operations within this method
         if x.dim() == 3:
@@ -303,15 +306,38 @@ class BirdCLEFEncoder(nn.Module):
         # add positional encoding
         x = self.pos_enc(x)
         
+        # Store initial embedding
+        initial_embedding = x.clone()
+        
+        # If we only need initial embedding, return early
+        if layer_index == 0 and dict_key is not None:
+            return {dict_key: initial_embedding}, []
+        
         # Process through attention blocks
         intermediate_outputs = []
-        intermediate_outputs.append(x.clone())
+        intermediate_outputs.append({"attention_output": initial_embedding})
         
-        for block in self.attention_blocks:
+        # Process through attention blocks up to specified layer_index if provided
+        for i, block in enumerate(self.attention_blocks):
             x = block(x, debug=self.debug)
-            intermediate_outputs.append(x.clone())
+            intermediate_outputs.append({"attention_output": x.clone()})
+            
+            # Return early if we've reached the requested layer
+            if layer_index is not None and dict_key is not None and i + 1 == layer_index:
+                return {dict_key: x}, []
         
-        return x, intermediate_outputs[1:]  # Now returning meaningful intermediate outputs
+        # Special handling for layer_index = -1 (last layer)
+        if layer_index == -1 and dict_key is not None:
+            # For layer_index = -1, return the final output directly
+            return {dict_key: x}, []
+            
+        # If layer_index was specified but not found, or no early return requested
+        if layer_index is None or dict_key is None:
+            return x, intermediate_outputs[1:]  # Normal operation
+        else:
+            # If an invalid layer_index was requested, return the last layer output
+            print(f"Warning: layer_index {layer_index} is out of range. Using the last layer instead.")
+            return {dict_key: x}, []
 
 ################################################################################
 # PREDICTOR (AS BEFORE)
@@ -580,24 +606,72 @@ class BirdJEPA(nn.Module):
         }
 
     @timed_operation("model_inference_forward")
-    def inference_forward(self, x):
+    def inference_forward(self, x, layer_index=None, dict_key=None):
         """
         run model in inference mode (no masking).
         x: (B,1,T,F) from analysis code => we will reorder to (B,F,T)
         returns (context_repr, layers)
+        
+        If layer_index and dict_key are provided, returns the output from
+        the specified layer directly in the second return value.
         """
         # No individual timers for operations within this method
         # reorder
         x = x.squeeze(1)         # (B,T,F)
         x = x.transpose(1,2)     # (B,F,T)
         
+        # If dict_key isn't specified, use default value
+        if dict_key is None:
+            dict_key = "attention_output"
+            
+        print(f"[MODEL] Starting inference_forward with layer_index={layer_index}, dict_key={dict_key}")
+            
         # encode
-        context_repr, intermediate_outputs = self.context_encoder(x.unsqueeze(1))
+        context_repr, intermediate_outputs = self.context_encoder(x.unsqueeze(1), layer_index=layer_index, dict_key=dict_key)
         
-        # format intermediate outputs (placeholder)
-        layers = []
+        print(f"[MODEL] Encoder returned: context_repr type={type(context_repr)}, intermediate_outputs={type(intermediate_outputs)} with {len(intermediate_outputs)} items")
         
-        return context_repr, layers
+        # Check if we got a dict from the encoder (specific layer request)
+        if isinstance(context_repr, dict):
+            print(f"[MODEL] context_repr is a dict with keys: {list(context_repr.keys())}")
+            if dict_key in context_repr:
+                print(f"[MODEL] Found dict_key in context_repr, returning directly")
+                # Ensure the value is a tensor
+                if not isinstance(context_repr[dict_key], torch.Tensor):
+                    print(f"[MODEL] Warning: value is not a tensor but {type(context_repr[dict_key])}")
+                return None, context_repr
+            else:
+                # If the key doesn't exist but we have content, add it with the proper key
+                if len(context_repr) > 0:
+                    first_key = list(context_repr.keys())[0]
+                    print(f"[MODEL] dict_key not found, using first key: {first_key}")
+                    output_dict = {dict_key: context_repr[first_key]}
+                    return None, output_dict
+                else:
+                    print(f"[MODEL] Empty context_repr dict, returning empty dict")
+                    return None, {dict_key: None}
+        
+        # For normal operation or when we have a list of layer outputs
+        if len(intermediate_outputs) > 0:
+            print(f"[MODEL] Processing {len(intermediate_outputs)} intermediate outputs")
+            # Make sure we have output with the correct key
+            formatted_outputs = []
+            for i, layer_output in enumerate(intermediate_outputs):
+                if isinstance(layer_output, dict) and dict_key in layer_output:
+                    print(f"[MODEL] Layer {i} has dict with correct key")
+                    formatted_outputs.append(layer_output)
+                else:
+                    # If it's not a dict or doesn't have the right key, wrap it
+                    print(f"[MODEL] Layer {i} needs reformatting, type={type(layer_output)}")
+                    if isinstance(layer_output, torch.Tensor):
+                        print(f"[MODEL] Layer {i} is tensor with shape {layer_output.shape}")
+                    formatted_outputs.append({dict_key: layer_output})
+            return context_repr, formatted_outputs
+        else:
+            # No outputs available
+            print(f"[MODEL] No intermediate outputs, returning empty list with dict")
+            empty_dict = {dict_key: None}
+            return context_repr, [empty_dict]
 
 # Helper function to get memory usage in a readable format
 @timed_operation("get_memory_usage")

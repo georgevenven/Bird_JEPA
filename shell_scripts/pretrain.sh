@@ -9,19 +9,19 @@ cd ..
 INPUT_DIR="/home/george-vengrovski/Documents/projects/Bird_JEPA/xeno_subset"
 SONG_DETECTION_JSON_PATH=None
 TEST_PERCENTAGE=20
-EXPERIMENT_NAME="BirdJEPA_Test"
+EXPERIMENT_NAME="BirdJEPA_Run_10k"
 
 # change default parameters (if needed)
-BATCH_SIZE=48                    # training batch size
+BATCH_SIZE=32                    # training batch size
 LEARNING_RATE=3e-4                # learning rate for training
 MULTI_THREAD=true                 # set to false for single-thread spectrogram generation
 STEP_SIZE=119                     # step size for spectrogram generation
 NFFT=1024                         # number of fft points for spectrogram
-MAX_STEPS=15                   # maximum training steps
-EVAL_INTERVAL=5                   # evaluation interval
+MAX_STEPS=10000               # maximum training steps
+EVAL_INTERVAL=500                   # evaluation interval
 INPUT_DIM=513                     # input dimension (frequency bins)
 HIDDEN_DIM=64                    # hidden dimension
-MAX_SEQ_LEN=500                   # maximum sequence length
+MAX_SEQ_LEN=1000                   # maximum sequence length
 MASK_RATIO=0.3                    # mask ratio for training
 DEBUG=true                       # debug mode flag (lowercase)
 
@@ -135,8 +135,7 @@ python3 src/spectrogram_generator.py \
         --song_detection_json_path "$SONG_DETECTION_JSON_PATH" \
         --step_size "$STEP_SIZE" \
         --nfft "$NFFT" \
-        --single_threaded "$([[ "$MULTI_THREAD" == false ]] && echo 'true' || echo 'false')" \
-        --generate_random_files_number 10
+        --single_threaded "$([[ "$MULTI_THREAD" == false ]] && echo 'true' || echo 'false')"
 
         
 python3 src/spectrogram_generator.py \
@@ -145,8 +144,7 @@ python3 src/spectrogram_generator.py \
         --song_detection_json_path "$SONG_DETECTION_JSON_PATH" \
         --step_size "$STEP_SIZE" \
         --nfft "$NFFT" \
-        --single_threaded "$([[ "$MULTI_THREAD" == false ]] && echo 'true' || echo 'false')" \
-        --generate_random_files_number 10
+        --single_threaded "$([[ "$MULTI_THREAD" == false ]] && echo 'true' || echo 'false')"
 
 
 # run trainer with BirdJEPA model

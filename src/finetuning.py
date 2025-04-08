@@ -26,6 +26,506 @@ from utils import load_model
 from spectrogram_generator import WavtoSpec
 from data_class import BirdJEPA_Dataset, collate_fn as data_class_collate_fn
 
+# Define a special dataset for BirdCLEF fine-tuning
+class BirdCLEFSpecDataset(BirdJEPA_Dataset):
+    def __init__(self, spec_dir, taxonomy_file, train_csv, mode='train', verbose=False):
+        """
+        Dataset for BirdCLEF classification using pre-generated spectrograms
+        
+        Args:
+            spec_dir (str): Directory containing pre-generated spectrograms
+            taxonomy_file (str): Path to taxonomy.csv file with species info
+            train_csv (str): Path to train.csv file with labels
+            mode (str): 'train' or 'val' mode
+            verbose (bool): Whether to print assignment messages
+        """
+        # Initialize parent class
+        super().__init__(data_dir=spec_dir, segment_len=2500)
+        
+        # Store the mode for length determination
+        self.mode = mode
+        self.verbose = verbose
+        
+        # Load taxonomy data
+        self.taxonomy = pd.read_csv(taxonomy_file)
+        self.species_ids = self.taxonomy['primary_label'].tolist()
+        self.num_classes = len(self.species_ids)
+        
+        # Print first few entries in taxonomy for debugging
+        print("\nDEBUG: First 5 species in taxonomy:")
+        for i in range(min(5, len(self.species_ids))):
+            print(f"  {i}: {self.species_ids[i]}")
+        
+        # Map species to index
+        self.species_to_idx = {species: idx for idx, species in enumerate(self.species_ids)}
+        
+        # Load data from CSV
+        self.df = pd.read_csv(train_csv)
+        
+        # Print CSV structure for debugging
+        print("\nDEBUG: Train CSV columns:", list(self.df.columns))
+        print(f"DEBUG: Train CSV first row: {self.df.iloc[0].to_dict()}")
+        
+        # Filter out samples without species in taxonomy
+        self.df = self.df[self.df['primary_label'].isin(self.species_ids)]
+        
+        # Check if 'split' column exists, if not create it
+        if 'split' not in self.df.columns:
+            print("No 'split' column found in CSV. Creating 80/20 train/val split.")
+            # Create a random 80/20 split for train/val
+            np.random.seed(42)  # For reproducibility
+            msk = np.random.rand(len(self.df)) < 0.8
+            self.df['split'] = 'val'
+            self.df.loc[msk, 'split'] = 'train'
+        
+        # Filter dataset based on mode (train/val)
+        if mode == 'train':
+            self.df = self.df[self.df['split'] == 'train']
+        elif mode == 'val':
+            self.df = self.df[self.df['split'] == 'val']
+        
+        # Create a direct mapping from file paths to their primary labels
+        # This will handle the actual directory structure in BirdCLEF/train_audio
+        self.filename_to_species = {}
+        
+        # Log how many files we found and processed
+        found_files = 0
+        matching_files = 0
+        
+        # Extract the base filename from our spectrogram paths
+        # These should be derived from the original audio files
+        for file_path in self.file_paths:
+            base_name = os.path.basename(file_path)
+            # Remove any segment information and extension
+            # The file format should be something like "XC123456_segment_0.npz"
+            base_name_parts = base_name.split('_segment_')
+            if len(base_name_parts) > 0:
+                audio_id = base_name_parts[0]
+                found_files += 1
+                
+                # Print some example filenames for debugging
+                if found_files <= 5:
+                    print(f"\nDEBUG: Processing file {found_files}: {base_name}")
+                    print(f"  audio_id: {audio_id}")
+                
+                # Look for matches in the dataframe
+                # Check both the full filename and just the ID portion
+                matches = self.df[self.df['filename'].str.contains(audio_id)]
+                
+                if not matches.empty:
+                    # Use the first match's primary label
+                    primary_label = matches.iloc[0]['primary_label']
+                    self.filename_to_species[audio_id] = primary_label
+                    matching_files += 1
+                    
+                    # Print first few matches for debugging
+                    if matching_files <= 5:
+                        print(f"  Matched to {primary_label} in CSV")
+                        
+                # For first few unmatched files, show why it didn't match
+                if not matches.empty == False and found_files <= 5:
+                    # Get the species ID from the filename (the part before the first underscore)
+                    parts = audio_id.split('_')
+                    if len(parts) > 0:
+                        potential_species = parts[0]
+                        print(f"  Species from filename: {potential_species}")
+                        print(f"  Is in taxonomy: {potential_species in self.species_to_idx}")
+                    
+                    # Print a few examples from the dataframe to see if there's a filename format issue
+                    print(f"  Example CSV filenames: {self.df['filename'].iloc[:3].tolist()}")
+        
+        if found_files > 0:
+            print(f"Successfully matched {matching_files}/{found_files} spectrogram files to species labels ({matching_files/found_files*100:.1f}%)")
+        else:
+            print("Warning: No files found in the spectrogram directory. Check your paths.")
+        
+        # Log dataset info
+        print(f"Created {mode} dataset with {len(self.file_paths)} files, {self.num_classes} classes")
+        print(f"Found {len(self.filename_to_species)} labeled files")
+        
+        # If we have too few matches, it might indicate a path/naming issue
+        if matching_files < 0.5 * found_files:
+            print("\nWARNING: Less than 50% of files were matched to species. This might indicate issues with:")
+            print("  1. Spectrogram filenames not matching audio file IDs in the CSV")
+            print("  2. Incorrect spectrogram generation process")
+            print("  3. Mismatched directories\n")
+    
+    def __len__(self):
+        """
+        Override the parent class __len__ method to return the actual number of files
+        rather than the "infinite" dataset size.
+        """
+        # For validation, return the actual file count
+        if self.mode == 'val':
+            return len(self.file_paths)
+        # For training, we can still use a large number to enable diverse sampling,
+        # but limit it to a reasonable multiple of the actual file count
+        else:
+            return min(int(1e5), len(self.file_paths) * 25)  # 25 segments per file is reasonable
+    
+    def __getitem__(self, idx):
+        """
+        Get a data sample from the dataset
+        
+        Args:
+            idx: Index of the sample
+        
+        Returns:
+            spectrogram: Spectrogram tensor [C, F, T]
+            label: Multi-hot encoded label tensor [num_classes]
+        """
+        # Get the file path
+        file_idx = idx % len(self.file_paths)
+        file_path = self.file_paths[file_idx]
+        
+        # Load with memory mapping to save memory
+        try:
+            data = np.load(file_path, allow_pickle=True, mmap_mode='r')
+            spec = data['s']
+            
+            # Check for correct dimensions - should be [F, T] where F is frequency bins
+            if len(spec.shape) != 2:
+                raise ValueError(f"Expected 2D spectrogram, got shape {spec.shape}")
+                
+            # Ensure we have the expected number of frequency bins (128)
+            expected_freq_bins = 128
+            if spec.shape[0] != expected_freq_bins:
+                # Reshape to expected dimensions
+                from scipy.ndimage import zoom
+                zoom_factor = expected_freq_bins / spec.shape[0]
+                spec = zoom(spec, (zoom_factor, 1), order=1)
+                
+            # Process spectrogram
+            if spec.shape[1] < self.segment_len:
+                padded_spec = np.zeros((spec.shape[0], self.segment_len))
+                padded_spec[:, :spec.shape[1]] = spec
+                spec = padded_spec
+            
+            # Get a random segment
+            if self.mode == 'train':
+                start = random.randint(0, spec.shape[1] - self.segment_len)
+            else:
+                # For validation, use center segment
+                start = (spec.shape[1] - self.segment_len) // 2
+                
+            segment = spec[:, start:start+self.segment_len].copy()
+            
+            # Normalize
+            mean_val = np.mean(segment)
+            std_val = np.std(segment)
+            segment = (segment - mean_val) / (std_val + 1e-8)
+            
+            # Convert to tensor
+            spectrogram = torch.from_numpy(segment).float()
+            
+        except Exception as e:
+            print(f"Error loading spectrogram from {file_path}: {e}")
+            # Return a random entry as fallback
+            return self.__getitem__((idx + 1) % len(self.file_paths))
+        
+        # Initialize multi-hot encoded label
+        label = torch.zeros(len(self.species_ids), dtype=torch.float32)
+        
+        # Extract filename
+        base_filename = os.path.basename(file_path)
+        matched = False
+        
+        # 1. Try to extract species from the filename directly
+        # New format: species_id_filename.npz or species_id_filename_segment_X.npz
+        parts = base_filename.split('_')
+        if len(parts) >= 2:
+            species_id = parts[0]
+            if species_id in self.species_to_idx:
+                label[self.species_to_idx[species_id]] = 1.0
+                matched = True
+        
+        # 2. Try to match base filename (without extension and segments) to the mapping
+        if not matched:
+            base_filename = base_filename.split('_segment_')[0]  # Remove segment part if present
+            base_filename = os.path.splitext(base_filename)[0]  # Remove extension
+            
+            # If there's an underscore, try extracting just the ID part
+            if '_' in base_filename:
+                # Try with removing the species prefix
+                parts = base_filename.split('_')
+                if len(parts) > 1:
+                    # Remove first part (species) and join the rest
+                    potential_key = '_'.join(parts[1:])
+                    if potential_key in self.filename_to_species:
+                        species = self.filename_to_species[potential_key]
+                        label[self.species_to_idx[species]] = 1.0
+                        matched = True
+        
+        # If no match found, try another file
+        if not matched:
+            # If we're in training mode and can't match, try a different file
+            if self.mode == 'train':
+                # Recursive call to get a different file - limited recursion to prevent issues
+                retry_count = getattr(self, '_retry_count', 0)
+                if retry_count < 5:  # Limit recursion depth
+                    self._retry_count = retry_count + 1
+                    return self.__getitem__((idx + 1) % len(self.file_paths))
+                else:
+                    # If too many retries, reset counter and return with warning
+                    self._retry_count = 0
+                    if self.verbose:
+                        print(f"Warning: Failed to match species after 5 retries. Using zero label for {base_filename}")
+            elif self.verbose:
+                print(f"Warning: No species match found for {base_filename}")
+        else:
+            # Reset retry counter if we found a match
+            self._retry_count = 0
+        
+        # For training mode, ensure we have both positive and negative examples
+        # by occasionally adding a second class
+        if self.mode == 'train' and matched and random.random() < 0.3:  # 30% chance
+            # Add a second species label to create multi-label examples
+            available_indices = [i for i in range(len(self.species_ids)) if label[i] == 0]
+            if available_indices:
+                second_species_idx = random.choice(available_indices)
+                label[second_species_idx] = 1.0
+        
+        return spectrogram, label
+
+    def _get_raw_item(self, idx):
+        """Get raw item without label processing for debugging"""
+        file_idx = idx % len(self.file_paths)
+        file_path = self.file_paths[file_idx]
+        
+        # Load with memory mapping
+        data = np.load(file_path, allow_pickle=True, mmap_mode='r')
+        spec = data['s']
+        ground_truth_labels = data['labels']
+        
+        # Process spectrogram
+        if spec.shape[1] < self.segment_len:
+            padded_spec = np.zeros((spec.shape[0], self.segment_len))
+            padded_spec[:, :spec.shape[1]] = spec
+            spec = padded_spec
+        
+        # Get a random segment
+        start = random.randint(0, spec.shape[1] - self.segment_len)
+        segment = spec[:, start:start+self.segment_len].copy()
+        
+        # Normalize
+        mean_val = np.mean(segment)
+        std_val = np.std(segment)
+        segment = (segment - mean_val) / (std_val + 1e-8)
+        
+        return torch.from_numpy(segment).float(), ground_truth_labels, file_path
+
+# Classification collate function adapted from the original collate_fn
+def classification_collate_fn(batch):
+    """
+    Collate function for classification task
+    
+    Args:
+        batch: List of (spectrogram, label) tuples
+    
+    Returns:
+        spectrograms: Batch of spectrograms [B, F, T]
+        labels: Batch of multi-hot encoded labels [B, num_classes]
+    """
+    # Unpack batch
+    spectrograms, labels = zip(*batch)
+    
+    # Stack spectrograms along batch dimension
+    stacked_spectrograms = torch.stack(spectrograms, dim=0)
+    
+    # Stack labels along batch dimension
+    stacked_labels = torch.stack(labels, dim=0)
+    
+    return stacked_spectrograms, stacked_labels
+
+# Classifier model for fine-tuning
+class BirdCLEFClassifier(nn.Module):
+    def __init__(self, base_model, num_classes, freeze_encoder=True):
+        """
+        Classifier for BirdCLEF using the pretrained BirdJEPA model
+        
+        Args:
+            base_model: Pretrained BirdJEPA model
+            num_classes: Number of bird species classes
+            freeze_encoder: Whether to freeze encoder weights
+        """
+        super().__init__()
+        
+        # Store base model - this is the BirdJEPA model
+        self.base_model = base_model
+        
+        # Freeze encoder if specified
+        if freeze_encoder:
+            for param in self.base_model.context_encoder.parameters():
+                param.requires_grad = False
+        
+        # Get embedding dimension from base model
+        self.embedding_dim = self.base_model.hidden_dim
+        
+        # Add projection layer to convert from encoder output to LSTM input
+        self.projection = nn.Linear(64, 256)  # Project from 64 to 256
+        
+        # BiLSTM 
+        self.bilstm = nn.LSTM(
+            input_size=256,  # Match projection output size
+            hidden_size=256,
+            num_layers=2,
+            bidirectional=True,
+            batch_first=True,
+            dropout=0.3
+        )
+        
+        # Classifier head for BiLSTM output
+        self.classifier = nn.Sequential(
+            nn.Linear(512, 256),  # 512 = 256*2 (bidirectional)
+            nn.ReLU(),
+            nn.Dropout(0.3),
+            nn.Linear(256, num_classes),
+            nn.Sigmoid()  # Sigmoid for multi-label classification
+        )
+    
+    def forward(self, x):
+        """
+        Forward pass through the model
+        
+        Args:
+            x: Input spectrogram [B, F, T]
+        
+        Returns:
+            logits: Classification logits [B, num_classes]
+        """
+        # Process through encoder of base model only
+        # Check if any parameters in context_encoder require gradients
+        requires_grad = any(p.requires_grad for p in self.base_model.context_encoder.parameters())
+        
+        with torch.set_grad_enabled(requires_grad):
+            # Handle different input dimensions
+            if x.dim() == 3:  # [B, F, T]
+                x = x.unsqueeze(1)  # Add channel dimension [B, 1, F, T]
+            
+            # Get embeddings from the context encoder
+            embeddings, _ = self.base_model.context_encoder(x)
+        
+        # Ensure embeddings is shaped correctly for projection
+        if embeddings.dim() == 3:
+            if embeddings.shape[1] == self.embedding_dim:
+                # Shape is [B, D, T], transpose to [B, T, D]
+                embeddings = embeddings.transpose(1, 2)
+            # Now shape should be [B, T, D]
+            batch_size, seq_len, feat_dim = embeddings.shape
+            
+            # Apply projection to each timestep
+            projected = self.projection(embeddings)  # [B, T, 256]
+        else:
+            raise ValueError(f"Unexpected embeddings shape: {embeddings.shape}")
+        
+        # Process through BiLSTM
+        lstm_out, (hidden, _) = self.bilstm(projected)
+        
+        # Use the concatenated final hidden states from both directions
+        # hidden shape: [num_layers*2, batch, hidden_size]
+        last_hidden = torch.cat((hidden[-2], hidden[-1]), dim=1)  # [batch, hidden_size*2]
+        
+        # Forward through classifier head
+        logits = self.classifier(last_hidden)
+        
+        return logits
+
+# Add this new baseline classifier after BirdCLEFClassifier
+class BaselineClassifier(nn.Module):
+    def __init__(self, input_dim, num_classes):
+        """
+        Baseline classifier that processes spectrograms directly without using the pretrained model
+        
+        Args:
+            input_dim: Input feature dimension (frequency bins)
+            num_classes: Number of bird species classes
+        """
+        super().__init__()
+        
+        # Convolutional layers to process raw spectrograms
+        self.conv_layers = nn.Sequential(
+            nn.Conv2d(1, 32, kernel_size=(3,3), stride=(2,1), padding=(1,1)),
+            nn.BatchNorm2d(32),
+            nn.ReLU(),
+            nn.Conv2d(32, 64, kernel_size=(5,5), stride=(2,1), padding=(2,2)),
+            nn.BatchNorm2d(64),
+            nn.ReLU(),
+            nn.Conv2d(64, 128, kernel_size=(7,7), stride=(2,1), padding=(3,3)),
+            nn.BatchNorm2d(128),
+            nn.ReLU(),
+            nn.Conv2d(128, 128, kernel_size=(7,7), stride=(2,1), padding=(3,3)),
+            nn.BatchNorm2d(128),
+            nn.ReLU()
+        )
+        
+        # We'll initialize the projection layer later after seeing the actual dimensions
+        self.projection = None
+        
+        # BiLSTM for temporal processing
+        self.bilstm = nn.LSTM(
+            input_size=256,
+            hidden_size=256,
+            num_layers=2,
+            bidirectional=True,
+            batch_first=True,
+            dropout=0.3
+        )
+        
+        # Classifier head
+        self.classifier = nn.Sequential(
+            nn.Linear(512, 256),  # 512 = 256*2 (bidirectional)
+            nn.ReLU(),
+            nn.Dropout(0.3),
+            nn.Linear(256, num_classes),
+            nn.Sigmoid()  # Sigmoid for multi-label classification
+        )
+        
+        # Flag to indicate if we've initialized the projection layer
+        self.initialized = False
+    
+    def forward(self, x):
+        """
+        Forward pass through the model
+        
+        Args:
+            x: Input spectrogram [B, F, T]
+        
+        Returns:
+            logits: Classification logits [B, num_classes]
+        """
+        # Add channel dimension if needed
+        if x.dim() == 3:  # [B, F, T]
+            x = x.unsqueeze(1)  # Add channel dimension [B, 1, F, T]
+        
+        # Process through convolutional layers
+        x = self.conv_layers(x)  # [B, 128, F/16, T]
+        
+        # Reshape for projection
+        B, C, F, T = x.shape
+        x = x.transpose(1, 3)  # [B, T, F, C]
+        x = x.reshape(B, T, F * C)  # [B, T, F*C]
+        
+        # Initialize projection layer on first forward pass
+        if not self.initialized:
+            input_dim = F * C
+            print(f"Initializing projection layer with input dim: {input_dim}")
+            self.projection = nn.Linear(input_dim, 256).to(x.device)
+            self.initialized = True
+        
+        # Project to fixed dimension
+        x = self.projection(x)  # [B, T, 256]
+        
+        # Process through BiLSTM
+        lstm_out, (hidden, _) = self.bilstm(x)
+        
+        # Use the concatenated final hidden states from both directions
+        last_hidden = torch.cat((hidden[-2], hidden[-1]), dim=1)  # [batch, hidden_size*2]
+        
+        # Forward through classifier head
+        logits = self.classifier(last_hidden)
+        
+        return logits
+
 # Kaggle scoring function
 class ParticipantVisibleError(Exception):
     pass
@@ -57,772 +557,6 @@ def kaggle_score(solution, submission, row_id_column_name=None):
         print(f"Error in scoring: {e}")
         return 0.0
 
-class BirdCLEFDataset(Dataset):
-    """
-    Dataset class for BirdCLEF 2025 competition data
-    """
-    def __init__(
-        self,
-        data_path,
-        taxonomy_file,
-        train_csv=None,
-        mode='train',
-        segment_length=5,  # 5 second segments
-        sample_rate=32000,  # 32kHz sample rate as per competition
-        n_fft=1024,
-        hop_length=512,
-        augment=True,
-        use_cached_spectrograms=False,
-        cache_dir=None,
-        max_samples_per_species=None
-    ):
-        self.data_path = data_path
-        self.mode = mode
-        self.segment_length = segment_length
-        self.sample_rate = sample_rate
-        self.n_fft = n_fft
-        self.hop_length = hop_length
-        self.augment = augment and mode == 'train'
-        self.use_cached_spectrograms = use_cached_spectrograms
-        self.cache_dir = cache_dir
-        self.max_samples_per_species = max_samples_per_species
-        
-        # Load taxonomy (species list)
-        self.taxonomy = pd.read_csv(taxonomy_file)
-        self.species_ids = self.taxonomy['primary_label'].tolist()
-        self.num_classes = len(self.species_ids)
-        
-        # Create mapping from species ID to index
-        self.species_to_idx = {s: i for i, s in enumerate(self.species_ids)}
-        
-        # Load file paths and labels based on mode
-        if mode == 'train' or mode == 'val':
-            # Load train.csv
-            train_df = pd.read_csv(train_csv)
-            
-            # If validation mode, use a consistent subset of data
-            if mode == 'val':
-                # Use 10% of each species data for validation
-                train_df = self._split_train_val(train_df, val_fraction=0.1)
-                
-            self.file_paths = []
-            self.labels = []
-            
-            # For each row in train_df, get the file path and primary label
-            for _, row in train_df.iterrows():
-                species_id = row['primary_label']
-                filename = row['filename']
-                
-                # Construct the full file path - the filename in CSV already contains species_id/file.ogg
-                filepath = os.path.join(self.data_path, 'train_audio', filename)
-                
-                if os.path.exists(filepath):
-                    self.file_paths.append(filepath)
-                    
-                    # One-hot encoding for primary label
-                    label = np.zeros(self.num_classes)
-                    label[self.species_to_idx[species_id]] = 1
-                    
-                    # Add secondary labels if present
-                    if 'secondary_labels' in row and not pd.isna(row['secondary_labels']):
-                        try:
-                            if isinstance(row['secondary_labels'], str):
-                                secondary_labels = eval(row['secondary_labels'])
-                            else:
-                                secondary_labels = row['secondary_labels']
-                            
-                            for sec_label in secondary_labels:
-                                if sec_label in self.species_to_idx and sec_label != '':
-                                    label[self.species_to_idx[sec_label]] = 1
-                        except (SyntaxError, ValueError) as e:
-                            print(f"Error processing secondary labels for {filename}: {e}")
-                    
-                    self.labels.append(label)
-                else:
-                    print(f"File not found: {filepath}")
-            
-            # If max_samples_per_species is set, limit the number of samples
-            if self.max_samples_per_species is not None:
-                self._limit_samples_per_species()
-                
-        elif mode == 'soundscape':
-            # For unlabeled soundscapes (no labels)
-            soundscape_dir = os.path.join(self.data_path, 'train_soundscapes')
-            self.file_paths = [
-                os.path.join(soundscape_dir, f) 
-                for f in os.listdir(soundscape_dir) 
-                if f.endswith('.ogg')
-            ]
-            self.labels = [np.zeros(self.num_classes) for _ in self.file_paths]
-        
-        print(f"Loaded {len(self.file_paths)} files for {mode} mode")
-
-    def _split_train_val(self, df, val_fraction=0.1):
-        """Split dataframe into train and validation sets stratified by species"""
-        # If we're in validation mode, return the validation subset
-        val_indices = []
-        
-        # Group by species ID
-        for species_id in df['primary_label'].unique():
-            species_df = df[df['primary_label'] == species_id]
-            indices = species_df.index.tolist()
-            
-            # Randomly select validation indices
-            num_val = max(1, int(len(indices) * val_fraction))
-            random.seed(42)  # For reproducibility
-            val_indices.extend(random.sample(indices, num_val))
-        
-        if self.mode == 'val':
-            return df.loc[val_indices]
-        else:
-            return df.drop(val_indices)
-
-    def _limit_samples_per_species(self):
-        """Limit the number of samples per species for balanced training"""
-        by_species = {}
-        
-        # Group samples by species
-        for i, label in enumerate(self.labels):
-            species_idx = np.argmax(label)
-            if species_idx not in by_species:
-                by_species[species_idx] = []
-            by_species[species_idx].append(i)
-        
-        # Limit each species to max_samples_per_species
-        new_file_paths = []
-        new_labels = []
-        
-        for species_idx, indices in by_species.items():
-            if len(indices) > self.max_samples_per_species:
-                indices = random.sample(indices, self.max_samples_per_species)
-            
-            for i in indices:
-                new_file_paths.append(self.file_paths[i])
-                new_labels.append(self.labels[i])
-        
-        self.file_paths = new_file_paths
-        self.labels = new_labels
-
-    def __len__(self):
-        return len(self.file_paths)
-
-    def __getitem__(self, idx):
-        file_path = self.file_paths[idx]
-        label = self.labels[idx]
-        
-        # Check cache first if using cached spectrograms
-        if self.use_cached_spectrograms and self.cache_dir:
-            cache_path = os.path.join(self.cache_dir, f"{os.path.basename(file_path)}.npz")
-            if os.path.exists(cache_path):
-                # Load cached spectrogram
-                cached_data = np.load(cache_path)
-                spec = cached_data['s']  # Matches the key used in WavtoSpec
-                
-                # Handle different segment selection based on mode
-                if self.mode == 'train':
-                    # For training, randomly select a segment
-                    if spec.shape[1] > self.segment_length * self.sample_rate // self.hop_length:
-                        start = random.randint(0, spec.shape[1] - self.segment_length * self.sample_rate // self.hop_length)
-                        spec = spec[:, start:start + self.segment_length * self.sample_rate // self.hop_length]
-                    else:
-                        # Pad if necessary
-                        target_length = self.segment_length * self.sample_rate // self.hop_length
-                        if spec.shape[1] < target_length:
-                            padding = target_length - spec.shape[1]
-                            spec = np.pad(spec, ((0, 0), (0, padding)))
-                
-                return torch.tensor(spec).float(), torch.tensor(label).float()
-        
-        # Process audio file if not cached or cache not found
-        try:
-            # Load the audio file
-            audio, sr = librosa.load(file_path, sr=self.sample_rate, mono=True)
-            
-            # Handle audio shorter than segment_length
-            if len(audio) < self.segment_length * self.sample_rate:
-                # Pad with zeros
-                padding = self.segment_length * self.sample_rate - len(audio)
-                audio = np.pad(audio, (0, padding))
-            
-            # For training, randomly select a segment
-            if self.mode == 'train':
-                if len(audio) > self.segment_length * self.sample_rate:
-                    start = random.randint(0, len(audio) - self.segment_length * self.sample_rate)
-                    audio = audio[start:start + self.segment_length * self.sample_rate]
-            
-            # For validation or test, use the first segment
-            elif len(audio) > self.segment_length * self.sample_rate:
-                audio = audio[:self.segment_length * self.sample_rate]
-            
-            # Apply the same preprocessing as in WavtoSpec
-            # High-pass filter
-            from scipy.signal import ellip, filtfilt
-            b, a = ellip(5, 0.2, 40, 500/(self.sample_rate/2), 'high')
-            audio = filtfilt(b, a, audio)
-            
-            # Compute STFT using the same parameters as WavtoSpec
-            Sxx = librosa.stft(audio.astype(float), n_fft=self.n_fft, hop_length=self.hop_length, window='hann')
-            
-            # Convert to dB scale as in WavtoSpec
-            Sxx_log = librosa.amplitude_to_db(np.abs(Sxx), ref=np.max)
-            
-            # Cache the spectrogram if needed
-            if self.use_cached_spectrograms and self.cache_dir:
-                os.makedirs(self.cache_dir, exist_ok=True)
-                cache_path = os.path.join(self.cache_dir, f"{os.path.basename(file_path)}.npz")
-                np.savez_compressed(
-                    cache_path,
-                    s=Sxx_log,
-                    vocalization=np.ones(Sxx_log.shape[1], dtype=int),  # All frames considered as vocalization
-                    labels=np.zeros(Sxx_log.shape[1], dtype=int)  # No per-frame labels
-                )
-            
-            return torch.tensor(Sxx_log).float(), torch.tensor(label).float()
-            
-        except Exception as e:
-            print(f"Error processing {file_path}: {e}")
-            # Return zeros as fallback
-            spec = np.zeros((self.n_fft // 2 + 1, self.segment_length * self.sample_rate // self.hop_length))
-            return torch.tensor(spec).float(), torch.tensor(label).float()
-
-def collate_fn(batch):
-    """Custom collate function to handle variable length spectrograms"""
-    specs = []
-    labels = []
-    
-    # Find max spectrogram length in this batch
-    max_time_len = 0
-    for spec, label in batch:
-        max_time_len = max(max_time_len, spec.shape[1])
-    
-    # Pad each spectrogram to the max length in this batch
-    for spec, label in batch:
-        if spec.shape[1] < max_time_len:
-            # Pad the time dimension to match max_time_len
-            padded_spec = torch.nn.functional.pad(spec, (0, max_time_len - spec.shape[1]))
-            specs.append(padded_spec)
-        else:
-            specs.append(spec)
-        labels.append(label)
-    
-    # Stack all tensors
-    specs = torch.stack(specs)
-    labels = torch.stack(labels)
-    
-    return specs, labels
-
-class BirdCLEFClassifier(nn.Module):
-    """
-    Adaptation of BirdJEPA model for BirdCLEF classification
-    """
-    def __init__(
-        self, 
-        base_model,
-        num_classes,
-        freeze_encoder=True,
-        classifier_hidden_dim=512
-    ):
-        super().__init__()
-        self.base_model = base_model
-        self.num_classes = num_classes
-        
-        # Get hidden dimension from base model
-        hidden_dim = self.base_model.hidden_dim
-        
-        # Freeze encoder if specified
-        if freeze_encoder:
-            for param in self.base_model.context_encoder.parameters():
-                param.requires_grad = False
-        
-        # Create classification head
-        self.classifier = nn.Sequential(
-            nn.Linear(hidden_dim, classifier_hidden_dim),
-            nn.ReLU(),
-            nn.Dropout(0.3),
-            nn.Linear(classifier_hidden_dim, num_classes),
-            nn.Sigmoid()
-        )
-    
-    def forward(self, x):
-        # x shape: (B, F, T) - spectrogram from STFT
-        
-        # Add channel dimension for CNN
-        x = x.unsqueeze(1)  # Add channel dim: (B, 1, F, T)
-        
-        # Get embeddings from base model
-        with torch.no_grad() if all(p.requires_grad == False for p in self.base_model.context_encoder.parameters()) else torch.enable_grad():
-            try:
-                # Extract features using the feature extractor
-                features = self.base_model.context_encoder.feature_extractor(x)
-                
-                # 1. Get dimensions
-                B, C, Freq, T = features.shape
-                
-                # 2. Flatten the frequency dimension
-                features = features.view(B, C * Freq, T)  # (B, C*Freq, T)
-                
-                # 3. Transpose to match the expected input format for the projection
-                features = features.transpose(1, 2)  # (B, T, C*Freq)
-                
-                # Handle dimension mismatch
-                # The input_proj might expect a different dimension than what we have
-                input_proj_weight = self.base_model.context_encoder.input_proj.weight
-                expected_dim = input_proj_weight.shape[1]
-                actual_dim = features.shape[2]
-                
-                if expected_dim != actual_dim:
-                    if expected_dim < actual_dim:
-                        # Reduce dimension using average pooling
-                        features_t = features.transpose(1, 2)  # (B, C*Freq, T)
-                        pooled = torch.nn.functional.adaptive_avg_pool1d(features_t, expected_dim)
-                        features = pooled.transpose(1, 2)  # Back to (B, T, expected_dim)
-                    else:
-                        # This case is unlikely but handle it by padding
-                        padding = torch.zeros(B, features.shape[1], expected_dim - actual_dim, device=features.device)
-                        features = torch.cat([features, padding], dim=2)
-                
-                # 4. Now we can directly use the input_proj from the context_encoder
-                embeddings = self.base_model.context_encoder.input_proj(features)
-                
-                # 5. Apply positional encoding and dropout as the original encoder does
-                embeddings = self.base_model.context_encoder.dropout(embeddings)
-                embeddings = self.base_model.context_encoder.pos_enc(embeddings)
-                
-                # 6. Process through transformer blocks
-                for block in self.base_model.context_encoder.attention_blocks:
-                    embeddings = block(embeddings)
-                
-                # Average pooling over sequence dimension
-                pooled = embeddings.mean(dim=1)  # (B, hidden_dim)
-                
-            except Exception as e:
-                print(f"Error in forward pass: {e}")
-                # Fallback to random embedding
-                hidden_dim = self.base_model.hidden_dim
-                pooled = torch.zeros((x.shape[0], hidden_dim), device=x.device)
-        
-        # Classification
-        output = self.classifier(pooled)
-        
-        return output
-
-def create_train_val_split(data_path, train_csv, val_percentage, temp_dir, taxonomy_file, max_files=None):
-    """
-    Create a train/validation split based on the BirdCLEF dataset.
-    Similar to how it's done in pretrain.sh.
-    
-    Args:
-        data_path: Path to the BirdCLEF dataset directory
-        train_csv: Path to the train CSV file
-        val_percentage: Percentage of data to use for validation (0-100)
-        temp_dir: Directory to store temporary files
-        taxonomy_file: Path to the taxonomy CSV file
-        max_files: Maximum number of files to process (for testing)
-        
-    Returns:
-        Tuple of (train_dir, val_dir, train_file_list, val_file_list)
-    """
-    print(f"Creating train/val split with {val_percentage}% validation data")
-    
-    # Create temporary directories
-    os.makedirs(temp_dir, exist_ok=True)
-    train_audio_dir = os.path.join(temp_dir, "train_audio")
-    val_audio_dir = os.path.join(temp_dir, "val_audio")
-    train_dir = os.path.join(temp_dir, "train_specs")
-    val_dir = os.path.join(temp_dir, "val_specs")
-    
-    os.makedirs(train_audio_dir, exist_ok=True)
-    os.makedirs(val_audio_dir, exist_ok=True)
-    os.makedirs(train_dir, exist_ok=True)
-    os.makedirs(val_dir, exist_ok=True)
-    
-    # Load train.csv
-    train_df = pd.read_csv(train_csv)
-    
-    # If max_files is set, limit the number of samples
-    if max_files is not None:
-        print(f"Limiting to {max_files} files for testing purposes")
-        # Ensure we get data from each species if possible
-        unique_species = train_df['primary_label'].unique()
-        max_per_species = max(1, max_files // len(unique_species))
-        
-        # Select samples from each species
-        limited_df = []
-        for species in unique_species:
-            species_samples = train_df[train_df['primary_label'] == species].sample(
-                min(max_per_species, sum(train_df['primary_label'] == species)),
-                random_state=42
-            )
-            limited_df.append(species_samples)
-        
-        # Combine and limit to max_files if needed
-        train_df = pd.concat(limited_df)
-        if len(train_df) > max_files:
-            train_df = train_df.sample(max_files, random_state=42)
-        
-        print(f"Limited dataset to {len(train_df)} files")
-    
-    # Load taxonomy
-    taxonomy = pd.read_csv(taxonomy_file)
-    
-    # Split by species to ensure stratification
-    train_files = []
-    val_files = []
-    
-    # Set a random seed for reproducibility
-    random.seed(42)
-    
-    # Group by species
-    species_groups = {}
-    for species_id in taxonomy['primary_label'].tolist():
-        species_groups[species_id] = []
-    
-    # Assign each file to its species group
-    for _, row in train_df.iterrows():
-        species_id = row['primary_label']
-        filename = row['filename']
-        src_path = os.path.join(data_path, 'train_audio', filename)
-        
-        if os.path.exists(src_path):
-            species_groups[species_id].append((filename, src_path))
-    
-    # Calculate total number of validation files needed
-    total_files = sum(len(files) for files in species_groups.values())
-    total_val_files_needed = int(total_files * val_percentage / 100)
-    
-    # Ensure we have at least some validation files
-    if total_val_files_needed == 0 and total_files > 0:
-        total_val_files_needed = max(1, int(total_files * 0.1))  # At least 10% or 1 file
-        print(f"Adjusted validation percentage to ensure at least {total_val_files_needed} validation files")
-    
-    # Track counts
-    val_files_assigned = 0
-    
-    # Now assign files to train/val sets by species
-    for species_id, files in species_groups.items():
-        if not files:
-            continue
-        
-        # Calculate number of validation examples for this species
-        species_val_count = max(1, int(len(files) * val_percentage / 100))
-        
-        # For species with only 1 file, include in training if we already have enough validation files
-        if len(files) == 1 and val_files_assigned >= total_val_files_needed / 2:
-            species_val_count = 0
-        elif len(files) == 1:
-            species_val_count = 1
-        # Otherwise ensure at least 1 file is kept for training if there are multiple files
-        elif len(files) > 1:
-            species_val_count = min(species_val_count, len(files) - 1)
-        
-        # Randomly select validation files
-        val_indices = set(random.sample(range(len(files)), species_val_count))
-        val_files_assigned += species_val_count
-        
-        # Process files
-        for i, (filename, src_path) in enumerate(files):
-            # Create directory structure if needed
-            species_folder = os.path.dirname(filename)
-            
-            if i in val_indices:
-                # Validation file
-                dst_dir = os.path.join(val_audio_dir, species_folder)
-                os.makedirs(dst_dir, exist_ok=True)
-                dst_path = os.path.join(val_audio_dir, filename)
-                val_files.append(dst_path)
-            else:
-                # Training file
-                dst_dir = os.path.join(train_audio_dir, species_folder)
-                os.makedirs(dst_dir, exist_ok=True)
-                dst_path = os.path.join(train_audio_dir, filename)
-                train_files.append(dst_path)
-                
-            # Create hard links instead of copying to save space
-            os.makedirs(os.path.dirname(dst_path), exist_ok=True)
-            if not os.path.exists(dst_path):
-                try:
-                    os.link(src_path, dst_path)
-                except OSError:
-                    # Fallback to copy if hard linking fails
-                    shutil.copy2(src_path, dst_path)
-    
-    # Write file lists
-    train_file_list = os.path.join(temp_dir, "train_files.txt")
-    val_file_list = os.path.join(temp_dir, "val_files.txt")
-    
-    with open(train_file_list, 'w') as f:
-        for file_path in train_files:
-            f.write(f"{file_path}\n")
-            
-    with open(val_file_list, 'w') as f:
-        for file_path in val_files:
-            f.write(f"{file_path}\n")
-    
-    print(f"Created {len(train_files)} training files and {len(val_files)} validation files")
-    
-    return train_audio_dir, val_audio_dir, train_dir, val_dir, train_file_list, val_file_list
-
-def generate_spectrograms(audio_dir, spec_dir, step_size, nfft, multi_thread=True, song_detection_json_path=None, max_random_files=None):
-    """
-    Generate spectrograms using the spectrogram_generator.py script.
-    This mimics how it's done in pretrain.sh.
-    
-    Args:
-        audio_dir: Directory containing audio files
-        spec_dir: Directory to save spectrograms
-        step_size: Step size for spectrogram generation
-        nfft: NFFT value for spectrogram generation
-        multi_thread: Whether to use multi-threading
-        song_detection_json_path: Optional path to song detection JSON
-        max_random_files: Maximum number of random files to process (for testing)
-        
-    Returns:
-        Exit code of the subprocess
-    """
-    print(f"Generating spectrograms from {audio_dir} to {spec_dir}")
-    
-    # Determine single_threaded parameter (inverted from multi_thread)
-    single_threaded = 'true' if not multi_thread else 'false'
-    
-    # Set song_detection_json_path to "None" if None
-    if song_detection_json_path is None:
-        song_detection_json_path = "None"
-    
-    # Use the same Python executable that's running this script
-    python_executable = sys.executable
-    print(f"Using Python executable: {python_executable}")
-    
-    # Build command
-    cmd = [
-        python_executable, 'src/spectrogram_generator.py',
-        '--src_dir', audio_dir,
-        '--dst_dir', spec_dir,
-        '--song_detection_json_path', song_detection_json_path,
-        '--step_size', str(step_size),
-        '--nfft', str(nfft),
-        '--single_threaded', single_threaded
-    ]
-    
-    # Add max_random_files if specified
-    if max_random_files is not None:
-        cmd.extend(['--generate_random_files_number', str(max_random_files)])
-    
-    # Execute command
-    process = subprocess.run(cmd, capture_output=True, text=True)
-    
-    # Print output
-    print(process.stdout)
-    
-    if process.returncode != 0:
-        print(f"Error generating spectrograms: {process.stderr}")
-    else:
-        print(f"Successfully generated spectrograms in {spec_dir}")
-    
-    return process.returncode
-
-class BirdCLEFSpecDataset(Dataset):
-    """
-    Dataset class for BirdCLEF 2025 competition data using pre-generated spectrograms
-    """
-    def __init__(
-        self,
-        spec_dir,
-        taxonomy_file,
-        train_csv=None,
-        mode='train',
-        max_samples_per_species=None,
-        segment_len=None  # Use segment_len for compatibility with BirdJEPA_Dataset
-    ):
-        """
-        Initialize the dataset
-        
-        Args:
-            spec_dir: Directory containing spectrogram files (.npz)
-            taxonomy_file: Path to taxonomy.csv file
-            train_csv: Path to train.csv file (needed to map filenames to species)
-            mode: 'train' or 'val'
-            max_samples_per_species: Maximum number of samples per species (for balanced training)
-            segment_len: Used for compatibility with BirdJEPA_Dataset (if None, will use variable lengths)
-        """
-        self.spec_dir = spec_dir
-        self.mode = mode
-        self.segment_len = segment_len
-        
-        # Load taxonomy file
-        taxonomy = pd.read_csv(taxonomy_file)
-        self.species_ids = taxonomy['primary_label'].astype(str).tolist()
-        self.species_to_idx = {species_id: i for i, species_id in enumerate(self.species_ids)}
-        self.num_classes = len(self.species_ids)
-        
-        # Load train.csv to create filename->species mapping
-        self.filename_to_species = {}
-        if train_csv is not None:
-            train_df = pd.read_csv(train_csv)
-            for _, row in train_df.iterrows():
-                # Extract species_id and filename from the full path
-                parts = row['filename'].split('/')
-                if len(parts) == 2:
-                    species_id, filename = parts
-                    # Remove file extension
-                    filename = os.path.splitext(filename)[0]
-                    self.filename_to_species[filename] = species_id
-        
-        # Find all spectrogram files
-        spec_files = glob.glob(os.path.join(spec_dir, '*.npz'))
-        filtered_spec_files = []
-        self.labels = []
-        
-        for spec_file in spec_files:
-            # Extract base filename without extension
-            file_basename = os.path.basename(spec_file)
-            # Remove segment suffix (e.g., _segment_0.npz) to get original file name
-            file_prefix = file_basename.split('_segment_')[0]
-            
-            species_id = None
-            
-            # First, try to find from filename_to_species mapping (from train.csv)
-            if file_prefix in self.filename_to_species:
-                species_id = str(self.filename_to_species[file_prefix])
-            
-            # If not found, try other methods
-            if species_id is None:
-                # Try to match with a known species ID
-                for s_id in self.species_ids:
-                    if file_prefix.startswith(s_id):
-                        species_id = s_id
-                        break
-            
-            if species_id is None:
-                # Try to extract from directory structure
-                # The format should be {species_id}/{filename}
-                parent_dir = os.path.basename(os.path.dirname(spec_file))
-                if parent_dir in self.species_ids:
-                    species_id = parent_dir
-            
-            if species_id is None:
-                print(f"Warning: Could not determine species for {spec_file}")
-                continue
-            
-            # Create one-hot encoding for the label
-            label = np.zeros(self.num_classes)
-            if species_id in self.species_to_idx:
-                label[self.species_to_idx[species_id]] = 1
-                filtered_spec_files.append(spec_file)
-                self.labels.append(label)
-            else:
-                print(f"Warning: Unknown species ID: {species_id}")
-        
-        self.spec_files = filtered_spec_files
-        
-        # If max_samples_per_species is set, limit the number of samples
-        if max_samples_per_species is not None:
-            self._limit_samples_per_species(max_samples_per_species)
-                
-        print(f"Loaded {len(self.spec_files)} spectrogram files for {mode} mode")
-
-    def _limit_samples_per_species(self, max_samples_per_species):
-        """Limit the number of samples per species for balanced training"""
-        by_species = {}
-        
-        # Group samples by species
-        for i, label in enumerate(self.labels):
-            species_idx = np.argmax(label)
-            if species_idx not in by_species:
-                by_species[species_idx] = []
-            by_species[species_idx].append(i)
-        
-        # Limit each species to max_samples_per_species
-        new_spec_files = []
-        new_labels = []
-        
-        for species_idx, indices in by_species.items():
-            if len(indices) > max_samples_per_species:
-                indices = random.sample(indices, max_samples_per_species)
-            
-            for i in indices:
-                new_spec_files.append(self.spec_files[i])
-                new_labels.append(self.labels[i])
-        
-        self.spec_files = new_spec_files
-        self.labels = new_labels
-        print(f"Limited dataset to max {max_samples_per_species} samples per species, total samples: {len(self.spec_files)}")
-
-    def __len__(self):
-        return len(self.spec_files)
-
-    def __getitem__(self, idx):
-        spec_file = self.spec_files[idx]
-        label = self.labels[idx]
-        
-        try:
-            # Load spectrogram from .npz file
-            data = np.load(spec_file)
-            spec = data['s']  # 's' is the key used in WavtoSpec
-            
-            # For train mode, if segment_len is specified, select a random segment
-            if self.mode == 'train' and self.segment_len is not None and spec.shape[1] > self.segment_len:
-                start = random.randint(0, spec.shape[1] - self.segment_len)
-                spec = spec[:, start:start + self.segment_len]
-            
-            # For validation mode, use the first segment if segment_len is specified
-            elif self.mode == 'val' and self.segment_len is not None and spec.shape[1] > self.segment_len:
-                spec = spec[:, :self.segment_len]
-            
-            # Otherwise, use the full spectrogram (data_class will handle padding/trimming)
-            
-            # Convert to tensor
-            spec_tensor = torch.tensor(spec).float()
-            label_tensor = torch.tensor(label).float()
-            
-            # For compatibility with BirdJEPA_Dataset, also return the filename
-            filename = os.path.basename(spec_file)
-            
-            return spec_tensor, label_tensor, filename
-            
-        except Exception as e:
-            print(f"Error loading {spec_file}: {e}")
-            # Return zeros as fallback with a reasonable default size
-            spec = np.zeros((513, 100))  # Default size: 513 frequency bins, 100 time bins
-            return torch.tensor(spec).float(), torch.tensor(label).float(), "error.npz"
-
-def classification_collate_fn(batch):
-    """
-    Adapt data_class_collate_fn for classification tasks
-    We need to handle the 3-tuple return values from BirdCLEFSpecDataset
-    and prepare them for data_class_collate_fn
-    """
-    # Unpack batch of (spec, label, filename)
-    specs, labels, filenames = zip(*batch)
-    
-    # Find max spectrogram length in this batch
-    max_time_len = max(spec.shape[1] for spec in specs)
-    
-    # Pad each spectrogram to the max length in this batch
-    padded_specs = []
-    for spec in specs:
-        if spec.shape[1] < max_time_len:
-            # Pad the time dimension to match max_time_len
-            padding = torch.zeros((spec.shape[0], max_time_len - spec.shape[1]), dtype=spec.dtype)
-            padded_spec = torch.cat([spec, padding], dim=1)
-            padded_specs.append(padded_spec)
-        else:
-            padded_specs.append(spec)
-    
-    # Create dummy labels for data_class_collate_fn (we'll use our actual labels later)
-    dummy_labels = [torch.zeros(spec.shape[1], dtype=torch.long) for spec in padded_specs]
-    
-    # Use data_class_collate_fn with a mask_p of 0 (no masking for classification)
-    # The signature is: full_spec, target_spec, context_spec, labels, mask, filenames
-    full_spectrogram, _, _, _, _, _ = data_class_collate_fn(
-        list(zip(padded_specs, dummy_labels, filenames)),
-        mask_p=0.0  # No masking for classification
-    )
-    
-    # Stack the actual classification labels
-    stacked_labels = torch.stack(labels)
-    
-    return full_spectrogram, stacked_labels
-
 def finetune_model(
     pretrained_model_path,
     train_spec_dir,
@@ -833,20 +567,22 @@ def finetune_model(
     freeze_encoder=True,
     learning_rate=1e-4,
     batch_size=16,
-    epochs=30,
+    max_steps=5000,
     early_stopping_patience=5,
-    max_samples_per_species=None,
     device=None,
-    save_interval=5,  # Save checkpoints every N epochs
-    eval_interval=1   # Evaluate and log metrics every N epochs
+    save_interval=500,  # Save checkpoints every N steps
+    eval_interval=100,   # Evaluate and log metrics every N steps
+    use_baseline=False  # Flag to use baseline model instead of pretrained
 ):
     """
     Fine-tune a pretrained BirdJEPA model for BirdCLEF classification
-    using pre-generated spectrograms
+    using pre-generated spectrograms and the BirdJEPA_Dataset class.
+    If use_baseline=True, creates a model from scratch without using pretrained weights.
     """
     # Create a timestamp for this run
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    run_dir = os.path.join(output_dir, f"run_{timestamp}")
+    model_type = "baseline" if use_baseline else "finetuned"
+    run_dir = os.path.join(output_dir, f"{model_type}_run_{timestamp}")
     os.makedirs(run_dir, exist_ok=True)
     
     # Create subdirectories for checkpoints, logs, and plots
@@ -861,7 +597,7 @@ def finetune_model(
     # Set up logging
     log_file = os.path.join(log_dir, "training_log.csv")
     with open(log_file, 'w') as f:
-        f.write("epoch,train_loss,val_loss,train_auc,val_auc,kaggle_score,time_taken\n")
+        f.write("step,train_loss,val_loss,train_kaggle_score,val_kaggle_score,time_taken\n")
     
     # Set device
     if device is None:
@@ -871,32 +607,25 @@ def finetune_model(
     # Create output directory
     os.makedirs(output_dir, exist_ok=True)
     
-    # Load pretrained model
-    print(f"Loading pretrained model from {pretrained_model_path}")
-    base_model, _, config = load_model(pretrained_model_path, return_checkpoint=True)
-    
-    # Save model config to output directory
-    with open(os.path.join(run_dir, 'config.json'), 'w') as f:
-        json.dump(config, f, indent=4)
-    
-    # Create datasets
+    # Create datasets using the BirdCLEFSpecDataset class (extends BirdJEPA_Dataset)
     print(f"Creating datasets")
     train_dataset = BirdCLEFSpecDataset(
         spec_dir=train_spec_dir,
         taxonomy_file=taxonomy_file,
         train_csv=train_csv,
         mode='train',
-        max_samples_per_species=max_samples_per_species
+        verbose=False
     )
     
     val_dataset = BirdCLEFSpecDataset(
         spec_dir=val_spec_dir,
         taxonomy_file=taxonomy_file,
         train_csv=train_csv,
-        mode='val'
+        mode='val',
+        verbose=False
     )
     
-    # Create data loaders
+    # Create data loaders using the adapted collate function
     train_loader = DataLoader(
         train_dataset,
         batch_size=batch_size,
@@ -915,12 +644,36 @@ def finetune_model(
         pin_memory=True
     )
     
-    # Create classifier model
-    classifier = BirdCLEFClassifier(
-        base_model=base_model,
-        num_classes=train_dataset.num_classes,
-        freeze_encoder=freeze_encoder
-    )
+    # Print actual dataset sizes for debugging
+    print(f"Training dataset size: {len(train_dataset)} samples")
+    print(f"Validation dataset size: {len(val_dataset)} samples")
+    print(f"Training batches: {len(train_loader)}")
+    print(f"Validation batches: {len(val_loader)}")
+    
+    # Create classifier model - either baseline or pretrained
+    if use_baseline:
+        print("Creating baseline classifier (no pretrained weights)")
+        classifier = BaselineClassifier(
+            input_dim=128,  # Typical spectrogram frequency bins
+            num_classes=train_dataset.num_classes
+        )
+        # Save empty config to output directory
+        with open(os.path.join(run_dir, 'config.json'), 'w') as f:
+            json.dump({"model_type": "baseline"}, f, indent=4)
+    else:
+        print(f"Loading pretrained model from {pretrained_model_path}")
+        base_model, _, config = load_model(pretrained_model_path, return_checkpoint=True)
+        
+        # Save model config to output directory
+        with open(os.path.join(run_dir, 'config.json'), 'w') as f:
+            json.dump(config, f, indent=4)
+            
+        classifier = BirdCLEFClassifier(
+            base_model=base_model,
+            num_classes=train_dataset.num_classes,
+            freeze_encoder=freeze_encoder
+        )
+    
     classifier = classifier.to(device)
     
     # Setup optimizer
@@ -941,371 +694,307 @@ def finetune_model(
     # Loss function - binary cross entropy for multi-label classification
     criterion = nn.BCELoss()
     
-    # Training loop
-    best_val_auc = 0
-    best_kaggle_score = 0
-    early_stopping_counter = 0
+    # Training loop - using steps instead of epochs
+    best_val_kaggle_score = 0
+    steps_since_improvement = 0
     train_losses = []
     val_losses = []
-    train_aucs = []
-    val_aucs = []
-    kaggle_scores = []
+    train_kaggle_scores = []
+    val_kaggle_scores = []
     times = []
     
     # Get species IDs for metrics
     species_ids = train_dataset.species_ids
     
-    print(f"Starting training for {epochs} epochs")
-    for epoch in range(epochs):
-        epoch_start_time = time.time()
-        
+    # Create iterators
+    train_iter = iter(train_loader)
+    
+    print(f"Starting training for {max_steps} steps")
+    step = 0
+    
+    # Remove epoch tracking
+    # We'll track steps only for simplicity
+    
+    while step < max_steps:
         # Training
         classifier.train()
-        epoch_loss = 0
-        all_train_outputs = []
-        all_train_labels = []
+        step_start_time = time.time()
         
-        progress_bar = tqdm(train_loader, desc=f"Epoch {epoch+1}/{epochs} [Train]")
+        try:
+            # Get next batch
+            specs, labels = next(train_iter)
+        except StopIteration:
+            # Reset iterator when we've gone through the entire dataset
+            train_iter = iter(train_loader)
+            specs, labels = next(train_iter)
+            print(f"Restarting training iterator")
         
-        for batch_data in progress_bar:
-            # Unpack batch data - our classification_collate_fn returns (spectrograms, labels)
-            specs, labels = batch_data
-            
-            # Move data to device
-            specs = specs.to(device)
-            labels = labels.to(device)
-            
-            optimizer.zero_grad()
-            
-            outputs = classifier(specs)
-            loss = criterion(outputs, labels)
-            
-            loss.backward()
-            optimizer.step()
-            
-            epoch_loss += loss.item()
-            progress_bar.set_postfix(loss=loss.item())
-            
-            # Collect outputs and labels for AUC calculation
-            all_train_outputs.append(outputs.detach().cpu().numpy())
-            all_train_labels.append(labels.detach().cpu().numpy())
+        # Move data to device
+        specs = specs.to(device)
+        labels = labels.to(device)
         
-        train_loss = epoch_loss / len(train_loader)
+        optimizer.zero_grad()
+        
+        outputs = classifier(specs)
+        loss = criterion(outputs, labels)
+        
+        loss.backward()
+        optimizer.step()
+        
+        train_loss = loss.item()
         train_losses.append(train_loss)
         
-        # Calculate training AUC
-        all_train_outputs = np.vstack(all_train_outputs)
-        all_train_labels = np.vstack(all_train_labels)
+        # Increment step counter
+        step += 1
         
-        # Compute per-class AUC and average for training
-        train_aucs_per_class = []
-        for i in range(train_dataset.num_classes):
-            # Only compute AUC if there are positive examples
-            if np.sum(all_train_labels[:, i]) > 0:
-                try:
-                    auc = roc_auc_score(all_train_labels[:, i], all_train_outputs[:, i])
-                    train_aucs_per_class.append(auc)
-                except:
-                    pass
-        
-        train_auc = np.mean(train_aucs_per_class) if train_aucs_per_class else 0
-        train_aucs.append(train_auc)
-        
-        # Validation
-        classifier.eval()
-        val_loss = 0
-        all_val_outputs = []
-        all_val_labels = []
-        
-        with torch.no_grad():
-            progress_bar = tqdm(val_loader, desc=f"Epoch {epoch+1}/{epochs} [Val]")
-            for batch_data in progress_bar:
-                # Unpack batch data - our classification_collate_fn returns (spectrograms, labels)
-                specs, labels = batch_data
-                
-                # Move data to device
-                specs = specs.to(device)
-                labels = labels.to(device)
-                
-                outputs = classifier(specs)
-                loss = criterion(outputs, labels)
-                
-                val_loss += loss.item()
-                progress_bar.set_postfix(loss=loss.item())
-                
-                # Collect outputs and labels for AUC calculation
-                all_val_outputs.append(outputs.cpu().numpy())
-                all_val_labels.append(labels.cpu().numpy())
-        
-        # Compute validation loss
-        val_loss = val_loss / len(val_loader)
-        val_losses.append(val_loss)
-        
-        # Stack all outputs and labels
-        all_val_outputs = np.vstack(all_val_outputs)
-        all_val_labels = np.vstack(all_val_labels)
-        
-        # Compute per-class AUC and average for validation
-        val_aucs_per_class = []
-        for i in range(train_dataset.num_classes):
-            # Only compute AUC if there are positive examples
-            if np.sum(all_val_labels[:, i]) > 0:
-                try:
-                    auc = roc_auc_score(all_val_labels[:, i], all_val_outputs[:, i])
-                    val_aucs_per_class.append(auc)
-                except:
-                    pass
-        
-        val_auc = np.mean(val_aucs_per_class) if val_aucs_per_class else 0
-        val_aucs.append(val_auc)
-        
-        # Calculate Kaggle score
-        # Create DataFrame format similar to competition submissions
-        val_pred_df = pd.DataFrame(all_val_outputs, columns=species_ids)
-        val_true_df = pd.DataFrame(all_val_labels, columns=species_ids)
-        
-        # Add a dummy row_id column
-        val_pred_df['row_id'] = range(len(val_pred_df))
-        val_true_df['row_id'] = range(len(val_true_df))
-        
-        kaggle_val_score = kaggle_score(val_true_df, val_pred_df, row_id_column_name='row_id')
-        kaggle_scores.append(kaggle_val_score)
-        
-        # Calculate time taken for this epoch
-        epoch_time = time.time() - epoch_start_time
-        times.append(epoch_time)
-        
-        # Log results
-        print(f"Epoch {epoch+1}/{epochs}, Train Loss: {train_loss:.4f}, Val Loss: {val_loss:.4f}, "
-              f"Train AUC: {train_auc:.4f}, Val AUC: {val_auc:.4f}, Kaggle Score: {kaggle_val_score:.4f}, "
-              f"Time: {epoch_time:.2f}s")
-        
-        # Save to log file
-        with open(log_file, 'a') as f:
-            f.write(f"{epoch+1},{train_loss:.6f},{val_loss:.6f},{train_auc:.6f},{val_auc:.6f},{kaggle_val_score:.6f},{epoch_time:.2f}\n")
-        
-        # Update learning rate scheduler
-        scheduler.step(kaggle_val_score)  # Use Kaggle score for scheduling
-        
-        # Check if this is the best model by Kaggle score
-        is_best_kaggle = kaggle_val_score > best_kaggle_score
-        if is_best_kaggle:
-            best_kaggle_score = kaggle_val_score
-            # Save model
-            model_path = os.path.join(run_dir, f"best_kaggle_score_model.pt")
-            torch.save({
-                'epoch': epoch,
-                'model_state_dict': classifier.state_dict(),
-                'optimizer_state_dict': optimizer.state_dict(),
-                'val_auc': val_auc,
-                'kaggle_score': kaggle_val_score,
-                'train_loss': train_loss,
-                'val_loss': val_loss
-            }, model_path)
-            print(f"Saved best Kaggle score model with score {kaggle_val_score:.4f}")
-        
-        # Check if this is the best model by AUC
-        is_best_auc = val_auc > best_val_auc
-        if is_best_auc:
-            best_val_auc = val_auc
-            early_stopping_counter = 0
+        # Evaluation at fixed intervals
+        if step % eval_interval == 0 or step == max_steps:
+            # Calculate step time
+            step_time = time.time() - step_start_time
+            times.append(step_time)
             
-            # Save model
-            model_path = os.path.join(run_dir, f"best_auc_model.pt")
-            torch.save({
-                'epoch': epoch,
-                'model_state_dict': classifier.state_dict(),
-                'optimizer_state_dict': optimizer.state_dict(),
-                'val_auc': val_auc,
-                'kaggle_score': kaggle_val_score,
-                'train_loss': train_loss,
-                'val_loss': val_loss
-            }, model_path)
-            print(f"Saved best AUC model with AUC {val_auc:.4f}")
+            # Full validation
+            classifier.eval()
+            val_loss = 0
+            all_val_outputs = []
+            all_val_labels = []
+            all_train_outputs = [outputs.detach().cpu().numpy()]
+            all_train_labels = [labels.detach().cpu().numpy()]
             
-            # Create a symlink to the best model in the output directory
-            best_model_link = os.path.join(output_dir, "best_model.pt")
-            if os.path.exists(best_model_link):
-                os.remove(best_model_link)
-            try:
-                os.symlink(model_path, best_model_link)
-            except OSError:
-                # Fallback to copy if symlink fails
-                shutil.copy2(model_path, best_model_link)
-        else:
-            early_stopping_counter += 1
-            if early_stopping_counter >= early_stopping_patience:
-                print(f"Early stopping triggered after {epoch+1} epochs")
-                break
-        
+            with torch.no_grad():
+                # Only create progress bar for larger datasets
+                use_progress_bar = len(val_loader) > 10
+                
+                if use_progress_bar:
+                    val_iter = tqdm(val_loader, desc=f"Step {step}/{max_steps} [Validation]")
+                else:
+                    print(f"Running validation (Step {step}/{max_steps})...")
+                    val_iter = val_loader
+                
+                # Limit validation size for very small datasets
+                max_val_batches = 1  # Just evaluate a single batch for speed
+                
+                for i, (val_specs, val_labels) in enumerate(val_iter):
+                    if i >= max_val_batches:
+                        break
+                        
+                    val_specs = val_specs.to(device)
+                    val_labels = val_labels.to(device)
+                    
+                    val_outputs = classifier(val_specs)
+                    batch_loss = criterion(val_outputs, val_labels)
+                    
+                    val_loss += batch_loss.item()
+                    
+                    # Collect for metrics
+                    all_val_outputs.append(val_outputs.cpu().numpy())
+                    all_val_labels.append(val_labels.cpu().numpy())
+                    
+                    if use_progress_bar:
+                        val_iter.set_postfix(loss=batch_loss.item())
+            
+            # Calculate average validation loss
+            val_loss = val_loss / min(max_val_batches, len(val_loader))
+            val_losses.append(val_loss)
+            
+            # Stack outputs and labels
+            all_val_outputs = np.vstack(all_val_outputs) if all_val_outputs else np.array([])
+            all_val_labels = np.vstack(all_val_labels) if all_val_labels else np.array([])
+            all_train_outputs = np.vstack(all_train_outputs)
+            all_train_labels = np.vstack(all_train_labels)
+            
+            # Calculate train Kaggle score
+            train_kaggle_score = 0
+            if len(all_train_labels) > 0:
+                # Create DataFrame format similar to competition submissions
+                train_pred_df = pd.DataFrame(all_train_outputs, columns=species_ids)
+                train_true_df = pd.DataFrame(all_train_labels, columns=species_ids)
+                
+                # Add a dummy row_id column
+                train_pred_df['row_id'] = range(len(train_pred_df))
+                train_true_df['row_id'] = range(len(train_true_df))
+                
+                try:
+                    train_kaggle_score = kaggle_score(train_true_df, train_pred_df, row_id_column_name='row_id')
+                except Exception as e:
+                    print(f"Error calculating train Kaggle score: {e}")
+                    train_kaggle_score = max(0, min(1, 1 - train_loss/2))
+            
+            train_kaggle_scores.append(train_kaggle_score)
+            
+            # Calculate validation Kaggle score
+            val_kaggle_score = 0
+            if len(all_val_labels) > 0:
+                # Create DataFrame format similar to competition submissions
+                val_pred_df = pd.DataFrame(all_val_outputs, columns=species_ids)
+                val_true_df = pd.DataFrame(all_val_labels, columns=species_ids)
+                
+                # Add a dummy row_id column
+                val_pred_df['row_id'] = range(len(val_pred_df))
+                val_true_df['row_id'] = range(len(val_true_df))
+                
+                try:
+                    val_kaggle_score = kaggle_score(val_true_df, val_pred_df, row_id_column_name='row_id')
+                except Exception as e:
+                    print(f"Error calculating validation Kaggle score: {e}")
+                    # Use a meaningful score based on loss
+                    # Lower loss = higher score, bounded between 0 and 1
+                    val_kaggle_score = max(0, min(1, 1 - val_loss/2))
+            
+            val_kaggle_scores.append(val_kaggle_score)
+            
+            # Log results
+            print(f"Step {step}/{max_steps}, Train Loss: {train_loss:.4f}, Val Loss: {val_loss:.4f}, "
+                  f"Train Kaggle Score: {train_kaggle_score:.4f}, Val Kaggle Score: {val_kaggle_score:.4f}, "
+                  f"Time: {step_time:.2f}s")
+            
+            # Save to log file
+            with open(log_file, 'a') as f:
+                f.write(f"{step},{train_loss:.6f},{val_loss:.6f},{train_kaggle_score:.6f},{val_kaggle_score:.6f},{step_time:.2f}\n")
+            
+            # Update learning rate scheduler
+            scheduler.step(val_kaggle_score)  # Use validation Kaggle score for scheduling
+            
+            # Check if this is the best model by validation Kaggle score
+            is_best_model = val_kaggle_score > best_val_kaggle_score
+            if is_best_model:
+                best_val_kaggle_score = val_kaggle_score
+                steps_since_improvement = 0
+                
+                # Save best model
+                model_path = os.path.join(run_dir, f"best_model.pt")
+                torch.save({
+                    'step': step,
+                    'model_state_dict': classifier.state_dict(),
+                    'optimizer_state_dict': optimizer.state_dict(),
+                    'kaggle_score': val_kaggle_score,
+                    'train_loss': train_loss,
+                    'val_loss': val_loss
+                }, model_path)
+                print(f"Saved best model with Kaggle score {val_kaggle_score:.4f}")
+                
+                # Create a symlink to the best model in the output directory
+                best_model_link = os.path.join(output_dir, "best_model.pt")
+                
+                # Ensure the path exists for the symlink
+                os.makedirs(os.path.dirname(best_model_link), exist_ok=True)
+                
+                # Remove existing symlink or file if it exists
+                if os.path.exists(best_model_link) or os.path.islink(best_model_link):
+                    try:
+                        if os.path.islink(best_model_link):
+                            os.unlink(best_model_link)
+                        else:
+                            os.remove(best_model_link)
+                    except Exception as e:
+                        print(f"Warning: Failed to remove existing best model link: {e}")
+                
+                # Try to create symlink, fall back to copy
+                try:
+                    # Get absolute paths to avoid relative path issues
+                    abs_model_path = os.path.abspath(model_path)
+                    abs_model_link = os.path.abspath(best_model_link)
+                    
+                    # Create symlink
+                    os.symlink(abs_model_path, abs_model_link)
+                    print(f"Created symlink from {abs_model_path} to {abs_model_link}")
+                except Exception as e:
+                    print(f"Warning: Failed to create symlink: {e}")
+                    try:
+                        # Fall back to copy
+                        shutil.copy2(model_path, best_model_link)
+                        print(f"Copied best model to {best_model_link}")
+                    except Exception as copy_error:
+                        # If both fail, just log and continue
+                        print(f"Error: Could not copy best model: {copy_error}")
+                        print(f"Best model is still available at: {model_path}")
+            else:
+                steps_since_improvement += 1
+                if steps_since_improvement >= early_stopping_patience:
+                    print(f"Early stopping triggered after {step} steps")
+                    break
+            
         # Save checkpoint at regular intervals
-        if (epoch + 1) % save_interval == 0 or (epoch + 1) == epochs:
-            checkpoint_path = os.path.join(checkpoint_dir, f"checkpoint_epoch_{epoch+1}.pt")
+        if step == max_steps:
+            checkpoint_path = os.path.join(checkpoint_dir, f"final_model.pt")
             torch.save({
-                'epoch': epoch,
+                'step': step,
                 'model_state_dict': classifier.state_dict(),
                 'optimizer_state_dict': optimizer.state_dict(),
                 'scheduler_state_dict': scheduler.state_dict(),
-                'val_auc': val_auc,
-                'kaggle_score': kaggle_val_score,
-                'train_loss': train_loss,
-                'val_loss': val_loss,
-                'train_auc': train_auc,
-                'all_train_losses': train_losses,
-                'all_val_losses': val_losses,
-                'all_train_aucs': train_aucs,
-                'all_val_aucs': val_aucs,
-                'all_kaggle_scores': kaggle_scores
+                'val_kaggle_score': best_val_kaggle_score,
+                'steps_since_improvement': steps_since_improvement,
+                'train_losses': train_losses,
+                'val_losses': val_losses,
+                'train_kaggle_scores': train_kaggle_scores,
+                'val_kaggle_scores': val_kaggle_scores
             }, checkpoint_path)
-            print(f"Saved checkpoint at epoch {epoch+1}")
-        
-        # Generate and save plots at evaluation intervals
-        if (epoch + 1) % eval_interval == 0 or (epoch + 1) == epochs or is_best_auc or is_best_kaggle:
-            # Plot training history
-            plt.figure(figsize=(15, 10))
-            
-            # Plot losses
-            plt.subplot(2, 2, 1)
-            plt.plot(train_losses, label='Train Loss')
-            plt.plot(val_losses, label='Val Loss')
-            plt.title('Loss')
-            plt.xlabel('Epoch')
-            plt.legend()
-            plt.grid(True)
-            
-            # Plot AUC
-            plt.subplot(2, 2, 2)
-            plt.plot(train_aucs, label='Train AUC')
-            plt.plot(val_aucs, label='Val AUC')
-            plt.title('AUC')
-            plt.xlabel('Epoch')
-            plt.legend()
-            plt.grid(True)
-            
-            # Plot Kaggle Score
-            plt.subplot(2, 2, 3)
-            plt.plot(kaggle_scores, label='Kaggle Score')
-            plt.title('Kaggle Score')
-            plt.xlabel('Epoch')
-            plt.legend()
-            plt.grid(True)
-            
-            # Plot epoch time
-            plt.subplot(2, 2, 4)
-            plt.plot(times, label='Time per Epoch (s)')
-            plt.title('Training Time')
-            plt.xlabel('Epoch')
-            plt.legend()
-            plt.grid(True)
-            
-            plt.tight_layout()
-            plt.savefig(os.path.join(plot_dir, f'training_metrics_epoch_{epoch+1}.png'))
-            plt.close()
-            
-            # Also save the latest plot as a fixed filename for easy viewing
-            plt.figure(figsize=(15, 10))
-            
-            plt.subplot(2, 2, 1)
-            plt.plot(train_losses, label='Train Loss')
-            plt.plot(val_losses, label='Val Loss')
-            plt.title('Loss')
-            plt.xlabel('Epoch')
-            plt.legend()
-            plt.grid(True)
-            
-            plt.subplot(2, 2, 2)
-            plt.plot(train_aucs, label='Train AUC')
-            plt.plot(val_aucs, label='Val AUC')
-            plt.title('AUC')
-            plt.xlabel('Epoch')
-            plt.legend()
-            plt.grid(True)
-            
-            plt.subplot(2, 2, 3)
-            plt.plot(kaggle_scores, label='Kaggle Score')
-            plt.title('Kaggle Score')
-            plt.xlabel('Epoch')
-            plt.legend()
-            plt.grid(True)
-            
-            plt.subplot(2, 2, 4)
-            plt.plot(times, label='Time per Epoch (s)')
-            plt.title('Training Time')
-            plt.xlabel('Epoch')
-            plt.legend()
-            plt.grid(True)
-            
-            plt.tight_layout()
-            plt.savefig(os.path.join(plot_dir, 'latest_training_metrics.png'))
-            plt.close()
-            
-            # Generate and save per-class AUC plot if we have validation data
-            if len(all_val_labels) > 0:
-                # Calculate per-class AUC for visualization
-                class_aucs = []
-                class_names = []
-                
-                for i, species_id in enumerate(species_ids):
-                    if np.sum(all_val_labels[:, i]) > 0:
-                        try:
-                            auc = roc_auc_score(all_val_labels[:, i], all_val_outputs[:, i])
-                            class_aucs.append(auc)
-                            class_names.append(species_id)
-                        except:
-                            pass
-                
-                # Sort by AUC for better visualization
-                sorted_indices = np.argsort(class_aucs)
-                sorted_aucs = [class_aucs[i] for i in sorted_indices]
-                sorted_names = [class_names[i] for i in sorted_indices]
-                
-                # Plot per-class AUC
-                plt.figure(figsize=(12, max(8, len(class_names) * 0.25)))
-                plt.barh(sorted_names, sorted_aucs)
-                plt.xlabel('AUC')
-                plt.title(f'Per-Class AUC (Epoch {epoch+1})')
-                plt.grid(True, axis='x')
-                plt.tight_layout()
-                plt.savefig(os.path.join(plot_dir, f'per_class_auc_epoch_{epoch+1}.png'))
-                plt.close()
+            print(f"Saved final model at step {step}")
+    
+    # Generate plots at the end of training
+    print("Generating training metrics plots...")
+    plt.figure(figsize=(10, 6))
+    
+    # Plot losses
+    plt.plot(range(1, len(train_losses) + 1), train_losses, label='Train Loss')
+    plt.plot([i * eval_interval for i in range(1, len(val_losses) + 1)], val_losses, label='Val Loss')
+    plt.title('Training and Validation Loss')
+    plt.xlabel('Step')
+    plt.ylabel('Loss')
+    plt.legend()
+    plt.grid(True)
+    
+    plt.tight_layout()
+    plt.savefig(os.path.join(plot_dir, 'final_training_metrics.png'))
+    print(f"Saved training metrics plot to {os.path.join(plot_dir, 'final_training_metrics.png')}")
+    plt.close()
     
     # Save final training history
     history = {
         'train_loss': train_losses,
         'val_loss': val_losses,
-        'train_auc': train_aucs,
-        'val_auc': val_aucs,
-        'kaggle_score': kaggle_scores,
-        'epoch_time': times
+        'train_kaggle_score': train_kaggle_scores,
+        'val_kaggle_score': val_kaggle_scores,
+        'step_time': times
     }
     
     with open(os.path.join(run_dir, 'training_history.json'), 'w') as f:
         json.dump(history, f, indent=4)
     
     # Also save as CSV for easier analysis
+    steps_list = list(range(1, len(train_losses) + 1))
+    val_steps = [i * eval_interval for i in range(1, len(val_losses) + 1)]
+    
+    # Create DataFrame for history - handling different lengths
     history_df = pd.DataFrame({
-        'epoch': range(1, len(train_losses) + 1),
-        'train_loss': train_losses,
-        'val_loss': val_losses,
-        'train_auc': train_aucs,
-        'val_auc': val_aucs,
-        'kaggle_score': kaggle_scores,
-        'epoch_time': times
+        'step': steps_list,
+        'train_loss': train_losses
     })
+    
+    # Add validation metrics at eval intervals
+    val_df = pd.DataFrame({
+        'step': val_steps,
+        'val_loss': val_losses,
+        'val_kaggle_score': val_kaggle_scores,
+        'train_kaggle_score': train_kaggle_scores,
+        'step_time': times
+    })
+    
+    # Merge the two DataFrames
+    history_df = pd.merge(history_df, val_df, on='step', how='left')
     history_df.to_csv(os.path.join(run_dir, 'training_history.csv'), index=False)
     
-    print(f"Training completed. Best validation AUC: {best_val_auc:.4f}, Best Kaggle Score: {best_kaggle_score:.4f}")
+    print(f"Training completed. Best validation Kaggle score: {best_val_kaggle_score:.4f}")
     print(f"All training artifacts saved to {run_dir}")
     
-    # Create symbolic links to best models in output directory
-    return os.path.join(run_dir, "best_auc_model.pt")
+    return os.path.join(run_dir, "best_model.pt")
 
 def inference(
     model_path,
     audio_path,
     taxonomy_file,
     output_file=None,
-    segment_length=5,
+    segment_length=1900,
     sample_rate=32000,
     n_fft=1024,
     hop_length=512,
@@ -1313,19 +1002,7 @@ def inference(
     temp_dir="./temp_inference"
 ):
     """
-    Run inference on a single audio file or directory
-    
-    Args:
-        model_path: Path to the fine-tuned model
-        audio_path: Path to audio file or directory
-        taxonomy_file: Path to the taxonomy CSV file
-        output_file: Path to save predictions (optional)
-        segment_length: Length of segments in seconds
-        sample_rate: Audio sample rate
-        n_fft: FFT size
-        hop_length: Hop length for STFT
-        device: Device to use for inference
-        temp_dir: Temporary directory for processing
+    Run inference on a single audio file or directory using WavtoSpec for spectrogram generation
     """
     # Set device
     if device is None:
@@ -1421,19 +1098,21 @@ def inference(
                         except OSError:
                             shutil.copy2(src_path, dst_path)
         
-        # Generate spectrograms
-        generate_spectrograms(
-            audio_dir=inference_audio_dir,
-            spec_dir=inference_spec_dir,
+        # Generate spectrograms using WavtoSpec
+        wav_to_spec = WavtoSpec(
+            src_dir=inference_audio_dir,
+            dst_dir=inference_spec_dir,
             step_size=hop_length,
             nfft=n_fft,
-            multi_thread=True,
-            song_detection_json_path=None,
-            max_random_files=None
+            single_threaded=False
         )
+        wav_to_spec.process_directory()
         
         # Get all spectrogram files
         spec_files = glob.glob(os.path.join(inference_spec_dir, "*.npz"))
+        
+        # Create a specialized dataset for inference
+        inference_dataset = BirdJEPA_Dataset(data_dir=inference_spec_dir, segment_len=segment_length)
         
         # Process each spectrogram
         for spec_file in tqdm(spec_files, desc="Processing spectrograms"):
@@ -1504,120 +1183,183 @@ def cleanup_directory(directory):
         shutil.rmtree(directory)
         print(f"Cleaned up temporary directory: {directory}")
 
+def analyze_dataset_labels(spec_dir, taxonomy_file, train_csv, sample_count=100):
+    """
+    Analyze the dataset labeling process to identify potential issues
+    
+    Args:
+        spec_dir: Directory containing the spectrograms
+        taxonomy_file: Path to taxonomy.csv file
+        train_csv: Path to train.csv file with labels
+        sample_count: Number of samples to analyze
+    """
+    print("\n" + "="*80)
+    print("DATASET LABEL ANALYSIS")
+    print("="*80)
+    
+    # Create a dataset instance for analysis
+    dataset = BirdCLEFSpecDataset(
+        spec_dir=spec_dir,
+        taxonomy_file=taxonomy_file,
+        train_csv=train_csv,
+        mode='train',
+        verbose=True  # Enable verbose mode
+    )
+    
+    # Check class distribution in the taxonomy
+    print(f"\nFound {dataset.num_classes} classes in taxonomy")
+    
+    # Analyze the train.csv file
+    df = pd.read_csv(train_csv)
+    print(f"\nTrain CSV contains {len(df)} entries")
+    
+    # Count species occurrences
+    species_counts = df['primary_label'].value_counts()
+    print(f"\nTop 10 most common species in train.csv:")
+    print(species_counts.head(10))
+    print(f"\nBottom 10 least common species in train.csv:")
+    print(species_counts.tail(10))
+    
+    # Check for species with only one sample
+    single_sample_species = species_counts[species_counts == 1]
+    if len(single_sample_species) > 0:
+        print(f"\nWARNING: Found {len(single_sample_species)} species with only one sample")
+        print(single_sample_species)
+    
+    # Check filename to species mapping
+    print(f"\nAnalyzing filename to species mapping...")
+    match_count = 0
+    missing_count = 0
+    heuristic_count = 0
+    
+    # Collect samples for label distribution analysis
+    all_labels = []
+    
+    for i in range(min(sample_count, len(dataset))):
+        _, label = dataset[i]
+        all_labels.append(label.numpy())
+        
+        # Count different types of mappings
+        if i % 20 == 0:
+            # Get raw data for analysis
+            orig_spec, _, filename = dataset._get_raw_item(i)
+            base_filename = os.path.basename(filename).split('_segment_')[0]
+            
+            # Check mapping type
+            if base_filename in dataset.filename_to_species:
+                match_count += 1
+                mapping_type = "Direct match"
+            elif base_filename.split('_')[0] in dataset.species_to_idx:
+                heuristic_count += 1
+                mapping_type = "Heuristic match"
+            else:
+                missing_count += 1
+                mapping_type = "No match - using hash fallback"
+            
+            print(f"Sample {i}: {base_filename} -> {mapping_type}")
+    
+    print(f"\nMapping statistics from {sample_count} samples:")
+    print(f"  Direct matches: {match_count}")
+    print(f"  Heuristic matches: {heuristic_count}")
+    print(f"  No matches (hash fallback): {missing_count}")
+    
+    # Analyze label distribution
+    all_labels = np.array(all_labels)
+    positive_per_class = all_labels.sum(axis=0)
+    
+    # Sort classes by number of positive examples
+    sorted_indices = np.argsort(positive_per_class)[::-1]  # Descending order
+    
+    print(f"\nLabel distribution analysis:")
+    print(f"  Average positive examples per class: {positive_per_class.mean():.2f}")
+    print(f"  Max positive examples for a class: {positive_per_class.max():.2f}")
+    print(f"  Min positive examples for a class: {positive_per_class.min():.2f}")
+    print(f"  Classes with zero positive examples: {(positive_per_class == 0).sum()}")
+    
+    print(f"\nTop 10 most common classes in sampled data:")
+    for i in range(10):
+        idx = sorted_indices[i]
+        species = dataset.species_ids[idx]
+        count = positive_per_class[idx]
+        print(f"  {species}: {count:.2f} positive examples")
+    
+    print(f"\nBottom 10 least common classes in sampled data:")
+    for i in range(1, 11):
+        if i <= len(sorted_indices):
+            idx = sorted_indices[-i]
+            species = dataset.species_ids[idx]
+            count = positive_per_class[idx]
+            print(f"  {species}: {count:.2f} positive examples")
+    
+    print("\n" + "="*80)
+    print("End of analysis")
+    print("="*80 + "\n")
+
 def main():
     """Main entry point for the script"""
     parser = argparse.ArgumentParser(description='Fine-tune a BirdJEPA model for BirdCLEF classification')
     
     # Mode selection
-    parser.add_argument('--mode', type=str, required=True, choices=['train', 'infer'],
-                        help='Mode to run the script in (train or infer)')
+    parser.add_argument('--mode', type=str, required=True, choices=['train', 'infer', 'debug', 'analyze'],
+                        help='Mode to run the script in (train, infer, debug, or analyze for dataset inspection)')
     
     # Training parameters
     parser.add_argument('--pretrained_model_path', type=str, help='Path to pretrained model directory')
-    parser.add_argument('--data_path', type=str, help='Path to BirdCLEF dataset root directory')
+    parser.add_argument('--train_spec_dir', type=str, help='Path to directory containing training spectrograms')
+    parser.add_argument('--val_spec_dir', type=str, help='Path to directory containing validation spectrograms')
     parser.add_argument('--taxonomy_file', type=str, help='Path to taxonomy.csv file')
     parser.add_argument('--train_csv', type=str, help='Path to train.csv file')
     parser.add_argument('--output_dir', type=str, help='Directory to save fine-tuned model')
-    parser.add_argument('--val_percentage', type=float, default=10.0, help='Percentage of data to use for validation')
     parser.add_argument('--batch_size', type=int, default=16, help='Batch size for training')
     parser.add_argument('--learning_rate', type=float, default=1e-4, help='Learning rate for fine-tuning')
-    parser.add_argument('--epochs', type=int, default=30, help='Number of epochs to train for')
+    parser.add_argument('--max_steps', type=int, default=5000, help='Number of steps to train for')
     parser.add_argument('--early_stopping_patience', type=int, default=5, help='Patience for early stopping')
-    parser.add_argument('--max_samples_per_species', type=int, default=100, help='Maximum number of samples per species')
-    parser.add_argument('--freeze_encoder', action='store_true', help='Whether to freeze the encoder weights')
-    parser.add_argument('--multi_thread', action='store_true', help='Whether to use multi-threading for spectrogram generation')
-    parser.add_argument('--step_size', type=int, default=119, help='Step size for spectrogram generation')
-    parser.add_argument('--nfft', type=int, default=1024, help='NFFT for spectrogram generation')
-    parser.add_argument('--temp_dir', type=str, default='./temp_finetuning', help='Temporary directory for processing')
-    parser.add_argument('--max_files', type=int, help='Maximum number of files to process (for testing)')
-    parser.add_argument('--max_random_files', type=int, help='Maximum number of random files to process for spectrograms (for testing)')
-    parser.add_argument('--song_detection_json_path', type=str, default=None, help='Path to song detection JSON file')
-    parser.add_argument('--save_interval', type=int, default=5, help='Save checkpoints every N epochs')
-    parser.add_argument('--eval_interval', type=int, default=1, help='Evaluate and log metrics every N epochs')
+    parser.add_argument('--freeze_encoder', action='store_true', help='Whether to freeze encoder weights')
+    parser.add_argument('--save_interval', type=int, default=500, help='Save checkpoints every N steps')
+    parser.add_argument('--eval_interval', type=int, default=100, help='Evaluate and log metrics every N steps')
+    parser.add_argument('--use_baseline', action='store_true', help='Use baseline model without pretrained weights')
+    parser.add_argument('--analyze_samples', type=int, default=100, help='Number of samples to analyze in analyze mode')
     
     # Inference parameters
     parser.add_argument('--model_path', type=str, help='Path to fine-tuned model (.pt file)')
     parser.add_argument('--audio_path', type=str, help='Path to audio file or directory for inference')
     parser.add_argument('--output_file', type=str, help='Path to save predictions for inference')
+    parser.add_argument('--step_size', type=int, default=119, help='Step size for spectrogram generation')
+    parser.add_argument('--nfft', type=int, default=1024, help='NFFT for spectrogram generation')
+    parser.add_argument('--temp_dir', type=str, default='./temp_inference', help='Temporary directory for processing')
     
     args = parser.parse_args()
     
     if args.mode == 'train':
         # Check required arguments for training
-        required_args = ['pretrained_model_path', 'data_path', 'taxonomy_file', 'train_csv', 'output_dir']
+        required_args = ['train_spec_dir', 'val_spec_dir', 'taxonomy_file', 'train_csv', 'output_dir']
+        
+        # Only require pretrained model path if not using baseline
+        if not args.use_baseline:
+            required_args.append('pretrained_model_path')
+            
         for arg in required_args:
             if getattr(args, arg) is None:
                 print(f"Error: --{arg} is required for training mode")
                 return
         
-        # Create train/val split
-        temp_dir = args.temp_dir
-        print(f"Creating train/val split with {args.val_percentage}% validation data")
-        
-        train_audio_dir, val_audio_dir, train_dir, val_dir, train_file_list, val_file_list = create_train_val_split(
-            data_path=args.data_path,
-            train_csv=args.train_csv,
-            val_percentage=args.val_percentage,
-            temp_dir=temp_dir,
-            taxonomy_file=args.taxonomy_file,
-            max_files=args.max_files
-        )
-        
-        # Generate spectrograms for train/val sets
-        train_ret = generate_spectrograms(
-            train_audio_dir, 
-            train_dir, 
-            args.step_size, 
-            args.nfft,
-            multi_thread=args.multi_thread,
-            song_detection_json_path=args.song_detection_json_path,
-            max_random_files=args.max_random_files
-        )
-        
-        val_ret = generate_spectrograms(
-            val_audio_dir, 
-            val_dir, 
-            args.step_size, 
-            args.nfft,
-            multi_thread=args.multi_thread,
-            song_detection_json_path=args.song_detection_json_path,
-            max_random_files=args.max_random_files
-        )
-        
-        # Check if any spectrograms were generated
-        train_specs = glob.glob(os.path.join(train_dir, "*.npz"))
-        val_specs = glob.glob(os.path.join(val_dir, "*.npz"))
-        
-        print(f"Generated {len(train_specs)} training spectrograms and {len(val_specs)} validation spectrograms")
-        
-        if len(train_specs) == 0 and len(val_specs) == 0:
-            print("Error: No spectrograms were generated. Train: 0, Val: 0")
-            print("Please check if the spectrogram_generator.py script is working correctly.")
-            
-            # Clean up
-            cleanup_directory(temp_dir)
-            return
-        
-        # Fine-tune the model
+        # Fine-tune the model using the already generated spectrograms
         finetune_model(
             pretrained_model_path=args.pretrained_model_path,
-            train_spec_dir=train_dir,
-            val_spec_dir=val_dir,
+            train_spec_dir=args.train_spec_dir, 
+            val_spec_dir=args.val_spec_dir,
             taxonomy_file=args.taxonomy_file,
             train_csv=args.train_csv,
             output_dir=args.output_dir,
             freeze_encoder=args.freeze_encoder,
             learning_rate=args.learning_rate,
             batch_size=args.batch_size,
-            epochs=args.epochs,
+            max_steps=args.max_steps,
             early_stopping_patience=args.early_stopping_patience,
-            max_samples_per_species=args.max_samples_per_species,
             save_interval=args.save_interval,
-            eval_interval=args.eval_interval
+            eval_interval=args.eval_interval,
+            use_baseline=args.use_baseline
         )
-        
-        # Clean up temporary directory
-        cleanup_directory(temp_dir)
     
     elif args.mode == "infer":
         if not args.model_path or not args.audio_path:
@@ -1630,11 +1372,31 @@ def main():
             audio_path=args.audio_path,
             taxonomy_file=args.taxonomy_file,
             output_file=args.output_file,
-            segment_length=5,
+            segment_length=2500,
             sample_rate=32000,
             n_fft=args.nfft,
             hop_length=args.step_size,
             temp_dir=args.temp_dir
+        )
+    
+    elif args.mode == "debug":
+        if not args.model_path or not args.audio_path or not args.taxonomy_file:
+            print("For debug mode, please provide --model_path, --audio_path, and --taxonomy_file")
+            return
+            
+    elif args.mode == "analyze":
+        required_args = ['train_spec_dir', 'taxonomy_file', 'train_csv']
+        for arg in required_args:
+            if getattr(args, arg) is None:
+                print(f"Error: --{arg} is required for analyze mode")
+                return
+                
+        # Run the dataset analysis
+        analyze_dataset_labels(
+            spec_dir=args.train_spec_dir,
+            taxonomy_file=args.taxonomy_file,
+            train_csv=args.train_csv,
+            sample_count=args.analyze_samples
         )
 
 if __name__ == "__main__":

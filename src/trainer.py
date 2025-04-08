@@ -1056,7 +1056,7 @@ if __name__ == '__main__':
     parser.add_argument('--decoder_lr',      type=float, default=1e-4)
     parser.add_argument('--freeze_encoder_steps', type=int, default=0)
     parser.add_argument('--freeze_decoder_steps', type=int, default=0)
-    parser.add_argument('--patience',        type=int, default=4)
+    parser.add_argument('--patience',        type=int, default=8)
     parser.add_argument('--ema_momentum',    type=float, default=0.9)
     parser.add_argument('--continue_training', action='store_true', help='Continue training from checkpoint')
     parser.add_argument('--zero_predictor_input', action='store_true',

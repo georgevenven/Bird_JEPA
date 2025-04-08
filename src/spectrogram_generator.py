@@ -320,16 +320,31 @@ class WavtoSpec:
                     segment_spec_file_path = os.path.join(
                         self.dst_dir, f"{spec_filename}_segment_{i}.npz"
                     )
+                    
+                    # Quantize spectrogram to uint8 to save space
+                    # First normalize to 0-255 range
+                    min_val = segment_Sxx_log.min()
+                    max_val = segment_Sxx_log.max()
+                    if max_val > min_val:  # Avoid division by zero
+                        segment_Sxx_log_uint8 = np.uint8(255 * (segment_Sxx_log - min_val) / (max_val - min_val))
+                    else:
+                        segment_Sxx_log_uint8 = np.zeros_like(segment_Sxx_log, dtype=np.uint8)
+                    
+                    # Save the quantized data without compression
                     np.savez(  # Use uncompressed version
                         segment_spec_file_path,
-                        s=segment_Sxx_log,
+                        s=segment_Sxx_log_uint8,
                         vocalization=segment_vocalization,
-                        labels=segment_labels
+                        labels=segment_labels,
+                        min_val=min_val,  # Store scaling info for reconstruction
+                        max_val=max_val
                     )
+                    
                     print(f"Segment {i} spectrogram, vocalization data, and labels saved to {segment_spec_file_path}")
                     
                     # Clear segment data after saving to reduce memory usage
                     del segment_Sxx_log
+                    del segment_Sxx_log_uint8
                     del segment_labels
                     del segment_vocalization
                     gc.collect()  # Force garbage collection

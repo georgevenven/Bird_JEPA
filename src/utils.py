@@ -81,7 +81,6 @@ def load_model(experiment_folder, return_checkpoint=False):
     print(f"\nLoaded checkpoint details:")
     print(f"Path: {latest_checkpoint}")
     print(f"Training step: {checkpoint['step']}")
-    print(f"Model state keys: {list(checkpoint['model_state_dict'].keys())}")
     if 'encoder_optimizer_state' in checkpoint:
         print(f"Encoder optimizer state included: Yes")
     if 'predictor_optimizer_state' in checkpoint:

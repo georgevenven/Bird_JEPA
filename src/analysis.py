@@ -178,7 +178,18 @@ def plot_umap_projection(model, device, data_dirs, category_colors_file="test_ll
                         # model expects: (B,1,T,F) -> inference_forward -> (B,T,H)
                         data_in = data.permute(0, 2, 1).unsqueeze(1)  # (B,1,T,F)
                         # Run inference
-                        _, layers = model.inference_forward(data_in.to(device))
+                        _, layers = model.inference_forward(x = data_in.to(device), layer_index=layer_index, dict_key=dict_key)
+                        
+                        # Add these diagnostic prints
+                        print(f"Total layers available: {len(layers)}")
+                        print(f"Attempting to access layer index: {layer_index}")
+                        print(f"Layers type: {type(layers)}")
+                        
+                        # More detailed debugging
+                        if isinstance(layers, dict):
+                            print(f"Dictionary keys in layers: {list(layers.keys())}")
+                            for k, v in layers.items():
+                                print(f"Key: {k}, Value type: {type(v)}, Value shape: {v.shape if hasattr(v, 'shape') else 'No shape'}")
                         
                         # Extract embeddings from the specified layer_index and dict_key
                         if layer_index is None:
@@ -186,10 +197,36 @@ def plot_umap_projection(model, device, data_dirs, category_colors_file="test_ll
                         if dict_key is None:
                             dict_key = "attention_output"
                         
-                        layer_output_dict = layers[layer_index]
-                        output = layer_output_dict.get(dict_key, None)
-                        if output is None:
-                            print(f"Invalid key: {dict_key}. Skipping this batch.")
+                        # Handle the new return format from the modified model
+                        if isinstance(layers, dict):
+                            # When layer_index and dict_key were provided, output comes directly in a dict
+                            print(f"Using direct dictionary output with key: {dict_key}")
+                            if dict_key in layers:
+                                output = layers[dict_key]
+                                if output is None:
+                                    print(f"Output is None. Skipping this batch.")
+                                    continue
+                            else:
+                                print(f"Invalid key: {dict_key}. Available keys: {list(layers.keys())}. Skipping this batch.")
+                                continue
+                        elif len(layers) > 0:
+                            # Traditional access to layer outputs when no specific layer was requested
+                            print(f"Processing as list of layer outputs, length: {len(layers)}")
+                            layer_output_dict = layers[layer_index]
+                            print(f"Layer output type: {type(layer_output_dict)}")
+                            if isinstance(layer_output_dict, dict):
+                                print(f"Available keys in layer output: {list(layer_output_dict.keys())}")
+                                if dict_key in layer_output_dict:
+                                    output = layer_output_dict[dict_key]
+                                else:
+                                    print(f"Invalid key: {dict_key}. Skipping this batch.")
+                                    continue
+                            else:
+                                # If layer_output_dict is not a dictionary, try to use it directly
+                                print(f"Layer output is not a dictionary, using directly. Shape: {layer_output_dict.shape if hasattr(layer_output_dict, 'shape') else 'No shape'}")
+                                output = layer_output_dict
+                        else:
+                            print(f"No layer outputs available. Skipping this batch.")
                             continue
 
                         # output: (B,T,H)
