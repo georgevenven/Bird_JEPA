@@ -88,6 +88,7 @@ class BirdJEPA_Dataset(Dataset):
 
 @timed_operation("collate_fn")
 def collate_fn(batch, segment_length=500, mask_p=0.75, verbose=False):
+
     # Simplified collate function without timing blocks
     specs, labels, filenames = zip(*batch)
     
@@ -122,80 +123,3 @@ def collate_fn(batch, segment_length=500, mask_p=0.75, verbose=False):
         print(f"Batch shapes - Input: {segs.shape}, Mask: {mask.shape}")
     
     return full_spectrogram, target_spectrogram, context_spectrogram, labels, mask, filenames
-
-class BirdCLEFDataset(Dataset):
-    def __init__(self, root_dir, transform=None, debug=False):
-        with Timer("clef_dataset_initialization", debug=debug):
-            self.root_dir = Path(root_dir)
-            self.transform = transform
-            self.debug = debug
-            self.files = []
-            for file_path in self.root_dir.rglob('*.mp3'):
-                self.files.append(file_path)
-            if self.debug:
-                print(f"[Dataset] Found {len(self.files)} files")
-    def __len__(self):
-        return len(self.files)
-    @timed_operation("clef_dataset_getitem")
-    def __getitem__(self, idx):
-        audio_path = self.files[idx]
-        with Timer("audio_loading", debug=self.debug):
-            waveform, sample_rate = torchaudio.load(audio_path)
-            if waveform.shape[0] > 1:
-                waveform = torch.mean(waveform, dim=0, keepdim=True)
-            if self.transform:
-                waveform = self.transform(waveform)
-            spectrogram = torchaudio.transforms.MelSpectrogram()(waveform)
-            spectrogram = torch.log(spectrogram + 1e-9)
-            spectrogram = (spectrogram - spectrogram.mean()) / (spectrogram.std() + 1e-9)
-            if self.debug and idx % 100 == 0:
-                print(f"[Dataset] Loaded item {idx}")
-            return spectrogram
-
-def worker_init_fn(worker_id):
-    worker_seed = torch.initial_seed() % 2**32 + worker_id
-    np.random.seed(worker_seed)
-    random.seed(worker_seed)
-
-class BirdCLEFDataModule:
-    def __init__(self, data_dir, batch_size=32, num_workers=4, debug=False):
-        with Timer("data_module_initialization", debug=debug):
-            self.data_dir = Path(data_dir)
-            self.batch_size = batch_size
-            self.num_workers = num_workers
-            self.debug = debug
-            self.train_dataset = BirdCLEFDataset(
-                self.data_dir / 'train',
-                debug=debug
-            )
-            self.val_dataset = BirdCLEFDataset(
-                self.data_dir / 'val',
-                debug=debug
-            )
-            if self.debug:
-                print(f"[DataModule] Train samples: {len(self.train_dataset)}")
-                print(f"[DataModule] Val samples: {len(self.val_dataset)}")
-    @timed_operation("data_module_setup")
-    def setup(self):
-        self.train_loader = torch.utils.data.DataLoader(
-            self.train_dataset,
-            batch_size=self.batch_size,
-            shuffle=True,
-            num_workers=self.num_workers,
-            pin_memory=True,
-            worker_init_fn=worker_init_fn
-        )
-        self.val_loader = torch.utils.data.DataLoader(
-            self.val_dataset,
-            batch_size=self.batch_size,
-            shuffle=False,
-            num_workers=self.num_workers,
-            pin_memory=True
-        )
-        if self.debug:
-            print(f"[DataModule] Train batches: {len(self.train_loader)}")
-            print(f"[DataModule] Val batches: {len(self.val_loader)}")
-    def get_train_loader(self):
-        return self.train_loader
-    def get_val_loader(self):
-        return self.val_loader

@@ -1,0 +1,23 @@
+# Core Python Libraries
+numpy>=1.20.0
+matplotlib>=3.5.0
+tqdm>=4.62.0
+# json5>=0.9.6 - using standard json module instead which is built-in
+
+# Deep Learning Frameworks
+torch>=1.10.0
+torchaudio>=0.10.0
+
+# Audio Processing
+librosa>=0.9.0
+soundfile>=0.10.3
+scipy>=1.7.0
+
+# File Handling & Data Processing
+requests>=2.27.0
+
+# System Monitoring & Performance
+psutil>=5.9.0
+
+# Testing
+# unittest2>=2.0.0 - using built-in unittest module 

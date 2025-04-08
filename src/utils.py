@@ -16,14 +16,15 @@ def load_weights(dir, model):
     model.load_state_dict(checkpoint['model_state_dict'])
     return model
 
-def load_model(experiment_folder, return_checkpoint=False):
+def load_model(experiment_folder, return_checkpoint=False, load_weights=True, random_weights=False):
     """
-    load a trained BirdJEPA model from an experiment folder.
+    Load a trained BirdJEPA model from an experiment folder or initialize with random weights.
     
     args:
         experiment_folder (str): path to the experiment folder containing saved weights
         return_checkpoint (bool): if true, returns full checkpoint dict for continued training
-        
+        load_weights (bool): if true, loads weights from the checkpoint file
+        random_weights (bool): if true, initializes model with random weights instead of loading
     returns:
         model: loaded BirdJEPA model with weights
         checkpoint (optional): full checkpoint dict if return_checkpoint=true
@@ -63,31 +64,35 @@ def load_model(experiment_folder, return_checkpoint=False):
         blocks_config=blocks_config  # Pass the parsed blocks_config
     )
     
-    weights_dir = os.path.join(experiment_folder, 'saved_weights')
-    checkpoints = glob.glob(os.path.join(weights_dir, 'checkpoint_*.pt'))
-    if not checkpoints:
-        print(f"Available files in {experiment_folder}:")
-        print("\n".join(os.listdir(experiment_folder)))
-        print(f"\nAvailable files in weights dir {weights_dir} (if exists):")
-        if os.path.exists(weights_dir):
-            print("\n".join(os.listdir(weights_dir)))
-        raise ValueError(f"No checkpoints found in {weights_dir}")
+    if not random_weights:
+        weights_dir = os.path.join(experiment_folder, 'saved_weights')
+        checkpoints = glob.glob(os.path.join(weights_dir, 'checkpoint_*.pt'))
+        if not checkpoints:
+            print(f"Available files in {experiment_folder}:")
+            print("\n".join(os.listdir(experiment_folder)))
+            print(f"\nAvailable files in weights dir {weights_dir} (if exists):")
+            if os.path.exists(weights_dir):
+                print("\n".join(os.listdir(weights_dir)))
+            raise ValueError(f"No checkpoints found in {weights_dir}")
+        
+        latest_checkpoint = max(checkpoints, key=lambda x: int(x.split('_')[-1].split('.')[0]))
+        
+        checkpoint = torch.load(latest_checkpoint)
+        model.load_state_dict(checkpoint['model_state_dict'])
+        
+        print(f"\nLoaded checkpoint details:")
+        print(f"Path: {latest_checkpoint}")
+        print(f"Training step: {checkpoint['step']}")
+        if 'encoder_optimizer_state' in checkpoint:
+            print(f"Encoder optimizer state included: Yes")
+        if 'predictor_optimizer_state' in checkpoint:
+            print(f"Predictor optimizer state included: Yes")
+        if 'decoder_optimizer_state' in checkpoint:
+            print(f"Decoder optimizer state included: Yes")
+        
+        if return_checkpoint:
+            return model, checkpoint, config
+    else:
+        print("Initialized model with random weights.")
     
-    latest_checkpoint = max(checkpoints, key=lambda x: int(x.split('_')[-1].split('.')[0]))
-    
-    checkpoint = torch.load(latest_checkpoint)
-    model.load_state_dict(checkpoint['model_state_dict'])
-    
-    print(f"\nLoaded checkpoint details:")
-    print(f"Path: {latest_checkpoint}")
-    print(f"Training step: {checkpoint['step']}")
-    if 'encoder_optimizer_state' in checkpoint:
-        print(f"Encoder optimizer state included: Yes")
-    if 'predictor_optimizer_state' in checkpoint:
-        print(f"Predictor optimizer state included: Yes")
-    if 'decoder_optimizer_state' in checkpoint:
-        print(f"Decoder optimizer state included: Yes")
-    
-    if return_checkpoint:
-        return model, checkpoint, config
     return model

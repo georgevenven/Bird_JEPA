@@ -32,6 +32,7 @@ def split_files(input_dir, test_percentage):
     """
     # Collect all files in the input directory, including nested files
     all_files = collect_all_files(input_dir)
+    print(f"Found {len(all_files)} files in {input_dir}")
 
     # Calculate the number of files to be used for testing
     total_files = len(all_files)

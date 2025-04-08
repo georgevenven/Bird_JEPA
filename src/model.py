@@ -624,52 +624,54 @@ class BirdJEPA(nn.Module):
         if dict_key is None:
             dict_key = "attention_output"
             
-        print(f"[MODEL] Starting inference_forward with layer_index={layer_index}, dict_key={dict_key}")
+        # print(f"[MODEL] Starting inference_forward with layer_index={layer_index}, dict_key={dict_key}")
             
         # encode
         context_repr, intermediate_outputs = self.context_encoder(x.unsqueeze(1), layer_index=layer_index, dict_key=dict_key)
         
-        print(f"[MODEL] Encoder returned: context_repr type={type(context_repr)}, intermediate_outputs={type(intermediate_outputs)} with {len(intermediate_outputs)} items")
+        # print(f"[MODEL] Encoder returned: context_repr type={type(context_repr)}, intermediate_outputs={type(intermediate_outputs)} with {len(intermediate_outputs)} items")
         
         # Check if we got a dict from the encoder (specific layer request)
         if isinstance(context_repr, dict):
-            print(f"[MODEL] context_repr is a dict with keys: {list(context_repr.keys())}")
+            # print(f"[MODEL] context_repr is a dict with keys: {list(context_repr.keys())}")
             if dict_key in context_repr:
-                print(f"[MODEL] Found dict_key in context_repr, returning directly")
+                # print(f"[MODEL] Found dict_key in context_repr, returning directly")
                 # Ensure the value is a tensor
                 if not isinstance(context_repr[dict_key], torch.Tensor):
-                    print(f"[MODEL] Warning: value is not a tensor but {type(context_repr[dict_key])}")
+                    # print(f"[MODEL] Warning: value is not a tensor but {type(context_repr[dict_key])}")
+                    pass
                 return None, context_repr
             else:
                 # If the key doesn't exist but we have content, add it with the proper key
                 if len(context_repr) > 0:
                     first_key = list(context_repr.keys())[0]
-                    print(f"[MODEL] dict_key not found, using first key: {first_key}")
+                    # print(f"[MODEL] dict_key not found, using first key: {first_key}")
                     output_dict = {dict_key: context_repr[first_key]}
                     return None, output_dict
                 else:
-                    print(f"[MODEL] Empty context_repr dict, returning empty dict")
+                    # print(f"[MODEL] Empty context_repr dict, returning empty dict")
                     return None, {dict_key: None}
         
         # For normal operation or when we have a list of layer outputs
         if len(intermediate_outputs) > 0:
-            print(f"[MODEL] Processing {len(intermediate_outputs)} intermediate outputs")
+            # print(f"[MODEL] Processing {len(intermediate_outputs)} intermediate outputs")
             # Make sure we have output with the correct key
             formatted_outputs = []
             for i, layer_output in enumerate(intermediate_outputs):
                 if isinstance(layer_output, dict) and dict_key in layer_output:
-                    print(f"[MODEL] Layer {i} has dict with correct key")
+                    # print(f"[MODEL] Layer {i} has dict with correct key")
                     formatted_outputs.append(layer_output)
                 else:
                     # If it's not a dict or doesn't have the right key, wrap it
-                    print(f"[MODEL] Layer {i} needs reformatting, type={type(layer_output)}")
+                    # print(f"[MODEL] Layer {i} needs reformatting, type={type(layer_output)}")
                     if isinstance(layer_output, torch.Tensor):
-                        print(f"[MODEL] Layer {i} is tensor with shape {layer_output.shape}")
+                        # print(f"[MODEL] Layer {i} is tensor with shape {layer_output.shape}")
+                        pass
                     formatted_outputs.append({dict_key: layer_output})
             return context_repr, formatted_outputs
         else:
             # No outputs available
-            print(f"[MODEL] No intermediate outputs, returning empty list with dict")
+            # print(f"[MODEL] No intermediate outputs, returning empty list with dict")
             empty_dict = {dict_key: None}
             return context_repr, [empty_dict]
 
