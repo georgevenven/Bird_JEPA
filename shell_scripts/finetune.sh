@@ -10,8 +10,8 @@ PROJECT_ROOT=$(pwd)
 
 # Create experiment directory
 EXPERIMENT_NAME="experiments/BirdJEPA_Run_10k_Finetune"
-PRETRAINED_MODEL_PATH="experiments/BirdJEPA_Test"
-DATA_PATH="/Users/georgev/Documents/data/birdclef-2025"
+PRETRAINED_MODEL_PATH="experiments/BirdJEPA_Run_10k"
+DATA_PATH="BirdCLEF"
 
 mkdir -p "$EXPERIMENT_NAME"
 echo "Created experiment directory: $EXPERIMENT_NAME"
@@ -36,7 +36,7 @@ TRAIN_FILE_LIST="$TEMP_DIR/train_files.txt"
 TEST_FILE_LIST="$TEMP_DIR/test_files.txt"
 # Define the experiment directory at the beginning
 
-EXPERIMENT_DIR="experiments/$EXPERIMENT_NAME"
+EXPERIMENT_DIR="$EXPERIMENT_NAME"
 mkdir -p "$EXPERIMENT_DIR"
 echo "Created experiment directory: $EXPERIMENT_DIR"
 
@@ -152,10 +152,10 @@ python3 "${PROJECT_ROOT}/src/finetuning.py" \
     --train_csv "$TRAIN_CSV" \
     --val_csv "$TRAIN_CSV" \
     --output_dir "$EXPERIMENT_DIR" \
-    --batch_size 4 \
-    --learning_rate 1e-3 \
-    --max_steps 100 \
+    --batch_size 12 \
+    --learning_rate 3e-4 \
+    --max_steps 50000 \
     --early_stopping_patience 10 \
-    --save_interval 100 \
-    --eval_interval 10 \
+    --save_interval 1000 \
+    --eval_interval 100 \
     --pretrained_model_path "$PRETRAINED_MODEL_PATH"

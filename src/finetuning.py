@@ -172,47 +172,58 @@ class BirdCLEFDataWrapper:
             return self.next_batch()
 
 class Classifier(nn.Module):
-    def __init__(self, context_length, num_classes, hidden_dim=64):
+    def __init__(self, context_length, num_classes, hidden_dim=64, pool_type='mean'):
         super(Classifier, self).__init__()
+        self.pool_type = pool_type  # 'mean' or 'max'
+        
+        # MLP after pooling (much smaller now)
         self.mlp = nn.Sequential(
-            nn.Linear(context_length * hidden_dim, 256),
+            nn.Linear(hidden_dim, 128),
             nn.ReLU(),
             nn.Dropout(0.3),
-            nn.Linear(256, 128),
-            nn.ReLU(),
-            nn.Dropout(0.2),
             nn.Linear(128, num_classes),
             nn.Sigmoid() if num_classes == 1 else nn.LogSoftmax(dim=1)
         )    
 
     def forward(self, x):
-        return self.mlp(x)
+        # x shape: [batch_size, context_length, hidden_dim]
+        
+        # Apply global pooling across temporal dimension
+        if self.pool_type == 'mean':
+            # Mean pooling over the temporal dimension
+            pooled = torch.mean(x, dim=1)  # [batch_size, hidden_dim]
+        elif self.pool_type == 'max':
+            # Max pooling over the temporal dimension
+            pooled, _ = torch.max(x, dim=1)  # [batch_size, hidden_dim]
+        
+        # Pass through MLP
+        return self.mlp(pooled)
 
 class Model(nn.Module):
-    def __init__(self, model_path=None, context_length=500, num_classes=1):
+    def __init__(self, model_path=None, context_length=500, num_classes=1, pool_type='mean'):
         super(Model, self).__init__()
         self.model_path = model_path
         self.context_length = context_length
         self.num_classes = num_classes
         self.encoder = None
-        self.classifier = Classifier(context_length, num_classes, hidden_dim=64)
+        self.classifier = Classifier(context_length, num_classes, hidden_dim=64, pool_type=pool_type)
         
         # Load pretrained model if path is provided
         if model_path:
-            self.encoder = load_model(model_path, load_weights=False)
+            self.encoder = load_model(model_path, load_weights=True)
         
-        print(f"Model initialized with context_length={context_length}, num_classes={num_classes}")
+        print(f"Model initialized with context_length={context_length}, num_classes={num_classes}, pooling={pool_type}")
     
     def forward(self, x):
         # Get embeddings from encoder
         x = x.unsqueeze(1)
         x = x.transpose(2, 3)
 
-        with torch.no_grad():  # Assuming we're freezing the encoder
-            embedding_repr = self.encoder.inference_forward(x)
+        embedding_repr = self.encoder.inference_forward(x)
 
-        embedding_repr = embedding_repr[0]
-        outputs = self.classifier(embedding_repr.flatten(1,2))
+        embedding_repr = embedding_repr[0]  # [batch_size, context_length, hidden_dim]
+        # No need to flatten, pass directly to classifier
+        outputs = self.classifier(embedding_repr)
         return outputs
 
 class Trainer:
@@ -239,7 +250,8 @@ class Trainer:
         self.model = Model(
             args.pretrained_model_path, 
             args.context_length,
-            num_classes=self.train_wrapper.num_classes
+            num_classes=self.train_wrapper.num_classes,
+            pool_type=args.pool_type
         )
         
         # Set up optimizer and loss function
@@ -577,7 +589,7 @@ class Inference:
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--mode", type=str, required=True, choices=["train", "infer", "debug", "analyze"])
-    parser.add_argument("--context_length", type=int, default=500)
+    parser.add_argument("--context_length", type=int, default=1500)
     
     # Training arguments
     parser.add_argument("--train_spec_dir", type=str, help="Directory containing training spectrograms")
@@ -598,6 +610,8 @@ def main():
     parser.add_argument("--ema_alpha", type=float, default=0.2, help="EMA smoothing factor (0-1)")
     parser.add_argument("--save_best_metric", type=str, default="loss", choices=["loss", "roc_auc"], 
                        help="Metric to use for saving best model (loss or roc_auc)")
+    parser.add_argument("--pool_type", type=str, default="mean", choices=["mean", "max"],
+                       help="Type of pooling to use in the classifier")
 
     args = parser.parse_args()
 
