@@ -172,7 +172,7 @@ class BirdCLEFDataWrapper:
             return self.next_batch()
 
 class Classifier(nn.Module):
-    def __init__(self, context_length, num_classes, hidden_dim=64, pool_type='mean'):
+    def __init__(self, context_length, num_classes, hidden_dim=128, pool_type='mean'):
         super(Classifier, self).__init__()
         self.pool_type = pool_type  # 'mean' or 'max'
         
@@ -206,7 +206,7 @@ class Model(nn.Module):
         self.context_length = context_length
         self.num_classes = num_classes
         self.encoder = None
-        self.classifier = Classifier(context_length, num_classes, hidden_dim=64, pool_type=pool_type)
+        self.classifier = Classifier(context_length, num_classes, hidden_dim=128, pool_type=pool_type)
         
         # Load pretrained model if path is provided
         if model_path:
@@ -359,8 +359,9 @@ class Trainer:
                     self.val_losses_ema.append(self.calculate_ema(val_loss, self.val_losses_ema[-1]))
                     self.val_roc_auc_scores_ema.append(self.calculate_ema(roc_auc_score, self.val_roc_auc_scores_ema[-1]))
                 
-                print(f"Step {step+1}/{self.args.max_steps}, Training Loss: {avg_train_loss:.4f}, "
-                      f"Validation Loss: {val_loss:.4f}, ROC-AUC: {roc_auc_score:.4f}")
+                print(f"Step {step+1}/{self.args.max_steps}, Training Loss: {avg_train_loss:.4f} (EMA: {self.train_losses_ema[-1]:.4f}), "
+                      f"Validation Loss: {val_loss:.4f} (EMA: {self.val_losses_ema[-1]:.4f}), "
+                      f"ROC-AUC: {roc_auc_score:.4f} (EMA: {self.val_roc_auc_scores_ema[-1]:.4f})")
                 
                 # Save model if it has the best validation score
                 if self.args.save_best_metric == 'loss' and val_loss < best_val_loss and self.run_dir:
@@ -580,9 +581,99 @@ class Trainer:
         model.train()  # Set model back to training mode
         return avg_loss, roc_auc
 
-class Analysis:
-    pass
+def load_model_from_checkpoint(checkpoint_path, pretrained_model_path, context_length, num_classes, pool_type='mean', device=None):
+    """
+    Load a trained model from a checkpoint
+    
+    Args:
+        checkpoint_path (str): Path to the checkpoint file
+        pretrained_model_path (str): Path to the pretrained encoder
+        context_length (int): Context length for the model
+        num_classes (int): Number of classes for classification
+        pool_type (str): Type of pooling to use (mean or max)
+        device (torch.device): Device to load the model to
+        
+    Returns:
+        tuple: (model, checkpoint_info) where checkpoint_info is a dict with metadata
+               or (None, None) if loading failed
+    """
+    if device is None:
+        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        
+    if not checkpoint_path or not os.path.exists(checkpoint_path):
+        print(f"Error: Checkpoint file not found at {checkpoint_path}")
+        return None, None
+    
+    try:
+        print(f"Loading checkpoint from {checkpoint_path}")
+        
+        # Create model instance
+        model = Model(
+            model_path=pretrained_model_path,
+            context_length=context_length,
+            num_classes=num_classes,
+            pool_type=pool_type
+        )
+        
+        # Load checkpoint weights
+        checkpoint = torch.load(checkpoint_path, map_location=device)
+        model.load_state_dict(checkpoint['model_state_dict'])
+        
+        # Move model to device and set to eval mode
+        model.to(device)
+        model.eval()
+        
+        print(f"Model loaded successfully (from step {checkpoint.get('step', 'unknown')})")
+        
+        # Return model and checkpoint info
+        return model, checkpoint
+        
+    except Exception as e:
+        print(f"Error loading model: {e}")
+        return None, None
 
+class Analysis:
+    def __init__(self, args):
+        """
+        Initialize the Analysis class
+        
+        Args:
+            args: An argparse namespace containing:
+                - checkpoint_path: Path to the saved model checkpoint
+                - pretrained_model_path: Path to the pretrained encoder
+                - context_length: Context length for the model
+                - num_classes: Number of classes for classification
+                - pool_type: Type of pooling to use (mean or max)
+        """
+        self.args = args
+        self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        self.model = None
+        self.checkpoint_info = None
+        self.num_classes = args.num_classes if hasattr(args, 'num_classes') else 0
+        
+        print(f"Analysis initialized, will use device: {self.device}")
+    
+    def load_model(self):
+        """
+        Load a trained model from a checkpoint
+        """
+        if not hasattr(self.args, 'checkpoint_path') or not self.args.checkpoint_path:
+            print("Error: No checkpoint path provided")
+            return False
+            
+        # Use the global function to load the model
+        self.model, self.checkpoint_info = load_model_from_checkpoint(
+            checkpoint_path=self.args.checkpoint_path,
+            pretrained_model_path=self.args.pretrained_model_path,
+            context_length=self.args.context_length,
+            num_classes=self.args.num_classes,
+            pool_type=self.args.pool_type,
+            device=self.device
+        )
+        
+        return self.model is not None
+
+#load model ... 
 class Inference:
     pass
 
@@ -612,12 +703,28 @@ def main():
                        help="Metric to use for saving best model (loss or roc_auc)")
     parser.add_argument("--pool_type", type=str, default="mean", choices=["mean", "max"],
                        help="Type of pooling to use in the classifier")
+    
+    # Analysis arguments
+    parser.add_argument("--checkpoint_path", type=str, help="Path to model checkpoint for analysis/inference")
+    parser.add_argument("--num_classes", type=int, help="Number of classes (needed when loading checkpoint)")
+    parser.add_argument("--analysis_data_dir", type=str, help="Directory containing data for analysis")
 
     args = parser.parse_args()
 
     if args.mode == "train":
         trainer = Trainer(args)
         trainer.train()
+    elif args.mode == "analyze":
+        # Initialize analysis module
+        analyzer = Analysis(args)
+        
+        # Load model
+        if not analyzer.load_model():
+            print("Failed to load model for analysis. Exiting.")
+            return
+            
+        print("Model loaded successfully for analysis.")
+        # Additional analysis code will be added here
 
 if __name__ == "__main__":
     main()

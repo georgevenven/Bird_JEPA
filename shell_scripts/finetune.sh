@@ -10,7 +10,7 @@ PROJECT_ROOT=$(pwd)
 
 # Create experiment directory
 EXPERIMENT_NAME="experiments/BirdJEPA_Run_10k_Finetune"
-PRETRAINED_MODEL_PATH="experiments/BirdJEPA_Run_10k"
+PRETRAINED_MODEL_PATH="experiments/BirdJEPA_Untrained_Large_Test"
 DATA_PATH="BirdCLEF"
 
 mkdir -p "$EXPERIMENT_NAME"
@@ -23,7 +23,7 @@ TRAIN_CSV="${INPUT_DIR}/train.csv"
 TAXONOMY_FILE="${INPUT_DIR}/taxonomy.csv"
 
 # Spectrogram parameters
-STEP_SIZE=119
+STEP_SIZE=160
 NFFT=1024
 NUM_FILES=200  # Reduced file count for quick testing
 MULTI_THREAD=true
@@ -154,8 +154,8 @@ python3 "${PROJECT_ROOT}/src/finetuning.py" \
     --output_dir "$EXPERIMENT_DIR" \
     --batch_size 12 \
     --learning_rate 3e-4 \
-    --max_steps 50000 \
-    --early_stopping_patience 10 \
+    --max_steps 100000 \
+    --early_stopping_patience 1000 \
     --save_interval 1000 \
     --eval_interval 100 \
     --pretrained_model_path "$PRETRAINED_MODEL_PATH"

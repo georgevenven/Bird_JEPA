@@ -6,21 +6,21 @@ set -euo pipefail
 cd ..
 
 # required parameters
-INPUT_DIR="/home/george-vengrovski/Documents/projects/Bird_JEPA/xeno_subset"
-SONG_DETECTION_JSON_PATH=None
+INPUT_DIR="/media/george-vengrovski/disk2/canary/yarden_data/llb3_data"
+SONG_DETECTION_JSON_PATH="/media/george-vengrovski/Desk SSD/TweetyBERT/contains_llb.json"
 TEST_PERCENTAGE=20
-EXPERIMENT_NAME="BirdJEPA_Run_10k"
+EXPERIMENT_NAME="BirdJEPA_LLB3_Large_Test"
 
 # change default parameters (if needed)
-BATCH_SIZE=32                    # training batch size
-LEARNING_RATE=3e-4                # learning rate for training
+BATCH_SIZE=24                    # training batch size
+LEARNING_RATE=1e-4                # learning rate for training
 MULTI_THREAD=true                 # set to false for single-thread spectrogram generation
-STEP_SIZE=119                     # step size for spectrogram generation
+STEP_SIZE=160                     # step size for spectrogram generation
 NFFT=1024                         # number of fft points for spectrogram
-MAX_STEPS=10000               # maximum training steps
-EVAL_INTERVAL=500                   # evaluation interval
+MAX_STEPS=3000                         # maximum training steps
+EVAL_INTERVAL=250                   # evaluation interval
 INPUT_DIM=513                     # input dimension (frequency bins)
-HIDDEN_DIM=64                    # hidden dimension
+HIDDEN_DIM=128                    # hidden dimension
 MAX_SEQ_LEN=1000                   # maximum sequence length
 MASK_RATIO=0.3                    # mask ratio for training
 DEBUG=true                       # debug mode flag (lowercase)
@@ -34,7 +34,7 @@ fi
 # Format: "type:param,type:param,..." where type is "local" or "global"
 # For local blocks, param is window size
 # For global blocks, param is stride
-ARCHITECTURE="local:8,global:100,local:16,global:50,local:32,global:100"
+ARCHITECTURE="local:8,global:100,local:16,global:50,local:32,global:100,local:64,global:200,local:128,global:400"
 
 # Import statement for block classes (add to trainer.py)
 python_import="from model import LocalAttentionBlock, GlobalAttentionBlock"

@@ -1,6 +1,6 @@
 #!/bin/bash
 
-EXPERIMENT_FOLDER="experiments/BirdJEPA_Run_10k"
+EXPERIMENT_FOLDER="experiments/BirdJEPA_LLB3_Large_Test"
 DATA_DIRS=("/media/george-vengrovski/Desk SSD/TweetyBERT/linear_probe_dataset/llb3_test") # replace with actual dirs
 SAVE_NAME="BirdJEPA_Run_10k"
 
@@ -11,7 +11,7 @@ python3 src/analysis.py \
     --experiment_folder "$EXPERIMENT_FOLDER" \
     --data_dirs "${DATA_DIRS[@]}" \
     --save_name "$SAVE_NAME" \
-    --samples 100000 \
+    --samples 10000 \
     --layer_index -1 \
     --dict_key "attention_output" \
     --context 1000 \

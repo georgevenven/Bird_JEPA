@@ -971,11 +971,42 @@ class ModelTrainer:
             context_spec_np = context_spectrogram[0].cpu().numpy()
             target_spec_np = target_spectrogram[0].cpu().numpy()
             mask_np = mask[0].cpu().numpy()
-            context_inter_np = [layer[0].cpu().numpy().T for layer in context_intermediate]
-            target_inter_np = [layer[0].cpu().numpy().T for layer in target_intermediate]
+            
+            # Fix for handling different structure types in context_intermediate
+            context_inter_np = []
+            for layer in context_intermediate:
+                # Check if layer is a dictionary, tensor, or other structure
+                if isinstance(layer, dict):
+                    # If it's a dictionary, use the first key
+                    first_key = next(iter(layer))
+                    layer_data = layer[first_key]
+                    context_inter_np.append(layer_data[0].cpu().numpy().T)
+                elif isinstance(layer, (list, tuple)) and len(layer) > 0:
+                    # If it's a list or tuple, use the first element
+                    context_inter_np.append(layer[0].cpu().numpy().T)
+                elif hasattr(layer, 'cpu'):
+                    # If it's a tensor, use it directly
+                    context_inter_np.append(layer[0].cpu().numpy().T)
+                else:
+                    # Skip this layer if we can't process it
+                    print(f"Warning: Skipping layer with unexpected type: {type(layer)}")
+            
+            # Apply the same logic to target_intermediate
+            target_inter_np = []
+            for layer in target_intermediate:
+                if isinstance(layer, dict):
+                    first_key = next(iter(layer))
+                    layer_data = layer[first_key]
+                    target_inter_np.append(layer_data[0].cpu().numpy().T)
+                elif isinstance(layer, (list, tuple)) and len(layer) > 0:
+                    target_inter_np.append(layer[0].cpu().numpy().T)
+                elif hasattr(layer, 'cpu'):
+                    target_inter_np.append(layer[0].cpu().numpy().T)
+                else:
+                    print(f"Warning: Skipping layer with unexpected type: {type(layer)}")
 
         with Timer("stacked_layers_figure_creation", debug=self.debug):
-            num_layers = len(context_intermediate)
+            num_layers = len(context_inter_np)
             fig, axs = plt.subplots(num_layers + 1, 2, figsize=(16, 3 * (num_layers + 1)))
 
         with Timer("stacked_layers_plotting", debug=self.debug):
