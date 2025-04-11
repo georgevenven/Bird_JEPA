@@ -11,3 +11,5 @@
 /BirdCLEF
 /archive 
 /temp_safe
+/zips
+*.csv

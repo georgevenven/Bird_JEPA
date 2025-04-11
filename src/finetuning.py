@@ -13,6 +13,9 @@ from datetime import datetime
 import pandas.api.types
 import sklearn.metrics
 from sklearn.metrics import roc_auc_score
+import shutil
+from tqdm import tqdm
+import csv 
 
 # Import from project modules
 from model import BirdJEPA
@@ -72,19 +75,19 @@ def safe_roc_auc_score(y_true, y_pred, average='macro'):
             return np.mean(scores) if scores else 0.0
         return 0.0
 
-# keeps track of label information <-> filename
+# --- modified BirdCLEFDataWrapper to allow custom collate_fn and shuffle ---
 class BirdCLEFDataWrapper:
-    def __init__(self, csv_path, data_dir, context_length, batch_size):
+    def __init__(self, csv_path, data_dir, context_length, batch_size, infinite_dataset=True, collate_fn=None, shuffle=True):
         self.csv_path = csv_path
         self.data_dir = data_dir
         self.batch_size = batch_size
         self.context_length = context_length
+        self.infinite_dataset = infinite_dataset
         
         # Load CSV file into memory 
         self.csv_data = pd.read_csv(self.csv_path)
         
         # Extract primary_label and filename columns
-        print(f"Processing CSV data from {csv_path}")
         self.primary_labels = self.csv_data['primary_label'].values
         self.filenames = self.csv_data['filename'].values if 'filename' in self.csv_data.columns else self.csv_data['file_name'].values
         
@@ -92,9 +95,6 @@ class BirdCLEFDataWrapper:
         self.unique_labels = sorted(self.csv_data['primary_label'].unique())
         self.num_classes = len(self.unique_labels)
         self.label_to_idx = {label: i for i, label in enumerate(self.unique_labels)}
-        
-        print(f"Found {self.num_classes} unique bird classes")
-        print(f"First 5 classes: {self.unique_labels[:5]}")
         
         # Create a mapping from identifier to label
         self.identifier_to_label = {}
@@ -115,7 +115,7 @@ class BirdCLEFDataWrapper:
         print(f"Created mapping for {len(self.identifier_to_label)} files")
         
         # Initialize the dataset
-        self.init_dataset(context_length)
+        self.init_dataset(context_length, collate_fn, shuffle)
 
     def get_label_for_file(self, filename):
         """Get the primary label for a given filename based on XC/iNat identifier"""
@@ -134,14 +134,16 @@ class BirdCLEFDataWrapper:
         print(f"Warning: No label found for {filename}")
         return None, -1
 
-    def init_dataset(self, context_length):
+    def init_dataset(self, context_length, collate_fn, shuffle):
         print(f"Initializing dataset from {self.data_dir}")
-        self.dataset = BirdJEPA_Dataset(data_dir=self.data_dir, segment_len=context_length)
+        self.dataset = BirdJEPA_Dataset(data_dir=self.data_dir, segment_len=context_length, infinite_dataset=self.infinite_dataset)
+        if collate_fn is None:
+            collate_fn = data_class_collate_fn
         self.dataloader = torch.utils.data.DataLoader(
             self.dataset,
             batch_size=self.batch_size,
-            shuffle=True,
-            collate_fn=data_class_collate_fn
+            shuffle=shuffle,
+            collate_fn=collate_fn if self.infinite_dataset else None
         )
         self.dataloader_iter = iter(self.dataloader)
         print(f"Dataset initialized with {len(self.dataset)} samples")
@@ -164,6 +166,18 @@ class BirdCLEFDataWrapper:
                 # Return batch along with extracted labels
                 return batch, batch_labels, batch_label_indices
             
+            # this is sketchy, but when analyzing, we don't have a collate fn, so we return segment, segment_labels, os.path.basename(file_path) from dataclass
+            if isinstance(batch, list) and len(batch) >= 3:
+                filenames = batch[2]
+                batch_labels = []
+                batch_label_indices = []
+                for filename in filenames:
+                    label, label_idx = self.get_label_for_file(filename)
+                    batch_labels.append(label)
+                    batch_label_indices.append(label_idx)
+
+                return batch[0], batch_labels, batch_label_indices, filenames
+
             # If no filenames to process, just return the batch with empty label lists
             return batch, [], []
         except StopIteration:
@@ -181,8 +195,8 @@ class Classifier(nn.Module):
             nn.Linear(hidden_dim, 128),
             nn.ReLU(),
             nn.Dropout(0.3),
-            nn.Linear(128, num_classes),
-            nn.Sigmoid() if num_classes == 1 else nn.LogSoftmax(dim=1)
+            nn.Linear(128, num_classes)
+            # Remove sigmoid/softmax - BCEWithLogitsLoss will apply sigmoid internally
         )    
 
     def forward(self, x):
@@ -210,7 +224,10 @@ class Model(nn.Module):
         
         # Load pretrained model if path is provided
         if model_path:
+            print(f"Loading pretrained encoder from {model_path}")
             self.encoder = load_model(model_path, load_weights=True)
+        else:
+            print("No pretrained encoder path provided. Model will need to be initialized from a checkpoint.")
         
         print(f"Model initialized with context_length={context_length}, num_classes={num_classes}, pooling={pool_type}")
     
@@ -219,12 +236,33 @@ class Model(nn.Module):
         x = x.unsqueeze(1)
         x = x.transpose(2, 3)
 
+        if self.encoder is None:
+            raise RuntimeError("Encoder not initialized. Please load a pretrained model or checkpoint.")
+
         embedding_repr = self.encoder.inference_forward(x)
 
         embedding_repr = embedding_repr[0]  # [batch_size, context_length, hidden_dim]
         # No need to flatten, pass directly to classifier
         outputs = self.classifier(embedding_repr)
         return outputs
+        
+    def load_from_checkpoint(self, checkpoint_path, strict=True):
+        """
+        Load model weights from a checkpoint file
+        """
+        print(f"Loading model from checkpoint: {checkpoint_path}")
+        checkpoint = torch.load(checkpoint_path, map_location="cpu")
+        
+        # Check if model_config is available in the checkpoint
+        if 'model_config' in checkpoint and self.encoder is None:
+            config = checkpoint['model_config']
+            if 'pretrained_model_path' in config and config['pretrained_model_path']:
+                print(f"Initializing encoder from config: {config['pretrained_model_path']}")
+                self.encoder = load_model(config['pretrained_model_path'], load_weights=True)
+        
+        # Load state dict with specified strictness
+        self.load_state_dict(checkpoint['model_state_dict'], strict=strict)
+        return checkpoint
 
 class Trainer:
     def __init__(self, args):
@@ -254,12 +292,28 @@ class Trainer:
             pool_type=args.pool_type
         )
         
+        # If a resume checkpoint is provided, load it
+        if hasattr(args, 'resume_checkpoint') and args.resume_checkpoint:
+            print(f"Resuming from checkpoint: {args.resume_checkpoint}")
+            checkpoint = self.model.load_from_checkpoint(args.resume_checkpoint, strict=False)
+            print(f"Loaded checkpoint from step {checkpoint.get('step', 'unknown')}")
+        
         # Set up optimizer and loss function
-        self.optimizer = torch.optim.Adam(
-            self.model.classifier.parameters(), 
-            lr=self.args.learning_rate
-        )
-        self.criterion = nn.CrossEntropyLoss()
+        if self.args.freeze_encoder:
+            # Only train the classifier if freeze_encoder is enabled
+            self.optimizer = torch.optim.Adam(
+                self.model.classifier.parameters(), 
+                lr=self.args.learning_rate
+            )
+            print("Freezing encoder: only classifier will be trained")
+        else:
+            # Train both encoder and classifier by default
+            self.optimizer = torch.optim.Adam(
+                self.model.parameters(), 
+                lr=self.args.learning_rate
+            )
+            print("Training both encoder and classifier")
+        self.criterion = nn.BCEWithLogitsLoss()  # use BCEWithLogitsLoss for multi-label classification
         
         # Move model to device
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -267,154 +321,155 @@ class Trainer:
         if self.model.encoder:
             self.model.encoder.to(self.device)
             
-        # Initialize loss tracking
+        # Initialize loss and metric tracking
         self.train_losses = []
         self.val_losses = []
         self.train_losses_ema = []
         self.val_losses_ema = []
         self.eval_steps = []
-        self.ema_alpha = args.ema_alpha if hasattr(args, 'ema_alpha') else 0.2  # EMA smoothing factor
+        self.ema_alpha = args.ema_alpha if hasattr(args, 'ema_alpha') else 0.2
         
-        # Initialize ROC-AUC tracking
         self.val_roc_auc_scores = []
         self.val_roc_auc_scores_ema = []
         
-        # Create output directory if it doesn't exist
+        # new output directory handling: if a folder already exists with the same name, move it to /archive
         if args.output_dir:
-            self.output_dir = Path(args.output_dir)
-            self.output_dir.mkdir(parents=True, exist_ok=True)
-            # Create a timestamp for this training run
-            self.timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-            self.run_dir = self.output_dir / f"run_{self.timestamp}"
+            self.run_dir = Path(args.output_dir)
+            if self.run_dir.exists():
+                archive_dir = self.run_dir.parent / "archive"
+                archive_dir.mkdir(parents=True, exist_ok=True)
+                archive_path = archive_dir / f"{self.run_dir.name}_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
+                print(f"existing folder detected. archiving to {archive_path}")
+                shutil.move(str(self.run_dir), str(archive_path))
             self.run_dir.mkdir(parents=True, exist_ok=True)
+            # dump config details to config.json along with encoder config if available
+            config_path = self.run_dir / "config.json"
+            config_data = vars(self.args).copy()
+            if self.model.encoder is not None:
+                # assuming the encoder provides its relevant parameters via a get_config() method
+                # otherwise, manually specify the attributes you want to save (e.g., num_layers, hidden_dim, etc.)
+                if hasattr(self.model.encoder, "get_config"):
+                    config_data['encoder_config'] = self.model.encoder.get_config()
+                else:
+                    config_data['encoder_config'] = {
+                        "dummy_key": "dummy_value"  # replace with relevant encoder parameters
+                    }
+            with open(config_path, "w") as f:
+                json.dump(config_data, f, indent=4)
         else:
-            self.output_dir = None
             self.run_dir = None
         
-        # Get unique bird classes for ROC-AUC evaluation
+        # get unique bird classes for ROC-AUC evaluation
         self.bird_classes = self.train_wrapper.unique_labels
-    
+
     def calculate_ema(self, current_value, previous_ema=None):
-        """Calculate Exponential Moving Average"""
         if previous_ema is None:
             return current_value
         return self.ema_alpha * current_value + (1 - self.ema_alpha) * previous_ema
-    
+
     def train(self):
-        # Training loop
         print(f"Starting training loop for {self.args.max_steps} steps")
-        
         running_loss = 0.0
         best_val_loss = float('inf')
         best_roc_auc = 0.0
         patience_counter = 0
         
         for step in range(self.args.max_steps):
-            # Get next batch
             batch_tuple, batch_labels, batch_label_indices = self.train_wrapper.next_batch()
-
-            # Skip batches with missing labels
             if -1 in batch_label_indices:
-                print(f"Skipping batch with missing labels")
+                print("Skipping batch with missing labels")
                 continue
 
-            # Move data to device
             inputs = batch_tuple[0].to(self.device)
-            labels = torch.tensor(batch_label_indices, dtype=torch.long).to(self.device)
-            
-            # Zero the parameter gradients
+            batch_size = len(batch_label_indices)
+            labels = torch.zeros(batch_size, self.train_wrapper.num_classes, device=self.device)
+            for i, idx in enumerate(batch_label_indices):
+                labels[i, idx] = 1.0
+
             self.optimizer.zero_grad()
-            
-            # Forward pass
             outputs = self.model.forward(inputs)
-            
-            # Calculate loss
             loss = self.criterion(outputs, labels)            
-            # Backward pass and optimize
             loss.backward()
             self.optimizer.step()
-            
-            # Update running loss
+
             running_loss += loss.item()
-            
-            # Print stats at evaluation interval
             if (step + 1) % self.args.eval_interval == 0:
                 avg_train_loss = running_loss / self.args.eval_interval
-                # Evaluate on validation set
-                val_loss, roc_auc_score = self.evaluate(model=self.model, criterion=self.criterion, val_wrapper=self.val_wrapper)
-                
-                # Store losses
+                val_loss, roc_auc_score_val = self.evaluate(model=self.model, criterion=self.criterion, val_wrapper=self.val_wrapper)
+
                 self.train_losses.append(avg_train_loss)
                 self.val_losses.append(val_loss)
-                self.val_roc_auc_scores.append(roc_auc_score)
+                self.val_roc_auc_scores.append(roc_auc_score_val)
                 self.eval_steps.append(step + 1)
                 
-                # Calculate EMA
                 if len(self.train_losses_ema) == 0:
                     self.train_losses_ema.append(avg_train_loss)
                     self.val_losses_ema.append(val_loss)
-                    self.val_roc_auc_scores_ema.append(roc_auc_score)
+                    self.val_roc_auc_scores_ema.append(roc_auc_score_val)
                 else:
                     self.train_losses_ema.append(self.calculate_ema(avg_train_loss, self.train_losses_ema[-1]))
                     self.val_losses_ema.append(self.calculate_ema(val_loss, self.val_losses_ema[-1]))
-                    self.val_roc_auc_scores_ema.append(self.calculate_ema(roc_auc_score, self.val_roc_auc_scores_ema[-1]))
+                    self.val_roc_auc_scores_ema.append(self.calculate_ema(roc_auc_score_val, self.val_roc_auc_scores_ema[-1]))
                 
                 print(f"Step {step+1}/{self.args.max_steps}, Training Loss: {avg_train_loss:.4f} (EMA: {self.train_losses_ema[-1]:.4f}), "
                       f"Validation Loss: {val_loss:.4f} (EMA: {self.val_losses_ema[-1]:.4f}), "
-                      f"ROC-AUC: {roc_auc_score:.4f} (EMA: {self.val_roc_auc_scores_ema[-1]:.4f})")
+                      f"ROC-AUC: {roc_auc_score_val:.4f} (EMA: {self.val_roc_auc_scores_ema[-1]:.4f})")
                 
-                # Save model if it has the best validation score
                 if self.args.save_best_metric == 'loss' and val_loss < best_val_loss and self.run_dir:
                     best_val_loss = val_loss
                     patience_counter = 0
                     self.save_model(step, "best_loss")
-                elif self.args.save_best_metric == 'roc_auc' and roc_auc_score > best_roc_auc and self.run_dir:
-                    best_roc_auc = roc_auc_score
+                elif self.args.save_best_metric == 'roc_auc' and roc_auc_score_val > best_roc_auc and self.run_dir:
+                    best_roc_auc = roc_auc_score_val
                     patience_counter = 0
                     self.save_model(step, "best_roc_auc")
                 else:
                     patience_counter += 1
                 
-                # Save model periodically
                 if (step + 1) % self.args.save_interval == 0 and self.run_dir:
                     self.save_model(step, "checkpoint")
                 
-                # Early stopping
                 if patience_counter >= self.args.early_stopping_patience:
                     print(f"Early stopping triggered at step {step+1}")
                     break
                 
-                # Reset running loss
                 running_loss = 0.0
         
-        # After training is complete, plot and save loss curves
         self.save_loss_data()
         self.plot_losses()
         self.plot_roc_auc()
-        
-        # Return to eval mode
         self.model.eval()
-    
+
     def save_model(self, step, prefix="checkpoint"):
-        """Save model checkpoint"""
         if not self.run_dir:
             return
-            
-        save_path = self.run_dir / f"{prefix}_step_{step+1}.pt"
+        # save weight checkpoints to a 'weights' subfolder
+        weights_dir = self.run_dir / "weights"
+        weights_dir.mkdir(exist_ok=True)
+        save_path = weights_dir / f"{prefix}_step_{step+1}.pt"
+        
+        # Save more comprehensive information about the model
+        model_config = {
+            'context_length': self.args.context_length,
+            'num_classes': self.train_wrapper.num_classes,
+            'pool_type': self.args.pool_type,
+            'freeze_encoder': self.args.freeze_encoder,
+            'pretrained_model_path': self.args.pretrained_model_path
+        }
+        
         torch.save({
             'step': step + 1,
             'model_state_dict': self.model.state_dict(),
             'optimizer_state_dict': self.optimizer.state_dict(),
             'train_loss': self.train_losses[-1] if self.train_losses else None,
             'val_loss': self.val_losses[-1] if self.val_losses else None,
+            'model_config': model_config,
         }, save_path)
         print(f"Model saved to {save_path}")
-    
+
     def save_loss_data(self):
-        """Save loss data to JSON file"""
         if not self.run_dir:
             return
-            
         loss_data = {
             'steps': self.eval_steps,
             'train_loss': self.train_losses,
@@ -424,259 +479,340 @@ class Trainer:
             'val_roc_auc': self.val_roc_auc_scores,
             'val_roc_auc_ema': self.val_roc_auc_scores_ema
         }
-        
-        json_path = self.run_dir / 'metrics_data.json'
+        # save loss data as loss.json (instead of metrics_data.json)
+        json_path = self.run_dir / 'loss.json'
         with open(json_path, 'w') as f:
             json.dump(loss_data, f, indent=4)
         
-        # Also save as CSV for easier analysis
-        csv_path = self.run_dir / 'metrics_data.csv'
-        df = pd.DataFrame({
-            'step': self.eval_steps,
-            'train_loss': self.train_losses,
-            'val_loss': self.val_losses,
-            'train_loss_ema': self.train_losses_ema,
-            'val_loss_ema': self.val_losses_ema,
-            'val_roc_auc': self.val_roc_auc_scores,
-            'val_roc_auc_ema': self.val_roc_auc_scores_ema
-        })
+        csv_path = self.run_dir / 'loss_data.csv'
+        df = pd.DataFrame(loss_data)
         df.to_csv(csv_path, index=False)
         
-        print(f"Metrics data saved to {json_path} and {csv_path}")
-    
+        print(f"Loss data saved to {json_path} and {csv_path}")
+
+    # plot_losses and plot_roc_auc remain unchanged
     def plot_losses(self):
-        """Plot and save the loss curves"""
         if not self.run_dir:
             return
-            
         plt.figure(figsize=(10, 6))
-        
-        # Plot raw losses
         plt.plot(self.eval_steps, self.train_losses, 'b-', alpha=0.3, label='Train Loss')
         plt.plot(self.eval_steps, self.val_losses, 'r-', alpha=0.3, label='Validation Loss')
-        
-        # Plot smoothed losses
         plt.plot(self.eval_steps, self.train_losses_ema, 'b-', linewidth=2, label='Train Loss (EMA)')
         plt.plot(self.eval_steps, self.val_losses_ema, 'r-', linewidth=2, label='Validation Loss (EMA)')
-        
         plt.title('Training and Validation Loss')
         plt.xlabel('Steps')
         plt.ylabel('Loss')
         plt.legend()
         plt.grid(True, alpha=0.3)
-        
-        # Save the plot
         plot_path = self.run_dir / 'loss_plot.png'
         plt.savefig(plot_path, dpi=300, bbox_inches='tight')
         plt.close()
-        
         print(f"Loss plot saved to {plot_path}")
-    
+
     def plot_roc_auc(self):
-        """Plot and save the ROC-AUC curves"""
         if not self.run_dir or not self.val_roc_auc_scores:
             return
-            
         plt.figure(figsize=(10, 6))
-        
-        # Plot raw ROC-AUC
         plt.plot(self.eval_steps, self.val_roc_auc_scores, 'g-', alpha=0.3, label='Validation ROC-AUC')
-        
-        # Plot smoothed ROC-AUC
         plt.plot(self.eval_steps, self.val_roc_auc_scores_ema, 'g-', linewidth=2, label='Validation ROC-AUC (EMA)')
-        
         plt.title('Validation ROC-AUC Score')
         plt.xlabel('Steps')
         plt.ylabel('ROC-AUC')
         plt.legend()
         plt.grid(True, alpha=0.3)
-        
-        # Set y-axis limits for ROC-AUC (typically between 0.5 and 1.0)
         plt.ylim(0.5, 1.05)
-        
-        # Save the plot
         plot_path = self.run_dir / 'roc_auc_plot.png'
         plt.savefig(plot_path, dpi=300, bbox_inches='tight')
         plt.close()
-        
         print(f"ROC-AUC plot saved to {plot_path}")
 
+    # evaluate remains unchanged
     def evaluate(self, model, criterion, val_wrapper):
-        """Evaluate model on validation set, returning both loss and ROC-AUC score"""
         model.eval()
         total_loss = 0.0
-        num_batches = 5  # Evaluate on multiple batches for better validation statistics
-        
-        all_labels = []  # True labels
-        all_preds = []   # Predicted probabilities
-        
+        num_batches = 5
+        all_labels = []
+        all_preds = []
         with torch.no_grad():
             for _ in range(num_batches):
                 batch_tuple, batch_labels, batch_label_indices = val_wrapper.next_batch()
-                
-                # Skip batches with missing labels
                 if -1 in batch_label_indices:
                     continue
-                    
-                # Move data to device
                 inputs = batch_tuple[0].to(self.device)
-                labels = torch.tensor(batch_label_indices, dtype=torch.long).to(self.device)
-                
-                # Forward pass
+                batch_size = len(batch_label_indices)
+                labels = torch.zeros(batch_size, val_wrapper.num_classes, device=self.device)
+                for i, idx in enumerate(batch_label_indices):
+                    labels[i, idx] = 1.0
                 outputs = model.forward(inputs)
-                
-                # Calculate loss
                 loss = criterion(outputs, labels)
                 total_loss += loss.item()
-                
-                # Convert to probabilities
-                if outputs.shape[1] > 1:  # Multi-class case
-                    # If using LogSoftmax output, convert to actual probabilities
-                    if torch.min(outputs) < 0:
-                        probs = torch.exp(outputs)
-                    else:
-                        probs = outputs
-                    
-                    # Convert one-hot indices to one-hot encoded format for ROC-AUC calculation
-                    batch_size = labels.size(0)
-                    num_classes = probs.size(1)
-                    
-                    # Create one-hot encoded labels
-                    labels_one_hot = torch.zeros(batch_size, num_classes).to(self.device)
-                    labels_one_hot.scatter_(1, labels.unsqueeze(1), 1)
-                    
-                    all_labels.append(labels_one_hot.cpu().numpy())
-                    all_preds.append(probs.cpu().numpy())
-                else:  # Binary case
-                    all_labels.append(labels.cpu().numpy())
-                    all_preds.append(outputs.cpu().numpy())
-        
-        # Calculate average loss
+                probs = torch.sigmoid(outputs)
+                all_labels.append(labels.cpu().numpy())
+                all_preds.append(probs.cpu().numpy())
         avg_loss = total_loss / num_batches
-        
-        # Calculate ROC-AUC if we have predictions
         roc_auc = 0.0
         if all_labels and all_preds:
             try:
                 all_labels = np.vstack(all_labels)
                 all_preds = np.vstack(all_preds)
-                
-                # Create DataFrame format for Kaggle scoring function
-                if all_labels.shape[1] > 1:  # Multi-class case
-                    solution_df = pd.DataFrame(all_labels, columns=self.bird_classes)
-                    submission_df = pd.DataFrame(all_preds, columns=self.bird_classes)
-                    
-                    # Add row_id column for Kaggle scoring format
-                    row_ids = [f"row_{i}" for i in range(len(solution_df))]
-                    solution_df.insert(0, "row_id", row_ids)
-                    submission_df.insert(0, "row_id", row_ids)
-                    
-                    # Calculate ROC-AUC using Kaggle's function
-                    roc_auc = kaggle_score(solution_df.copy(), submission_df.copy(), "row_id")
-                else:  # Binary case
-                    roc_auc = safe_roc_auc_score(all_labels, all_preds)
+                solution_df = pd.DataFrame(all_labels, columns=self.bird_classes)
+                submission_df = pd.DataFrame(all_preds, columns=self.bird_classes)
+                row_ids = [f"row_{i}" for i in range(len(solution_df))]
+                solution_df.insert(0, "row_id", row_ids)
+                submission_df.insert(0, "row_id", row_ids)
+                roc_auc = kaggle_score(solution_df.copy(), submission_df.copy(), "row_id")
             except Exception as e:
                 print(f"Error calculating ROC-AUC: {e}")
-        
-        model.train()  # Set model back to training mode
+        model.train()
         return avg_loss, roc_auc
-
-def load_model_from_checkpoint(checkpoint_path, pretrained_model_path, context_length, num_classes, pool_type='mean', device=None):
-    """
-    Load a trained model from a checkpoint
-    
-    Args:
-        checkpoint_path (str): Path to the checkpoint file
-        pretrained_model_path (str): Path to the pretrained encoder
-        context_length (int): Context length for the model
-        num_classes (int): Number of classes for classification
-        pool_type (str): Type of pooling to use (mean or max)
-        device (torch.device): Device to load the model to
-        
-    Returns:
-        tuple: (model, checkpoint_info) where checkpoint_info is a dict with metadata
-               or (None, None) if loading failed
-    """
-    if device is None:
-        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-        
-    if not checkpoint_path or not os.path.exists(checkpoint_path):
-        print(f"Error: Checkpoint file not found at {checkpoint_path}")
-        return None, None
-    
-    try:
-        print(f"Loading checkpoint from {checkpoint_path}")
-        
-        # Create model instance
-        model = Model(
-            model_path=pretrained_model_path,
-            context_length=context_length,
-            num_classes=num_classes,
-            pool_type=pool_type
-        )
-        
-        # Load checkpoint weights
-        checkpoint = torch.load(checkpoint_path, map_location=device)
-        model.load_state_dict(checkpoint['model_state_dict'])
-        
-        # Move model to device and set to eval mode
-        model.to(device)
-        model.eval()
-        
-        print(f"Model loaded successfully (from step {checkpoint.get('step', 'unknown')})")
-        
-        # Return model and checkpoint info
-        return model, checkpoint
-        
-    except Exception as e:
-        print(f"Error loading model: {e}")
-        return None, None
 
 class Analysis:
     def __init__(self, args):
-        """
-        Initialize the Analysis class
-        
-        Args:
-            args: An argparse namespace containing:
-                - checkpoint_path: Path to the saved model checkpoint
-                - pretrained_model_path: Path to the pretrained encoder
-                - context_length: Context length for the model
-                - num_classes: Number of classes for classification
-                - pool_type: Type of pooling to use (mean or max)
-        """
         self.args = args
-        self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-        self.model = None
-        self.checkpoint_info = None
-        self.num_classes = args.num_classes if hasattr(args, 'num_classes') else 0
+        self.run_dir = Path(args.output_dir)
+        weights_dir = self.run_dir / "weights"
+        checkpoint_files = list(weights_dir.glob("best_*_step_*.pt"))
+        if not checkpoint_files:
+            raise Exception("no best model checkpoint found for analysis")
         
-        print(f"Analysis initialized, will use device: {self.device}")
-    
-    def load_model(self):
-        """
-        Load a trained model from a checkpoint
-        """
-        if not hasattr(self.args, 'checkpoint_path') or not self.args.checkpoint_path:
-            print("Error: No checkpoint path provided")
-            return False
-            
-        # Use the global function to load the model
-        self.model, self.checkpoint_info = load_model_from_checkpoint(
-            checkpoint_path=self.args.checkpoint_path,
-            pretrained_model_path=self.args.pretrained_model_path,
-            context_length=self.args.context_length,
-            num_classes=self.args.num_classes,
-            pool_type=self.args.pool_type,
-            device=self.device
+        # Extract step numbers from filenames and sort by numeric value
+        def get_step_number(file_path):
+            match = re.search(r'step_(\d+)\.pt', str(file_path))
+            if match:
+                return int(match.group(1))  # Convert to integer for numeric sorting
+            return 0
+        
+        # Sort by step number, so "5750" will be higher than "750"
+        checkpoint_file = sorted(checkpoint_files, key=get_step_number)[-1]
+        
+        print(f"Loading model checkpoint from {checkpoint_file}")
+        
+        # Load number of classes from training csv
+        self.num_classes = self.load_num_classes(args.train_csv)
+        
+        # Create the model first with minimal parameters
+        self.model = Model(
+            model_path=args.pretrained_model_path,  # This can be None if loading from checkpoint
+            context_length=args.context_length,
+            num_classes=self.num_classes,
+            pool_type=args.pool_type
         )
         
-        return self.model is not None
+        # Load the checkpoint weights into the model
+        checkpoint = torch.load(checkpoint_file, map_location="cpu")
+        self.model.load_state_dict(checkpoint['model_state_dict'])
+        print(f"Successfully loaded model weights from checkpoint (step {checkpoint.get('step', 'unknown')})")
+        
+        self.model.eval()
+        
+        # Create validation dataloader with batch size 1, no shuffle, no custom collate_fn, and non-infinite dataset
+        self.val_wrapper = BirdCLEFDataWrapper(
+            csv_path=args.train_csv,
+            data_dir=args.val_spec_dir,
+            context_length=None,
+            batch_size=1,
+            infinite_dataset=False,
+            collate_fn=None,
+            shuffle=False
+        )
+    
+    def load_num_classes(self, csv_path):
+        df = pd.read_csv(csv_path)
+        return len(sorted(df['primary_label'].unique()))
 
-#load model ... 
+    def run_analysis(self):
+        print("running analysis on validation data")
+        all_labels = []
+        all_preds = []
+        num_samples = len(self.val_wrapper.dataset)  # Limit to 500 samples for debugging
+        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        self.model.to(device)
+        
+        for i in tqdm(range(num_samples), desc="Processing samples"):
+            spec_tensor, label, label_idx, filenames = self.val_wrapper.next_batch()
+            
+            # Skip if no valid label
+            if label_idx == -1:
+                print(f"warning: missing label for sample {i}, skipping")
+                continue
+                
+            # slice the spec tensor into 5 second segments, and shape it as batch x freq x timebins
+            segments = []
+            for j in range(0, spec_tensor.shape[-1], 1000):
+                segment = spec_tensor[..., j:j+1000]
+                if segment.shape[-1] < 1000:
+                    # Pad with zeros to reach 1000
+                    pad_size = 1000 - segment.shape[-1]
+                    pad_tensor = torch.zeros(*segment.shape[:-1], pad_size, device=segment.device)
+                    segment = torch.cat([segment, pad_tensor], dim=-1)
+                segments.append(segment)
+            
+            if not segments:
+                continue
+                
+            segments = torch.stack(segments, dim=0)
+            segments = segments.squeeze(1)
+            
+            # Run the model on each segment
+            with torch.no_grad():
+                segments = segments.to(device)
+                outputs = self.model.forward(segments)
+                probs = torch.sigmoid(outputs).cpu().numpy()
+                
+                # Average predictions across all segments
+                avg_prob = np.mean(probs, axis=0)
+                
+                # Create one-hot encoded true label
+                true_label = np.zeros(self.num_classes)
+                true_label[label_idx] = 1.0
+                
+                all_labels.append(true_label)
+                all_preds.append(avg_prob)
+                
+        if len(all_labels) == 0:
+            print("No valid samples for analysis")
+            return
+            
+        # Calculate ROC-AUC score
+        all_labels_arr = np.vstack(all_labels)
+        all_preds_arr = np.vstack(all_preds)
+        
+        # Get bird class names
+        bird_classes = sorted(pd.read_csv(self.args.train_csv)['primary_label'].unique())
+        
+        # Create dataframes for scoring
+        solution_df = pd.DataFrame(all_labels_arr, columns=bird_classes)
+        submission_df = pd.DataFrame(all_preds_arr, columns=bird_classes)
+        
+        # Add row_id column
+        row_ids = [f"row_{i}" for i in range(solution_df.shape[0])]
+        solution_df.insert(0, "row_id", row_ids)
+        submission_df.insert(0, "row_id", row_ids)
+        
+        # Calculate score
+        score = kaggle_score(solution_df.copy(), submission_df.copy(), "row_id")
+        
+        # Prepare results string
+        result_str = f"Analysis results:\nNum samples: {len(all_labels)}\nROC-AUC: {score:.4f}\n"
+        
+        # Print results
+        print(result_str)
+        
+        # Save results to file
+        results_path = self.run_dir / "analysis_results.txt"
+        with open(results_path, "w") as f:
+            f.write(result_str)
+            
+        print(f"Analysis results saved to {results_path}")
+
 class Inference:
-    pass
+    def __init__(self, args):
+        self.args = args
+        self.run_dir = Path(args.output_dir)
+        weights_dir = self.run_dir / "weights"
+        checkpoint_files = list(weights_dir.glob("best_*_step_*.pt"))
+        if not checkpoint_files:
+            raise Exception("no best model checkpoint found for analysis")
+        
+        # Extract step numbers from filenames and sort by numeric value
+        def get_step_number(file_path):
+            match = re.search(r'step_(\d+)\.pt', str(file_path))
+            if match:
+                return int(match.group(1))  # Convert to integer for numeric sorting
+            return 0
+        
+        # Sort by step number, so "5750" will be higher than "750"
+        checkpoint_file = sorted(checkpoint_files, key=get_step_number)[-1]
+        
+        print(f"Loading model checkpoint from {checkpoint_file}")
+        
+        # Load number of classes from training csv
+        self.num_classes = self.load_num_classes(args.train_csv)
+        
+        # Create the model first with minimal parameters
+        self.model = Model(
+            model_path=args.pretrained_model_path,  # This can be None if loading from checkpoint
+            context_length=args.context_length,
+            num_classes=self.num_classes,
+            pool_type=args.pool_type
+        )
+        
+        # Load the checkpoint weights into the model
+        checkpoint = torch.load(checkpoint_file, map_location="cpu")
+        self.model.load_state_dict(checkpoint['model_state_dict'])
+        print(f"Successfully loaded model weights from checkpoint (step {checkpoint.get('step', 'unknown')})")
+        
+        self.model.eval()
+        
+        # Create validation dataloader with batch size 1, no shuffle, no custom collate_fn, and non-infinite dataset
+        self.val_wrapper = BirdCLEFDataWrapper(
+            csv_path=args.train_csv,
+            data_dir=args.val_spec_dir,
+            context_length=None,
+            batch_size=1,
+            infinite_dataset=False,
+            collate_fn=None,
+            shuffle=False
+        )
 
+    def load_num_classes(self, csv_path):
+        df = pd.read_csv(csv_path)
+        return len(sorted(df['primary_label'].unique()))
+
+    def run_analysis(self):
+        print("running analysis on validation data")
+        rows = []
+        num_samples = len(self.val_wrapper.dataset)
+        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        self.model.to(device)
+        
+        # Get actual bird class names
+        bird_classes = self.val_wrapper.unique_labels
+
+        for i in tqdm(range(num_samples), desc="processing samples"):
+            if i > 10:
+                break
+            spec_tensor, label, label_idx, filenames = self.val_wrapper.next_batch()
+
+            if label_idx == -1:
+                print(f"warning: missing label for sample {i}, skipping")
+                continue
+
+            segments = []
+            for j in range(0, spec_tensor.shape[-1], 1000):
+                segment = spec_tensor[..., j : j + 1000]
+                if segment.shape[-1] < 1000:
+                    pad_size = 1000 - segment.shape[-1]
+                    pad_tensor = torch.zeros(*segment.shape[:-1], pad_size, device=segment.device)
+                    segment = torch.cat([segment, pad_tensor], dim=-1)
+                segments.append(segment)
+
+            if not segments:
+                continue
+
+            segments = torch.stack(segments, dim=0).squeeze(1)
+            with torch.no_grad():
+                segments = segments.to(device)
+                outputs = self.model(segments)
+                probs = torch.sigmoid(outputs).cpu().numpy()
+
+            # split the filename into the identifier and the segment number
+            base_id = filenames[0].split("_segment_")[0]
+
+            for seg_idx, segment_probs in enumerate(probs):
+                # assign a time marker (in seconds) per segment; here each segment represents 5 sec.
+                time_marker = (seg_idx + 1) * 5
+                row_id = f"soundscape_{base_id}_{time_marker}"
+                row_data = {"row_id": row_id}
+                for cls_idx, class_name in enumerate(bird_classes):
+                    row_data[class_name] = segment_probs[cls_idx]
+                rows.append(row_data)
+
+        submission_df = pd.DataFrame(rows)
+        submission_df.to_csv("submission.csv", index=False)
+        print("csv file 'submission.csv' populated with predictions for each 5-second segment using actual bird class names")
+
+            
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--mode", type=str, required=True, choices=["train", "infer", "debug", "analyze"])
@@ -687,10 +823,10 @@ def main():
     parser.add_argument("--val_spec_dir", type=str, help="Directory containing validation spectrograms")
     parser.add_argument("--taxonomy_file", type=str, help="Path to taxonomy file")
     parser.add_argument("--train_csv", type=str, help="Path to training CSV file")
-    parser.add_argument("--val_csv", type=str, help="Path to validation CSV file")  # Added val_csv parameter
     parser.add_argument("--output_dir", type=str, help="Directory to save model outputs")
     parser.add_argument("--pretrained_model_path", type=str, help="Path to pretrained model weights")
-    parser.add_argument("--freeze_encoder", action="store_true", help="Whether to freeze encoder weights")
+    parser.add_argument("--resume_checkpoint", type=str, help="Path to checkpoint for resuming training")
+    parser.add_argument("--freeze_encoder", action="store_true", help="If set, only train the classifier and freeze the encoder weights. By default, both encoder and classifier are trained.")
     parser.add_argument("--learning_rate", type=float, default=1e-4, help="Learning rate")
     parser.add_argument("--batch_size", type=int, default=4, help="Batch size")
     parser.add_argument("--max_steps", type=int, default=100, help="Maximum training steps")
@@ -704,27 +840,17 @@ def main():
     parser.add_argument("--pool_type", type=str, default="mean", choices=["mean", "max"],
                        help="Type of pooling to use in the classifier")
     
-    # Analysis arguments
-    parser.add_argument("--checkpoint_path", type=str, help="Path to model checkpoint for analysis/inference")
-    parser.add_argument("--num_classes", type=int, help="Number of classes (needed when loading checkpoint)")
-    parser.add_argument("--analysis_data_dir", type=str, help="Directory containing data for analysis")
-
     args = parser.parse_args()
 
     if args.mode == "train":
         trainer = Trainer(args)
         trainer.train()
     elif args.mode == "analyze":
-        # Initialize analysis module
         analyzer = Analysis(args)
-        
-        # Load model
-        if not analyzer.load_model():
-            print("Failed to load model for analysis. Exiting.")
-            return
-            
-        print("Model loaded successfully for analysis.")
-        # Additional analysis code will be added here
+        analyzer.run_analysis()
+    elif args.mode == "infer":
+        infer = Inference(args)
+        infer.run_analysis()
 
 if __name__ == "__main__":
     main()

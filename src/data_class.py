@@ -9,11 +9,11 @@ from pathlib import Path
 from timing_utils import Timer, timed_operation, timing_stats
 
 class BirdJEPA_Dataset(Dataset):
-    def __init__(self, data_dir, segment_len=50, verbose=False):
+    def __init__(self, data_dir, segment_len=50, verbose=False, infinite_dataset=True):
         self.data_dir = data_dir
         self.segment_len = segment_len
         self.verbose = verbose
-        
+        self.infinite_dataset = infinite_dataset
         # preload file paths into memory for fast access
         self.file_paths = [entry.path for entry in os.scandir(data_dir)]
         self.file_count = len(self.file_paths)
@@ -22,8 +22,11 @@ class BirdJEPA_Dataset(Dataset):
             print(f"Initialized dataset with {self.file_count} files.")
                 
     def __len__(self):
-        # return a very large number to simulate an infinite dataset
-        return int(1e5)
+        if self.infinite_dataset:
+            # return a very large number to simulate an infinite dataset
+            return int(1e5)
+        else:
+            return self.file_count
     
     def _get_random_file(self):
         """Get a random file path from the preloaded file paths."""
@@ -50,27 +53,26 @@ class BirdJEPA_Dataset(Dataset):
             print(f"Loaded file: {file_path}")
             print(f"Original spectrogram shape: {spec.shape}")
             print(f"Original labels shape: {ground_truth_labels.shape}")
-
-        if T < self.segment_len:
-            # pad both spectrogram and labels
-            if self.verbose:
-                print(f"Padding short segment from length {T} to {self.segment_len}")
-            
-            padded_spec = np.zeros((F, self.segment_len))
-            padded_spec[:, :T] = spec
-            
-            padded_labels = np.zeros(self.segment_len, dtype=ground_truth_labels.dtype)
-            padded_labels[:T] = ground_truth_labels
-            
-            spec = padded_spec
-            ground_truth_labels = padded_labels
-            T = self.segment_len
-
-            # Directly slice the memmapped arrays
-            start = random.randint(0, T - self.segment_len)
-            segment = spec[:, start:start+self.segment_len].copy()  # Copy forces load into memory
-            segment_labels = ground_truth_labels[start:start+self.segment_len].copy()
+        if self.segment_len is None:
+            # Return full length without slicing or padding
+            segment = spec.copy()
+            segment_labels = ground_truth_labels.copy()
         else:
+            if T < self.segment_len:
+                # pad both spectrogram and labels
+                if self.verbose:
+                    print(f"Padding short segment from length {T} to {self.segment_len}")
+                
+                padded_spec = np.zeros((F, self.segment_len))
+                padded_spec[:, :T] = spec
+                
+                padded_labels = np.zeros(self.segment_len, dtype=ground_truth_labels.dtype)
+                padded_labels[:T] = ground_truth_labels
+                
+                spec = padded_spec
+                ground_truth_labels = padded_labels
+                T = self.segment_len
+
             # Directly slice the memmapped arrays
             start = random.randint(0, T - self.segment_len)
             segment = spec[:, start:start+self.segment_len].copy()  # Copy forces load into memory

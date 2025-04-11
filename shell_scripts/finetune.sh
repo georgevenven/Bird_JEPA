@@ -131,7 +131,7 @@ VAL_SPEC_DIR="$TEMP_DIR/test_dir"
 #         --song_detection_json_path "$SONG_DETECTION_JSON_PATH" \
 #         --step_size "$STEP_SIZE" \
 #         --nfft "$NFFT" \
-#         --single_threaded "$([[ "$MULTI_THREAD" == false ]] && echo 'true' || echo 'false')"
+#         --single_threaded "$(if [[ "$MULTI_THREAD" == false ]]; then echo 'true'; else echo 'false'; fi)"
 
         
 # python3 src/spectrogram_generator.py \
@@ -140,22 +140,21 @@ VAL_SPEC_DIR="$TEMP_DIR/test_dir"
 #         --song_detection_json_path "$SONG_DETECTION_JSON_PATH" \
 #         --step_size "$STEP_SIZE" \
 #         --nfft "$NFFT" \
-#         --single_threaded "$([[ "$MULTI_THREAD" == false ]] && echo 'true' || echo 'false')"
+#         --single_threaded "$(if [[ "$MULTI_THREAD" == false ]]; then echo 'true'; else echo 'false'; fi)"
 
-# Run baseline training
+# Run baseline training, TRAIN CSV: this is for both train and val
 echo "Running finetuning with pre-generated spectrograms..."
 python3 "${PROJECT_ROOT}/src/finetuning.py" \
-    --mode train \
+    --mode infer \
     --train_spec_dir "$TRAIN_SPEC_DIR" \
     --val_spec_dir "$VAL_SPEC_DIR" \
     --taxonomy_file "$TAXONOMY_FILE" \
     --train_csv "$TRAIN_CSV" \
-    --val_csv "$TRAIN_CSV" \
     --output_dir "$EXPERIMENT_DIR" \
     --batch_size 12 \
     --learning_rate 3e-4 \
-    --max_steps 100000 \
-    --early_stopping_patience 1000 \
+    --max_steps 25000 \
+    --early_stopping_patience 50 \
     --save_interval 1000 \
-    --eval_interval 100 \
+    --eval_interval 250 \
     --pretrained_model_path "$PRETRAINED_MODEL_PATH"
