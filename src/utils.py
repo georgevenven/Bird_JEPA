@@ -77,7 +77,7 @@ def load_model(experiment_folder, return_checkpoint=False, load_weights=True, ra
         
         latest_checkpoint = max(checkpoints, key=lambda x: int(x.split('_')[-1].split('.')[0]))
         
-        checkpoint = torch.load(latest_checkpoint)
+        checkpoint = torch.load(latest_checkpoint, map_location='cpu')
         model.load_state_dict(checkpoint['model_state_dict'])
         
         print(f"\nLoaded checkpoint details:")

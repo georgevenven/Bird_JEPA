@@ -8,7 +8,12 @@ import re
 from pathlib import Path
 import datetime
 
-def create_zip_archive(experiment_path, output_dir="zips"):
+# Parameters to copy and paste (modify these variables instead of using command line)
+experiment_path = "/home/george-vengrovski/Documents/projects/Bird_JEPA/experiments/BirdJEPA_Run_10k_Finetune"  # Path to the experiment directory
+output_dir = "/home/george-vengrovski/Documents/projects/Bird_JEPA/zips"  # Directory to save the zip file (default: 'zips')
+pretrained_path = "/home/george-vengrovski/Documents/projects/Bird_JEPA/experiments/BirdJEPA_Untrained_Large_Test"  # Optional: Path to pretrained model directory or file
+
+def create_zip_archive(experiment_path, output_dir="zips", pretrained_path=None):
     """
     Create a zip archive of the project including src, scripts, shell_scripts directories
     and the specified experiment with only the best weights.
@@ -16,6 +21,7 @@ def create_zip_archive(experiment_path, output_dir="zips"):
     Args:
         experiment_path (str): Path to the experiment directory
         output_dir (str): Directory to save the zip file
+        pretrained_path (str, optional): Path to the pretrained model directory
     """
     # Create output directory if it doesn't exist
     os.makedirs(output_dir, exist_ok=True)
@@ -24,6 +30,22 @@ def create_zip_archive(experiment_path, output_dir="zips"):
     experiment_path = Path(experiment_path)
     if not experiment_path.exists():
         raise ValueError(f"Experiment path not found: {experiment_path}")
+    
+    # Check pretrained path if provided
+    if pretrained_path:
+        pretrained_path = Path(pretrained_path)
+        if not pretrained_path.exists():
+            raise ValueError(f"Pretrained path not found: {pretrained_path}")
+    
+    # Determine the project root directory
+    if 'experiments' in str(experiment_path):
+        # Extract project root from experiment path
+        project_root = Path(str(experiment_path).split('experiments')[0])
+    else:
+        # Default to current directory if unable to determine project root
+        project_root = Path(os.getcwd())
+    
+    print(f"Using project root: {project_root}")
     
     # Generate timestamp for zip filename
     timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -38,9 +60,13 @@ def create_zip_archive(experiment_path, output_dir="zips"):
         
         # Copy directories to temp directory
         for directory in ["src", "scripts", "shell_scripts"]:
-            if os.path.exists(directory):
-                shutil.copytree(directory, temp_path / directory)
+            src_dir = project_root / directory
+            if src_dir.exists():
+                dst_dir = temp_path / directory
+                shutil.copytree(src_dir, dst_dir)
                 print(f"Added directory: {directory}")
+            else:
+                print(f"Warning: Directory not found: {src_dir}")
         
         # Create experiment directory in temp
         exp_temp_path = temp_path / "experiment"
@@ -82,6 +108,20 @@ def create_zip_archive(experiment_path, output_dir="zips"):
             else:
                 print("Warning: No best weight files found!")
         
+        # Copy pretrained model if path is provided
+        if pretrained_path:
+            pretrained_temp_path = temp_path / "pretrained"
+            
+            if pretrained_path.is_file():
+                # If pretrained_path is a file, copy it directly
+                os.makedirs(pretrained_temp_path, exist_ok=True)
+                shutil.copy2(pretrained_path, pretrained_temp_path)
+                print(f"Added pretrained model file: {pretrained_path.name}")
+            elif pretrained_path.is_dir():
+                # Copy entire directory structure recursively
+                shutil.copytree(pretrained_path, pretrained_temp_path)
+                print(f"Added all pretrained model files from: {pretrained_path}")
+            
         # Create zip archive
         with zipfile.ZipFile(zip_filename, 'w', zipfile.ZIP_DEFLATED) as zipf:
             for root, _, files in os.walk(temp_dir):
@@ -94,14 +134,8 @@ def create_zip_archive(experiment_path, output_dir="zips"):
     return zip_filename
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Create a project export zip with essential files")
-    parser.add_argument("experiment_path", help="Path to the experiment directory")
-    parser.add_argument("--output-dir", default="zips", help="Directory to save the zip file (default: 'zips')")
-    
-    args = parser.parse_args()
-    
     try:
-        zip_path = create_zip_archive(args.experiment_path, args.output_dir)
+        zip_path = create_zip_archive(experiment_path, output_dir, pretrained_path)
         print(f"\nExport complete! Archive saved to: {zip_path}")
     except Exception as e:
         print(f"Error creating export: {e}") 

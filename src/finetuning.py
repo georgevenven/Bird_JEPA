@@ -770,8 +770,6 @@ class Inference:
         bird_classes = self.val_wrapper.unique_labels
 
         for i in tqdm(range(num_samples), desc="processing samples"):
-            if i > 10:
-                break
             spec_tensor, label, label_idx, filenames = self.val_wrapper.next_batch()
 
             if label_idx == -1:
@@ -802,15 +800,15 @@ class Inference:
             for seg_idx, segment_probs in enumerate(probs):
                 # assign a time marker (in seconds) per segment; here each segment represents 5 sec.
                 time_marker = (seg_idx + 1) * 5
-                row_id = f"soundscape_{base_id}_{time_marker}"
+                row_id = f"{base_id}_{time_marker}"
                 row_data = {"row_id": row_id}
                 for cls_idx, class_name in enumerate(bird_classes):
                     row_data[class_name] = segment_probs[cls_idx]
                 rows.append(row_data)
 
         submission_df = pd.DataFrame(rows)
-        submission_df.to_csv("submission.csv", index=False)
-        print("csv file 'submission.csv' populated with predictions for each 5-second segment using actual bird class names")
+        submission_df.to_csv(self.args.submission_csv, index=False)
+        print(f"CSV file '{self.args.submission_csv}' populated with predictions for each 5-second segment using actual bird class names")
 
             
 def main():
@@ -823,8 +821,8 @@ def main():
     parser.add_argument("--val_spec_dir", type=str, help="Directory containing validation spectrograms")
     parser.add_argument("--taxonomy_file", type=str, help="Path to taxonomy file")
     parser.add_argument("--train_csv", type=str, help="Path to training CSV file")
-    parser.add_argument("--output_dir", type=str, help="Directory to save model outputs")
-    parser.add_argument("--pretrained_model_path", type=str, help="Path to pretrained model weights")
+    parser.add_argument("--output_dir", type=str, help="Directory to save model outputs", default=".")
+    parser.add_argument("--pretrained_model_path", type=str, help="Path to pretrained model weights", default=None)
     parser.add_argument("--resume_checkpoint", type=str, help="Path to checkpoint for resuming training")
     parser.add_argument("--freeze_encoder", action="store_true", help="If set, only train the classifier and freeze the encoder weights. By default, both encoder and classifier are trained.")
     parser.add_argument("--learning_rate", type=float, default=1e-4, help="Learning rate")
@@ -839,6 +837,9 @@ def main():
                        help="Metric to use for saving best model (loss or roc_auc)")
     parser.add_argument("--pool_type", type=str, default="mean", choices=["mean", "max"],
                        help="Type of pooling to use in the classifier")
+    parser.add_argument("--submission_csv", type=str, default="submission.csv", 
+                       help="Path to save the inference results CSV")
+    
     
     args = parser.parse_args()
 
