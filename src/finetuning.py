@@ -16,6 +16,9 @@ from sklearn.metrics import roc_auc_score
 import shutil
 from tqdm import tqdm
 import csv 
+import sys
+# func torch
+import torch.nn.functional as F
 
 # Import from project modules
 from model import BirdJEPA
@@ -186,7 +189,7 @@ class BirdCLEFDataWrapper:
             return self.next_batch()
 
 class Classifier(nn.Module):
-    def __init__(self, context_length, num_classes, hidden_dim=128, pool_type='mean'):
+    def __init__(self, context_length, num_classes, hidden_dim=64, pool_type='mean'):
         super(Classifier, self).__init__()
         self.pool_type = pool_type  # 'mean' or 'max'
         
@@ -220,7 +223,7 @@ class Model(nn.Module):
         self.context_length = context_length
         self.num_classes = num_classes
         self.encoder = None
-        self.classifier = Classifier(context_length, num_classes, hidden_dim=128, pool_type=pool_type)
+        self.classifier = Classifier(context_length, num_classes, hidden_dim=64, pool_type=pool_type)
         
         # Load pretrained model if path is provided
         if model_path:
@@ -625,7 +628,7 @@ class Analysis:
         all_labels = []
         all_preds = []
         num_samples = len(self.val_wrapper.dataset)  # Limit to 500 samples for debugging
-        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        device = torch.device("cpu")
         self.model.to(device)
         
         for i in tqdm(range(num_samples), desc="Processing samples"):
@@ -704,47 +707,54 @@ class Analysis:
             f.write(result_str)
             
         print(f"Analysis results saved to {results_path}")
-
 class Inference:
     def __init__(self, args):
         self.args = args
         self.run_dir = Path(args.output_dir)
+        
+        # limit to 2 cores for inference (for xeon env)
+        torch.set_num_threads(2)
+        print("limiting pytorch to 2 cpu cores for inference")
+        
+        # setup logging to console.log file
+        console_log_path = args.console_log
+        self.log_file = open(console_log_path, "w")
+        self.original_stdout = sys.stdout
+        sys.stdout = self.Tee(self.original_stdout, self.log_file)
+        print(f"starting inference mode, logging to {console_log_path}")
+        
         weights_dir = self.run_dir / "weights"
         checkpoint_files = list(weights_dir.glob("best_*_step_*.pt"))
         if not checkpoint_files:
             raise Exception("no best model checkpoint found for analysis")
         
-        # Extract step numbers from filenames and sort by numeric value
+        # sort checkpoints by step number and pick the latest
         def get_step_number(file_path):
             match = re.search(r'step_(\d+)\.pt', str(file_path))
-            if match:
-                return int(match.group(1))  # Convert to integer for numeric sorting
-            return 0
+            return int(match.group(1)) if match else 0
         
-        # Sort by step number, so "5750" will be higher than "750"
         checkpoint_file = sorted(checkpoint_files, key=get_step_number)[-1]
+        print(f"loading model checkpoint from {checkpoint_file}")
         
-        print(f"Loading model checkpoint from {checkpoint_file}")
-        
-        # Load number of classes from training csv
+        # load number of classes from training csv
         self.num_classes = self.load_num_classes(args.train_csv)
         
-        # Create the model first with minimal parameters
+        # create model instance using minimal parameters
         self.model = Model(
-            model_path=args.pretrained_model_path,  # This can be None if loading from checkpoint
+            model_path=args.pretrained_model_path,  # can be None if loading from checkpoint
             context_length=args.context_length,
             num_classes=self.num_classes,
             pool_type=args.pool_type
         )
         
-        # Load the checkpoint weights into the model
+        # force cpu usage by loading checkpoint with map_location
+        print("forcing cpu-only inference mode")
         checkpoint = torch.load(checkpoint_file, map_location="cpu")
         self.model.load_state_dict(checkpoint['model_state_dict'])
-        print(f"Successfully loaded model weights from checkpoint (step {checkpoint.get('step', 'unknown')})")
-        
+        print(f"successfully loaded model weights from checkpoint (step {checkpoint.get('step', 'unknown')})")
         self.model.eval()
         
-        # Create validation dataloader with batch size 1, no shuffle, no custom collate_fn, and non-infinite dataset
+        # create validation dataloader with batch size 1, no shuffle, non-infinite dataset
         self.val_wrapper = BirdCLEFDataWrapper(
             csv_path=args.train_csv,
             data_dir=args.val_spec_dir,
@@ -755,66 +765,115 @@ class Inference:
             shuffle=False
         )
 
+    # tee class to duplicate stdout writes
+    class Tee:
+        def __init__(self, stdout, log_file):
+            self.stdout = stdout
+            self.log_file = log_file
+
+        def write(self, message):
+            self.stdout.write(message)
+            self.log_file.write(message)
+            self.log_file.flush()
+
+        def flush(self):
+            self.stdout.flush()
+            self.log_file.flush()
+
+    def __del__(self):
+        if hasattr(self, 'original_stdout') and hasattr(self, 'log_file'):
+            sys.stdout = self.original_stdout
+            self.log_file.close()
+            print("inference complete, log file closed")
+
     def load_num_classes(self, csv_path):
         df = pd.read_csv(csv_path)
         return len(sorted(df['primary_label'].unique()))
+
+    def get_segments(self, spec_tensor, seg_size=1000):
+        """
+        vectorizes the segmentation of the spectrogram using torch.unfold.
+        assumes spec_tensor is of shape (1, F, T); returns a tensor of shape (num_segments, F, seg_size).
+        """
+        T = spec_tensor.shape[-1]
+        remainder = T % seg_size
+        if remainder:
+            pad_size = seg_size - remainder
+            spec_tensor = F.pad(spec_tensor, (0, pad_size))
+        # after padding, use unfold along the time dimension
+        # spec_tensor shape: (1, F, T_pad); unfolding gives shape (1, F, num_segments, seg_size)
+        segments = spec_tensor.unfold(dimension=-1, size=seg_size, step=seg_size)
+        # rearrange to shape (num_segments, F, seg_size)
+        segments = segments.squeeze(0).permute(1, 0, 2)
+        return segments
 
     def run_analysis(self):
         print("running analysis on validation data")
         rows = []
         num_samples = len(self.val_wrapper.dataset)
-        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        device = torch.device("cpu")
         self.model.to(device)
+        print("using cpu for inference")
         
-        # Get actual bird class names
         bird_classes = self.val_wrapper.unique_labels
+        start_time = time.time()
+        last_log_time = start_time
+        samples_processed = 0
+        
+        # wrap entire processing loop in no_grad for efficiency
+        with torch.no_grad():
+            for i in tqdm(range(num_samples), desc="processing samples"):
+                spec_tensor, label, label_idx, filenames = self.val_wrapper.next_batch()
+                if label_idx == -1:
+                    print(f"warning: missing label for sample {i}, skipping")
+                    continue
 
-        for i in tqdm(range(num_samples), desc="processing samples"):
-            spec_tensor, label, label_idx, filenames = self.val_wrapper.next_batch()
-
-            if label_idx == -1:
-                print(f"warning: missing label for sample {i}, skipping")
-                continue
-
-            segments = []
-            for j in range(0, spec_tensor.shape[-1], 1000):
-                segment = spec_tensor[..., j : j + 1000]
-                if segment.shape[-1] < 1000:
-                    pad_size = 1000 - segment.shape[-1]
-                    pad_tensor = torch.zeros(*segment.shape[:-1], pad_size, device=segment.device)
-                    segment = torch.cat([segment, pad_tensor], dim=-1)
-                segments.append(segment)
-
-            if not segments:
-                continue
-
-            segments = torch.stack(segments, dim=0).squeeze(1)
-            with torch.no_grad():
-                segments = segments.to(device)
-                outputs = self.model(segments)
+                # vectorized segmentation instead of looping in python
+                segments_batch = self.get_segments(spec_tensor, seg_size=1000)
+                segments_batch = segments_batch.to(device)
+                outputs = self.model(segments_batch)
                 probs = torch.sigmoid(outputs).cpu().numpy()
-
-            # split the filename into the identifier and the segment number
-            base_id = filenames[0].split("_segment_")[0]
-
-            for seg_idx, segment_probs in enumerate(probs):
-                # assign a time marker (in seconds) per segment; here each segment represents 5 sec.
-                time_marker = (seg_idx + 1) * 5
-                row_id = f"{base_id}_{time_marker}"
-                row_data = {"row_id": row_id}
-                for cls_idx, class_name in enumerate(bird_classes):
-                    row_data[class_name] = segment_probs[cls_idx]
-                rows.append(row_data)
-
+                
+                base_id = filenames[0].split("_segment_")[0]
+                for seg_idx, segment_probs in enumerate(probs):
+                    time_marker = (seg_idx + 1) * 5  # each segment represents 5 sec
+                    row_id = f"{base_id}_{time_marker}"
+                    row_data = {"row_id": row_id}
+                    # assign predictions for each class
+                    for cls_idx, class_name in enumerate(bird_classes):
+                        row_data[class_name] = segment_probs[cls_idx]
+                    rows.append(row_data)
+                
+                samples_processed += 1
+                current_time = time.time()
+                if current_time - last_log_time > 10:
+                    elapsed = current_time - start_time
+                    samples_per_sec = samples_processed / elapsed
+                    segments_processed = len(rows)
+                    segments_per_sec = segments_processed / elapsed
+                    speed_info = (f"speed stats: {samples_per_sec:.2f} samples/sec, "
+                                  f"{segments_per_sec:.2f} segments/sec, {elapsed:.2f}s total")
+                    print(speed_info)
+                    last_log_time = current_time
+        
+        total_time = time.time() - start_time
+        final_samples_per_sec = samples_processed / total_time
+        final_segments = len(rows)
+        final_segments_per_sec = final_segments / total_time
+        
+        print(f"\nprocessing complete:")
+        print(f"- total time: {total_time:.2f} seconds")
+        print(f"- processed {samples_processed} samples at {final_samples_per_sec:.2f} samples/sec")
+        print(f"- generated {final_segments} segment predictions at {final_segments_per_sec:.2f} segments/sec")
+        
         submission_df = pd.DataFrame(rows)
         submission_df.to_csv(self.args.submission_csv, index=False)
-        print(f"CSV file '{self.args.submission_csv}' populated with predictions for each 5-second segment using actual bird class names")
+        print(f"csv file '{self.args.submission_csv}' populated with predictions for each 5-second segment using actual bird class names") 
 
-            
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--mode", type=str, required=True, choices=["train", "infer", "debug", "analyze"])
-    parser.add_argument("--context_length", type=int, default=1500)
+    parser.add_argument("--context_length", type=int, default=1000)
     
     # Training arguments
     parser.add_argument("--train_spec_dir", type=str, help="Directory containing training spectrograms")
@@ -839,6 +898,8 @@ def main():
                        help="Type of pooling to use in the classifier")
     parser.add_argument("--submission_csv", type=str, default="submission.csv", 
                        help="Path to save the inference results CSV")
+    parser.add_argument("--console_log", type=str, default="console.log",
+                      help="Path to save the console output log file")
     
     
     args = parser.parse_args()

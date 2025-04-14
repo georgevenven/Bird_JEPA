@@ -7,11 +7,15 @@ import tempfile
 import re
 from pathlib import Path
 import datetime
+import torch
+import numpy as np
+import pandas as pd
+from tqdm import tqdm
 
 # Parameters to copy and paste (modify these variables instead of using command line)
-experiment_path = "/home/george-vengrovski/Documents/projects/Bird_JEPA/experiments/BirdJEPA_Run_10k_Finetune"  # Path to the experiment directory
+experiment_path = "/home/george-vengrovski/Documents/projects/Bird_JEPA/experiments/BirdJEPA_Small_Finetune"  # Path to the experiment directory
 output_dir = "/home/george-vengrovski/Documents/projects/Bird_JEPA/zips"  # Directory to save the zip file (default: 'zips')
-pretrained_path = "/home/george-vengrovski/Documents/projects/Bird_JEPA/experiments/BirdJEPA_Untrained_Large_Test"  # Optional: Path to pretrained model directory or file
+pretrained_path = "/home/george-vengrovski/Documents/projects/Bird_JEPA/experiments/BirdJEPA_Small_Untrained"  # Optional: Path to pretrained model directory or file
 
 def create_zip_archive(experiment_path, output_dir="zips", pretrained_path=None):
     """
@@ -132,6 +136,95 @@ def create_zip_archive(experiment_path, output_dir="zips", pretrained_path=None)
     
     print(f"Archive created successfully: {zip_filename}")
     return zip_filename
+
+def run_analysis(self):
+    print("Running analysis with ONNX Runtime optimization")
+    rows = []
+    num_samples = len(self.val_wrapper.dataset)
+    
+    # Convert model to ONNX format (do this once)
+    dummy_input = torch.randn(1, 1, 128, 1000)  # Adjust size to match your model input
+    torch.onnx.export(
+        self.model,
+        dummy_input,
+        "model.onnx",
+        opset_version=12,
+        do_constant_folding=True,
+        input_names=["input"],
+        output_names=["output"]
+    )
+    
+    # Create ONNX Runtime session
+    session_options = ort.SessionOptions()
+    session_options.enable_cpu_mem_arena = True
+    session_options.intra_op_num_threads = 2  # Match your CPU cores
+    session = ort.InferenceSession("model.onnx", session_options)
+    
+    # Process in batches (use args.batch_size passed from command line)
+    batch_size = self.args.batch_size
+    all_segments = []
+    segment_info = []  # Store metadata for each segment
+    
+    # Collect segments
+    for i in tqdm(range(num_samples), desc="Collecting segments"):
+        spec_tensor, label, label_idx, filenames = self.val_wrapper.next_batch()
+        if label_idx == -1 or not filenames:
+            continue
+            
+        for j in range(0, spec_tensor.shape[-1], 1000):
+            segment = spec_tensor[..., j:j+1000]
+            if segment.shape[-1] < 1000:
+                pad_size = 1000 - segment.shape[-1]
+                pad_tensor = torch.zeros(*segment.shape[:-1], pad_size)
+                segment = torch.cat([segment, pad_tensor], dim=-1)
+            
+            base_id = filenames[0].split("_segment_")[0]
+            time_marker = (j // 1000 + 1) * 5
+            
+            all_segments.append(segment)
+            segment_info.append((base_id, time_marker, label_idx))
+            
+            # Process batch when it reaches batch_size
+            if len(all_segments) >= batch_size:
+                self._process_batch_onnx(session, all_segments, segment_info, rows, bird_classes)
+                all_segments = []
+                segment_info = []
+    
+    # Process remaining segments
+    if all_segments:
+        self._process_batch_onnx(session, all_segments, segment_info, rows, bird_classes)
+    
+    # Create submission
+    submission_df = pd.DataFrame(rows)
+    submission_df.to_csv(self.args.submission_csv, index=False)
+    print(f"CSV file '{self.args.submission_csv}' populated with predictions")
+
+def _process_batch_onnx(self, session, segments, segment_info, rows, bird_classes):
+    # Stack segments into a batch
+    batch = torch.stack(segments).numpy()
+    
+    # ONNX Runtime inference
+    ort_inputs = {session.get_inputs()[0].name: batch}
+    ort_outputs = session.run(None, ort_inputs)
+    probs = 1/(1 + np.exp(-ort_outputs[0]))  # sigmoid
+    
+    # Process results
+    for i, (base_id, time_marker, _) in enumerate(segment_info):
+        row_id = f"{base_id}_{time_marker}"
+        row_data = {"row_id": row_id}
+        for cls_idx, class_name in enumerate(bird_classes):
+            row_data[class_name] = probs[i][cls_idx]
+        rows.append(row_data)
+
+if __name__ == "__main__":
+    try:
+        zip_path = create_zip_archive(experiment_path, output_dir, pretrained_path)
+        print(f"\nExport complete! Archive saved to: {zip_path}")
+    except Exception as e:
+        print(f"Error creating export: {e}")
+
+parser = argparse.ArgumentParser(description="Export project")
+parser.add_argument("--use_onnx", action="store_true", help="Use ONNX Runtime for faster inference")
 
 if __name__ == "__main__":
     try:

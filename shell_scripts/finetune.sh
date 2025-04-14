@@ -9,8 +9,8 @@ cd "${SCRIPT_DIR}/.."
 PROJECT_ROOT=$(pwd)
 
 # Create experiment directory
-EXPERIMENT_NAME="experiments/BirdJEPA_Run_10k_Finetune"
-PRETRAINED_MODEL_PATH="experiments/BirdJEPA_Untrained_Large_Test"
+EXPERIMENT_NAME="experiments/BirdJEPA_Small_Finetune"
+PRETRAINED_MODEL_PATH="experiments/BirdJEPA_Small_Untrained"
 DATA_PATH="BirdCLEF"
 
 mkdir -p "$EXPERIMENT_NAME"
@@ -30,15 +30,15 @@ MULTI_THREAD=true
 SONG_DETECTION_JSON_PATH=None
 TEST_PERCENTAGE=20
 
-# don't change
+# # don't change
 TEMP_DIR="./temp"
-TRAIN_FILE_LIST="$TEMP_DIR/train_files.txt"
-TEST_FILE_LIST="$TEMP_DIR/test_files.txt"
-# Define the experiment directory at the beginning
+# TRAIN_FILE_LIST="$TEMP_DIR/train_files.txt"
+# TEST_FILE_LIST="$TEMP_DIR/test_files.txt"
+# # Define the experiment directory at the beginning
 
 EXPERIMENT_DIR="$EXPERIMENT_NAME"
-mkdir -p "$EXPERIMENT_DIR"
-echo "Created experiment directory: $EXPERIMENT_DIR"
+# mkdir -p "$EXPERIMENT_DIR"
+# echo "Created experiment directory: $EXPERIMENT_DIR"
 
 # Define the spectrogram directories for the finetuning script
 TRAIN_SPEC_DIR="$TEMP_DIR/train_dir"
@@ -151,8 +151,8 @@ python3 "${PROJECT_ROOT}/src/finetuning.py" \
     --taxonomy_file "$TAXONOMY_FILE" \
     --train_csv "$TRAIN_CSV" \
     --output_dir "$EXPERIMENT_DIR" \
-    --batch_size 12 \
-    --learning_rate 3e-4 \
+    --batch_size 20 \
+    --learning_rate 5e-4 \
     --max_steps 25000 \
     --early_stopping_patience 50 \
     --save_interval 1000 \
