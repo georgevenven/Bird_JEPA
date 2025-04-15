@@ -5,6 +5,9 @@ import argparse
 import zipfile
 import tempfile
 import re
+import sys
+import platform
+import subprocess
 from pathlib import Path
 import datetime
 import torch
@@ -12,223 +15,208 @@ import numpy as np
 import pandas as pd
 from tqdm import tqdm
 
-# Parameters to copy and paste (modify these variables instead of using command line)
-experiment_path = "/home/george-vengrovski/Documents/projects/Bird_JEPA/experiments/BirdJEPA_Small_Finetune"  # Path to the experiment directory
-output_dir = "/home/george-vengrovski/Documents/projects/Bird_JEPA/zips"  # Directory to save the zip file (default: 'zips')
-pretrained_path = "/home/george-vengrovski/Documents/projects/Bird_JEPA/experiments/BirdJEPA_Small_Untrained"  # Optional: Path to pretrained model directory or file
+# parameters (modify these variables instead of using command line)
+experiment_path = "/home/george-vengrovski/Documents/projects/Bird_JEPA/experiments/BirdJEPA_Small_Finetune"  # experiment directory
+output_dir = "/home/george-vengrovski/Documents/projects/Bird_JEPA/zips"  # where to save zip file
+pretrained_path = "/home/george-vengrovski/Documents/projects/Bird_JEPA/experiments/BirdJEPA_Small_Untrained"  # pretrained model (dir or file)
+download_onnx = False  # download onnxruntime wheel during zipping
 
-def create_zip_archive(experiment_path, output_dir="zips", pretrained_path=None):
+# parameters to target a wheel compatible with offline kaggle (adjust to match kaggle's python/abi)
+target_onnxruntime_version = "1.13.1"
+target_platform_tag = "manylinux2014_x86_64"  # common tag in kaggle env.
+target_python_version = "3.8"              # target python version in kaggle env.
+target_abi_tag = "cp38"                      # corresponding ABI tag
+
+
+def download_onnxruntime(temp_dir):
     """
-    Create a zip archive of the project including src, scripts, shell_scripts directories
-    and the specified experiment with only the best weights.
+    download the onnxruntime wheel using pip download,
+    forcing a target platform (kaggle offline env) by setting:
+      --platform target_platform_tag
+      --python-version target_python_version
+      --abi target_abi_tag
+    this is intended to run in an environment with internet access.
+    """
+    download_dir = os.path.join(temp_dir, "temp_download")
+    os.makedirs(download_dir, exist_ok=True)
     
-    Args:
-        experiment_path (str): Path to the experiment directory
-        output_dir (str): Directory to save the zip file
-        pretrained_path (str, optional): Path to the pretrained model directory
+    print("downloading onnxruntime wheel using pip...")
+    cmd = [
+        sys.executable, "-m", "pip", "download",
+        f"onnxruntime=={target_onnxruntime_version}",  # pinned version
+        "--no-deps",
+        "-d", download_dir,
+        "--platform", target_platform_tag,
+        "--python-version", target_python_version,
+        "--abi", target_abi_tag,
+        "--only-binary", ":all:"
+    ]
+    try:
+        subprocess.run(cmd, check=True, capture_output=True, text=True)
+    except subprocess.CalledProcessError as e:
+        raise RuntimeError(f"failed to download onnxruntime:\nstdout: {e.stdout}\nstderr: {e.stderr}")
+    
+    wheel_files = [f for f in os.listdir(download_dir) if f.endswith('.whl') and 'onnxruntime' in f]
+    if not wheel_files:
+        raise RuntimeError("no onnxruntime wheel file found after pip download.")
+    
+    wheel_file = os.path.join(download_dir, wheel_files[0])
+    dest_file = os.path.join(temp_dir, wheel_files[0])
+    shutil.copy2(wheel_file, dest_file)
+    print(f"downloaded onnxruntime wheel: {os.path.basename(dest_file)}")
+    return dest_file
+
+def create_zip_archive(experiment_path, output_dir="zips", pretrained_path=None, onnx_wheel_path=None, download_onnx=False):
     """
-    # Create output directory if it doesn't exist
+    create a zip archive of the project including source directories and experiment files,
+    and include the onnxruntime wheel downloaded during the zipping process.
+    the resulting archive is designed for offline kaggle use.
+    """
     os.makedirs(output_dir, exist_ok=True)
     
-    # Ensure experiment path exists
     experiment_path = Path(experiment_path)
     if not experiment_path.exists():
-        raise ValueError(f"Experiment path not found: {experiment_path}")
+        raise ValueError(f"experiment path not found: {experiment_path}")
     
-    # Check pretrained path if provided
     if pretrained_path:
         pretrained_path = Path(pretrained_path)
         if not pretrained_path.exists():
-            raise ValueError(f"Pretrained path not found: {pretrained_path}")
+            raise ValueError(f"pretrained path not found: {pretrained_path}")
     
-    # Determine the project root directory
+    if onnx_wheel_path and not download_onnx:
+        onnx_wheel_path = Path(onnx_wheel_path)
+        if not onnx_wheel_path.exists():
+            raise ValueError(f"onnx wheel file not found: {onnx_wheel_path}")
+    
+    # determine project root from experiment path if possible
     if 'experiments' in str(experiment_path):
-        # Extract project root from experiment path
         project_root = Path(str(experiment_path).split('experiments')[0])
     else:
-        # Default to current directory if unable to determine project root
         project_root = Path(os.getcwd())
     
-    print(f"Using project root: {project_root}")
+    print(f"using project root: {project_root}")
     
-    # Generate timestamp for zip filename
     timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
     experiment_name = experiment_path.name
     zip_filename = f"{output_dir}/{experiment_name}_{timestamp}.zip"
+    print(f"creating archive: {zip_filename}")
     
-    print(f"Creating archive: {zip_filename}")
-    
-    # Create temporary directory for staging files
     with tempfile.TemporaryDirectory() as temp_dir:
         temp_path = Path(temp_dir)
         
-        # Copy directories to temp directory
+        # copy source directories
         for directory in ["src", "scripts", "shell_scripts"]:
             src_dir = project_root / directory
             if src_dir.exists():
                 dst_dir = temp_path / directory
                 shutil.copytree(src_dir, dst_dir)
-                print(f"Added directory: {directory}")
+                print(f"added directory: {directory}")
             else:
-                print(f"Warning: Directory not found: {src_dir}")
+                print(f"warning: directory not found: {src_dir}")
         
-        # Create experiment directory in temp
+        # create experiment folder for configs, plots, weights etc.
         exp_temp_path = temp_path / "experiment"
         os.makedirs(exp_temp_path, exist_ok=True)
         
-        # Copy experiment config files
+        # copy experiment config files and plots
         for file in experiment_path.glob("*.json"):
             shutil.copy2(file, exp_temp_path)
-            print(f"Added config file: {file.name}")
-            
-        # Copy experiment plots
+            print(f"added config file: {file.name}")
         for file in experiment_path.glob("*.png"):
             shutil.copy2(file, exp_temp_path)
-            print(f"Added plot: {file.name}")
+            print(f"added plot: {file.name}")
         
-        # Find and copy only the best weights
+        # include only best weight file if available
         weights_dir = experiment_path / "weights"
         if weights_dir.exists():
             exp_weights_dir = exp_temp_path / "weights"
             os.makedirs(exp_weights_dir, exist_ok=True)
             
-            # Find best weights (files with "best_" prefix)
             best_weight_files = list(weights_dir.glob("best_*_step_*.pt"))
-            
             if best_weight_files:
-                # Extract step numbers from filenames and sort by numeric value
                 def get_step_number(file_path):
                     match = re.search(r'step_(\d+)\.pt', str(file_path))
-                    if match:
-                        return int(match.group(1))
-                    return 0
-                
-                # Get the best weight file with the highest step number
+                    return int(match.group(1)) if match else 0
                 best_weight_file = sorted(best_weight_files, key=get_step_number)[-1]
-                
-                # Copy the best weight file
                 shutil.copy2(best_weight_file, exp_weights_dir)
-                print(f"Added best weight file: {best_weight_file.name}")
+                print(f"added best weight file: {best_weight_file.name}")
             else:
-                print("Warning: No best weight files found!")
+                print("warning: no best weight files found!")
         
-        # Copy pretrained model if path is provided
+        # include pretrained model if provided
         if pretrained_path:
             pretrained_temp_path = temp_path / "pretrained"
-            
             if pretrained_path.is_file():
-                # If pretrained_path is a file, copy it directly
                 os.makedirs(pretrained_temp_path, exist_ok=True)
                 shutil.copy2(pretrained_path, pretrained_temp_path)
-                print(f"Added pretrained model file: {pretrained_path.name}")
+                print(f"added pretrained model file: {pretrained_path.name}")
             elif pretrained_path.is_dir():
-                # Copy entire directory structure recursively
                 shutil.copytree(pretrained_path, pretrained_temp_path)
-                print(f"Added all pretrained model files from: {pretrained_path}")
-            
-        # Create zip archive
+                print(f"added pretrained model files from: {pretrained_path}")
+        
+        # create dependencies folder and download onnxruntime wheel if enabled
+        deps_dir = temp_path / "dependencies"
+        os.makedirs(deps_dir, exist_ok=True)
+        
+        if download_onnx:
+            downloaded_wheel = download_onnxruntime(deps_dir)
+            if downloaded_wheel:
+                onnx_wheel_path = downloaded_wheel
+        
+        # create installation script for onnxruntime (using the local wheel)
+        install_script = deps_dir / "install_dependencies.sh"
+        with open(install_script, 'w') as f:
+            f.write("#!/bin/bash\n\n")
+            f.write("# function to check if onnxruntime is installed\n")
+            f.write("check_onnx() {\n")
+            f.write("    python -c \"import onnxruntime\" 2>/dev/null\n")
+            f.write("    return $?\n")
+            f.write("}\n\n")
+            f.write("SCRIPT_DIR=\"$(cd \"$(dirname \"${BASH_SOURCE[0]}\")\" && pwd)\"\n\n")
+            f.write("if check_onnx; then\n")
+            f.write("    echo 'onnxruntime is already installed'\n")
+            f.write("else\n")
+            f.write("    echo 'installing onnxruntime from local wheel...'\n")
+            f.write("    WHEEL_FILE=$(find \"$SCRIPT_DIR\" -name \"onnxruntime*.whl\" | head -n 1)\n")
+            f.write("    if [ -n \"$WHEEL_FILE\" ]; then\n")
+            f.write("        echo \"installing from local wheel: $(basename \"$WHEEL_FILE\")\"\n")
+            f.write("        pip install \"$WHEEL_FILE\"\n")
+            f.write("    else\n")
+            f.write("        echo 'no onnxruntime wheel found in dependencies'\n")
+            f.write("    fi\n")
+            f.write("    if check_onnx; then\n")
+            f.write("        echo 'onnxruntime installation verified'\n")
+            f.write("    else\n")
+            f.write("        echo 'warning: onnxruntime installation failed'\n")
+            f.write("    fi\n")
+            f.write("fi\n")
+        os.chmod(install_script, 0o755)
+        print("added installation script: install_dependencies.sh")
+        
+        # create the zip archive
         with zipfile.ZipFile(zip_filename, 'w', zipfile.ZIP_DEFLATED) as zipf:
-            for root, _, files in os.walk(temp_dir):
+            for root, _, files in os.walk(temp_path):
                 for file in files:
                     file_path = os.path.join(root, file)
                     arcname = os.path.relpath(file_path, temp_dir)
                     zipf.write(file_path, arcname)
     
-    print(f"Archive created successfully: {zip_filename}")
+    print(f"archive created successfully: {zip_filename}")
     return zip_filename
 
-def run_analysis(self):
-    print("Running analysis with ONNX Runtime optimization")
-    rows = []
-    num_samples = len(self.val_wrapper.dataset)
-    
-    # Convert model to ONNX format (do this once)
-    dummy_input = torch.randn(1, 1, 128, 1000)  # Adjust size to match your model input
-    torch.onnx.export(
-        self.model,
-        dummy_input,
-        "model.onnx",
-        opset_version=12,
-        do_constant_folding=True,
-        input_names=["input"],
-        output_names=["output"]
-    )
-    
-    # Create ONNX Runtime session
-    session_options = ort.SessionOptions()
-    session_options.enable_cpu_mem_arena = True
-    session_options.intra_op_num_threads = 2  # Match your CPU cores
-    session = ort.InferenceSession("model.onnx", session_options)
-    
-    # Process in batches (use args.batch_size passed from command line)
-    batch_size = self.args.batch_size
-    all_segments = []
-    segment_info = []  # Store metadata for each segment
-    
-    # Collect segments
-    for i in tqdm(range(num_samples), desc="Collecting segments"):
-        spec_tensor, label, label_idx, filenames = self.val_wrapper.next_batch()
-        if label_idx == -1 or not filenames:
-            continue
-            
-        for j in range(0, spec_tensor.shape[-1], 1000):
-            segment = spec_tensor[..., j:j+1000]
-            if segment.shape[-1] < 1000:
-                pad_size = 1000 - segment.shape[-1]
-                pad_tensor = torch.zeros(*segment.shape[:-1], pad_size)
-                segment = torch.cat([segment, pad_tensor], dim=-1)
-            
-            base_id = filenames[0].split("_segment_")[0]
-            time_marker = (j // 1000 + 1) * 5
-            
-            all_segments.append(segment)
-            segment_info.append((base_id, time_marker, label_idx))
-            
-            # Process batch when it reaches batch_size
-            if len(all_segments) >= batch_size:
-                self._process_batch_onnx(session, all_segments, segment_info, rows, bird_classes)
-                all_segments = []
-                segment_info = []
-    
-    # Process remaining segments
-    if all_segments:
-        self._process_batch_onnx(session, all_segments, segment_info, rows, bird_classes)
-    
-    # Create submission
-    submission_df = pd.DataFrame(rows)
-    submission_df.to_csv(self.args.submission_csv, index=False)
-    print(f"CSV file '{self.args.submission_csv}' populated with predictions")
-
-def _process_batch_onnx(self, session, segments, segment_info, rows, bird_classes):
-    # Stack segments into a batch
-    batch = torch.stack(segments).numpy()
-    
-    # ONNX Runtime inference
-    ort_inputs = {session.get_inputs()[0].name: batch}
-    ort_outputs = session.run(None, ort_inputs)
-    probs = 1/(1 + np.exp(-ort_outputs[0]))  # sigmoid
-    
-    # Process results
-    for i, (base_id, time_marker, _) in enumerate(segment_info):
-        row_id = f"{base_id}_{time_marker}"
-        row_data = {"row_id": row_id}
-        for cls_idx, class_name in enumerate(bird_classes):
-            row_data[class_name] = probs[i][cls_idx]
-        rows.append(row_data)
-
 if __name__ == "__main__":
+    parser = argparse.ArgumentParser(description="export project with onnxruntime dependency for offline kaggle use")
+    parser.add_argument("--onnx_wheel", type=str, help="local path to onnxruntime wheel to include")
+    parser.add_argument("--download_onnx", action="store_true", help="download onnxruntime wheel during zipping")
+    args, unknown = parser.parse_known_args()
+    
+    wheel_path = args.onnx_wheel if args.onnx_wheel else None
+    should_download = args.download_onnx if args.download_onnx else download_onnx
+    
     try:
-        zip_path = create_zip_archive(experiment_path, output_dir, pretrained_path)
-        print(f"\nExport complete! Archive saved to: {zip_path}")
+        zip_path = create_zip_archive(experiment_path, output_dir, pretrained_path, wheel_path, should_download)
+        print(f"\nexport complete! archive saved to: {zip_path}")
+        print("\nto install dependencies on kaggle, add this to a notebook cell:")
+        print("  !bash /kaggle/input/your-dataset-name/dependencies/install_dependencies.sh")
     except Exception as e:
-        print(f"Error creating export: {e}")
-
-parser = argparse.ArgumentParser(description="Export project")
-parser.add_argument("--use_onnx", action="store_true", help="Use ONNX Runtime for faster inference")
-
-if __name__ == "__main__":
-    try:
-        zip_path = create_zip_archive(experiment_path, output_dir, pretrained_path)
-        print(f"\nExport complete! Archive saved to: {zip_path}")
-    except Exception as e:
-        print(f"Error creating export: {e}") 
+        print(f"error creating export: {e}")

@@ -162,14 +162,14 @@ class BirdCLEF_ConvolutionalFeatureExtractor(nn.Module):
         self.conv1 = nn.Conv2d(in_channels, 32, kernel_size=(3,3), stride=(2,1), padding=(1,1))
         self.bn1 = nn.BatchNorm2d(32)
 
-        self.conv2 = nn.Conv2d(32, 64, kernel_size=(5,5), stride=(2,1), padding=(2,2))
-        self.bn2 = nn.BatchNorm2d(64)
+        self.conv2 = nn.Conv2d(32, 32, kernel_size=(5,5), stride=(2,1), padding=(2,2))
+        self.bn2 = nn.BatchNorm2d(32)
 
-        self.conv3 = nn.Conv2d(64, 128, kernel_size=(7,7), stride=(2,1), padding=(3,3))
-        self.bn3 = nn.BatchNorm2d(128)
+        self.conv3 = nn.Conv2d(32, 32, kernel_size=(7,7), stride=(2,1), padding=(3,3))
+        self.bn3 = nn.BatchNorm2d(32)
 
-        self.conv4 = nn.Conv2d(128, 128, kernel_size=(7,7), stride=(2,1), padding=(3,3))
-        self.bn4 = nn.BatchNorm2d(128)
+        self.conv4 = nn.Conv2d(32, 32, kernel_size=(7,7), stride=(2,1), padding=(3,3))
+        self.bn4 = nn.BatchNorm2d(32)
 
     def forward(self, x):
         # x shape: (B, 1, F, T)
@@ -447,11 +447,66 @@ class BirdJEPA(nn.Module):
         self.ema_updater = EMA(0.95)
         self.ema_m = 0.95
 
+        # Count and print parameters for different components
+        self._count_parameters(max_seq_len, blocks_config)
+
         if self.debug:
             context_trainable = sum(p.numel() for p in self.context_encoder.parameters() if p.requires_grad)
             decoder_trainable = sum(p.numel() for p in self.decoder.parameters() if p.requires_grad)
             print(f"[BirdJEPA] context encoder trainable params: {context_trainable}")
             print(f"[BirdJEPA] decoder trainable params: {decoder_trainable}")
+
+    def _count_parameters(self, max_seq_len, blocks_config):
+        # Count parameters in convolutional layers
+        conv_params = 0
+        for name, module in self.context_encoder.feature_extractor.named_modules():
+            if isinstance(module, nn.Conv2d):
+                layer_params = sum(p.numel() for p in module.parameters())
+                conv_params += layer_params
+                print(f"Conv layer {name}: {layer_params} parameters")
+        print(f"Total convolutional parameters: {conv_params}")
+
+        # Count parameters in transformer encoders
+        if not blocks_config:
+            blocks_config = [
+                {"type": "local", "window_size": 8},
+                {"type": "global", "stride": 100}
+            ]
+        
+        transformer_params = 0
+        attention_tokens = 0
+        
+        for i, block_config in enumerate(blocks_config):
+            block = self.context_encoder.attention_blocks[i]
+            block_params = sum(p.numel() for p in block.parameters())
+            transformer_params += block_params
+            
+            if block_config["type"] == "local":
+                window_size = block_config["window_size"]
+                # For each position, it attends to 2*window_size+1 tokens (itself + window_size on each side)
+                local_attention = (2 * window_size + 1) * max_seq_len
+                print(f"Local attention block {i}: {block_params} parameters, each token attends to {2*window_size+1} tokens")
+                print(f"Total attention connections in block {i}: {local_attention}")
+                attention_tokens += local_attention
+            
+            elif block_config["type"] == "global":
+                stride = block_config["stride"]
+                # Calculate global attention tokens
+                global_positions = max_seq_len // stride
+                if max_seq_len % stride != 0:
+                    global_positions += 1
+                # Global tokens attend to all tokens, others only to themselves
+                global_attention = global_positions * max_seq_len + (max_seq_len - global_positions)
+                print(f"Global attention block {i}: {block_params} parameters, {global_positions} tokens with global attention")
+                print(f"Total attention connections in block {i}: {global_attention}")
+                attention_tokens += global_attention
+        
+        print(f"Total transformer parameters: {transformer_params}")
+        print(f"Total attention connections across all blocks: {attention_tokens}")
+        
+        # Total model parameters
+        total_params = sum(p.numel() for p in self.parameters())
+        print(f"Total model parameters: {total_params}")
 
     @torch.no_grad()
     def update_ema(self):

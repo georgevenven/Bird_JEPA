@@ -34,7 +34,7 @@ fi
 # Format: "type:param,type:param,..." where type is "local" or "global"
 # For local blocks, param is window size
 # For global blocks, param is stride
-ARCHITECTURE="local:8,global:100,local:16,global:50"
+ARCHITECTURE="local:8,global:100,local:16,global:50,local:16,global:50"
 
 # Import statement for block classes (add to trainer.py)
 python_import="from model import LocalAttentionBlock, GlobalAttentionBlock"

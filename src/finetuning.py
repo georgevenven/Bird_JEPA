@@ -19,6 +19,9 @@ import csv
 import sys
 # func torch
 import torch.nn.functional as F
+import onnxruntime as ort
+import onnx
+from onnxruntime.quantization import quantize_dynamic, QuantType
 
 # Import from project modules
 from model import BirdJEPA
@@ -707,14 +710,15 @@ class Analysis:
             f.write(result_str)
             
         print(f"Analysis results saved to {results_path}")
+
 class Inference:
     def __init__(self, args):
         self.args = args
         self.run_dir = Path(args.output_dir)
         
-        # limit to 2 cores for inference (for xeon env)
-        torch.set_num_threads(2)
-        print("limiting pytorch to 2 cpu cores for inference")
+        # limit to 4 cores for inference (for AMD EPYC env)
+        torch.set_num_threads(4)
+        print("limiting pytorch to 4 cpu cores for inference")
         
         # setup logging to console.log file
         console_log_path = args.console_log
@@ -748,11 +752,33 @@ class Inference:
         )
         
         # force cpu usage by loading checkpoint with map_location
-        print("forcing cpu-only inference mode")
+        print("loading checkpoint for ONNX export")
         checkpoint = torch.load(checkpoint_file, map_location="cpu")
         self.model.load_state_dict(checkpoint['model_state_dict'])
         print(f"successfully loaded model weights from checkpoint (step {checkpoint.get('step', 'unknown')})")
         self.model.eval()
+        
+        # Export the model to ONNX format
+        print("Exporting model to ONNX format")
+        onnx_path = Path(self.args.onnx_model_path) if self.args.onnx_model_path else self.run_dir / "model.onnx"
+        self.export_to_onnx(self.model, onnx_path)
+        
+        # Initialize ONNX runtime session
+        print(f"Initializing ONNX runtime session from {onnx_path}")
+        # Configure ONNX runtime session options for optimal CPU performance
+        sess_options = ort.SessionOptions()
+        sess_options.graph_optimization_level = ort.GraphOptimizationLevel.ORT_ENABLE_ALL
+        sess_options.intra_op_num_threads = 4   # set threads to match core count
+        sess_options.inter_op_num_threads = 4
+
+        # Enable parallel execution mode
+        sess_options.execution_mode = ort.ExecutionMode.ORT_PARALLEL
+        
+        # Enable profiling
+        sess_options.enable_profiling = True
+
+        self.ort_session = ort.InferenceSession(str(onnx_path), sess_options=sess_options, providers=['CPUExecutionProvider'])
+        print("ONNX runtime session initialized with optimized CPU settings")
         
         # create validation dataloader with batch size 1, no shuffle, non-infinite dataset
         self.val_wrapper = BirdCLEFDataWrapper(
@@ -764,6 +790,49 @@ class Inference:
             collate_fn=None,
             shuffle=False
         )
+
+    def export_to_onnx(self, model, onnx_path):
+        """Export PyTorch model to ONNX format."""
+        # Create dummy input of shape [batch_size, freq, time]
+        # Assuming freq dimension is 64, time dimension is 1000
+        dummy_input = torch.randn(1, 513, 1000, dtype=torch.float32)
+        
+        # Export model to ONNX
+        torch.onnx.export(
+            model,
+            dummy_input,
+            onnx_path,
+            input_names=["input"],
+            output_names=["output"],
+            opset_version=13,
+            do_constant_folding=True,
+            dynamic_axes={
+                'input': {0: 'batch_size'},
+                'output': {0: 'batch_size'}
+            }
+        )
+        
+        # Verify the ONNX model
+        onnx_model = onnx.load(onnx_path)
+        onnx.checker.check_model(onnx_model)
+        print(f"Exported ONNX model to {onnx_path}")
+        
+        # Quantize the model to INT8
+        quantized_path = str(onnx_path).replace(".onnx", "_quantized.onnx")
+        try:
+            print(f"Applying INT8 quantization to model...")
+            quantize_dynamic(str(onnx_path), quantized_path, weight_type=QuantType.QInt8)
+            print(f"Quantized model saved to {quantized_path}")
+            
+            # Use the quantized model instead of the original one
+            if os.path.exists(quantized_path):
+                onnx_path = quantized_path
+                print(f"Using quantized model for inference")
+            else:
+                print(f"Quantization failed, using original model")
+        except Exception as e:
+            print(f"Quantization error: {e}")
+            print(f"Continuing with original model")
 
     # tee class to duplicate stdout writes
     class Tee:
@@ -808,53 +877,60 @@ class Inference:
         return segments
 
     def run_analysis(self):
-        print("running analysis on validation data")
+        print("running ONNX inference analysis on validation data")
         rows = []
         num_samples = len(self.val_wrapper.dataset)
-        device = torch.device("cpu")
-        self.model.to(device)
-        print("using cpu for inference")
+        print("using ONNX runtime for inference")
+        
+        # Accumulate segments to run in a larger batch
+        segment_batch_accumulator = []
+        filenames_accumulator = []
+        BATCH_SIZE_FOR_INFER = self.args.batch_size  # Use batch size from args
         
         bird_classes = self.val_wrapper.unique_labels
         start_time = time.time()
         last_log_time = start_time
         samples_processed = 0
         
-        # wrap entire processing loop in no_grad for efficiency
-        with torch.no_grad():
-            for i in tqdm(range(num_samples), desc="processing samples"):
-                spec_tensor, label, label_idx, filenames = self.val_wrapper.next_batch()
-                if label_idx == -1:
-                    print(f"warning: missing label for sample {i}, skipping")
-                    continue
+        # Get input and output names from ONNX model
+        input_name = self.ort_session.get_inputs()[0].name
+        
+        for i in tqdm(range(num_samples), desc="processing samples"):
+            spec_tensor, label, label_idx, filenames = self.val_wrapper.next_batch()
+            if label_idx == -1:
+                print(f"warning: missing label for sample {i}, skipping")
+                continue
 
-                # vectorized segmentation instead of looping in python
-                segments_batch = self.get_segments(spec_tensor, seg_size=1000)
-                segments_batch = segments_batch.to(device)
-                outputs = self.model(segments_batch)
-                probs = torch.sigmoid(outputs).cpu().numpy()
-                
-                base_id = filenames[0].split("_segment_")[0]
-                for seg_idx, segment_probs in enumerate(probs):
-                    time_marker = (seg_idx + 1) * 5  # each segment represents 5 sec
-                    row_id = f"{base_id}_{time_marker}"
-                    row_data = {"row_id": row_id}
-                    # assign predictions for each class
-                    for cls_idx, class_name in enumerate(bird_classes):
-                        row_data[class_name] = segment_probs[cls_idx]
-                    rows.append(row_data)
-                
-                samples_processed += 1
-                current_time = time.time()
-                if current_time - last_log_time > 10:
-                    elapsed = current_time - start_time
-                    samples_per_sec = samples_processed / elapsed
-                    segments_processed = len(rows)
-                    segments_per_sec = segments_processed / elapsed
-                    speed_info = (f"speed stats: {samples_per_sec:.2f} samples/sec, "
-                                  f"{segments_per_sec:.2f} segments/sec, {elapsed:.2f}s total")
-                    print(speed_info)
-                    last_log_time = current_time
+            # vectorized segmentation instead of looping in python
+            segments_batch = self.get_segments(spec_tensor, seg_size=1000)
+            
+            # Accumulate segments and filenames
+            segment_batch_accumulator.append(segments_batch)
+            filenames_accumulator.append(filenames)
+            
+            # If we've reached BATCH_SIZE_FOR_INFER samples, do a single inference call
+            if len(segment_batch_accumulator) >= BATCH_SIZE_FOR_INFER:
+                # Process the accumulated batch
+                self._process_batch(segment_batch_accumulator, filenames_accumulator, input_name, bird_classes, rows)
+                # Clear accumulators
+                segment_batch_accumulator = []
+                filenames_accumulator = []
+            
+            samples_processed += 1
+            current_time = time.time()
+            if current_time - last_log_time > 10:
+                elapsed = current_time - start_time
+                samples_per_sec = samples_processed / elapsed
+                segments_processed = len(rows)
+                segments_per_sec = segments_processed / elapsed
+                speed_info = (f"speed stats: {samples_per_sec:.2f} samples/sec, "
+                              f"{segments_per_sec:.2f} segments/sec, {elapsed:.2f}s total")
+                print(speed_info)
+                last_log_time = current_time
+        
+        # Process any remaining samples in the batch
+        if segment_batch_accumulator:
+            self._process_batch(segment_batch_accumulator, filenames_accumulator, input_name, bird_classes, rows)
         
         total_time = time.time() - start_time
         final_samples_per_sec = samples_processed / total_time
@@ -869,6 +945,61 @@ class Inference:
         submission_df = pd.DataFrame(rows)
         submission_df.to_csv(self.args.submission_csv, index=False)
         print(f"csv file '{self.args.submission_csv}' populated with predictions for each 5-second segment using actual bird class names") 
+        
+        # End profiling and save profile file in the same directory as the ONNX model
+        onnx_dir = os.path.dirname(os.path.abspath(self.args.onnx_model_path if self.args.onnx_model_path else os.path.join(self.run_dir, "model.onnx")))
+        profile_file = self.ort_session.end_profiling()
+        
+        # Copy profile file to the same directory as the ONNX model if it's not already there
+        if os.path.dirname(profile_file) != onnx_dir:
+            profile_filename = os.path.basename(profile_file)
+            new_profile_path = os.path.join(onnx_dir, profile_filename)
+            shutil.copy(profile_file, new_profile_path)
+            print(f"ONNX Runtime profiling results copied to {new_profile_path}")
+        else:
+            print(f"ONNX Runtime profiling results saved to {profile_file}")
+
+    def _process_batch(self, segment_batch_accumulator, filenames_accumulator, input_name, bird_classes, rows):
+        """Process a batch of accumulated segments with a single ONNX inference call."""
+        # Flatten all segments into a single batch
+        all_segments = []
+        segment_counts = []
+        
+        for segments in segment_batch_accumulator:
+            all_segments.append(segments)
+            segment_counts.append(segments.size(0))
+        
+        # Concatenate all segments into a single batch
+        combined_batch = torch.cat(all_segments, dim=0)
+        
+        # Convert to numpy for ONNX runtime
+        input_np = combined_batch.cpu().numpy().astype(np.float32)
+        
+        # Run ONNX inference on the combined batch
+        ort_outputs = self.ort_session.run(None, {input_name: input_np})
+        
+        # Convert outputs back to PyTorch tensor and apply sigmoid
+        outputs = torch.from_numpy(ort_outputs[0])
+        probs_all = torch.sigmoid(outputs).numpy()
+        
+        # Process results for each file
+        offset = 0
+        for j, (segments, filenames) in enumerate(zip(segment_batch_accumulator, filenames_accumulator)):
+            # Get the predictions for this file
+            seg_count = segment_counts[j]
+            file_probs = probs_all[offset:offset+seg_count]
+            offset += seg_count
+            
+            # Create rows for each segment
+            base_id = filenames[0].split("_segment_")[0]
+            for seg_idx, segment_probs in enumerate(file_probs):
+                time_marker = (seg_idx + 1) * 5  # each segment represents 5 sec
+                row_id = f"{base_id}_{time_marker}"
+                row_data = {"row_id": row_id}
+                # assign predictions for each class
+                for cls_idx, class_name in enumerate(bird_classes):
+                    row_data[class_name] = segment_probs[cls_idx]
+                rows.append(row_data)
 
 def main():
     parser = argparse.ArgumentParser()
@@ -900,6 +1031,8 @@ def main():
                        help="Path to save the inference results CSV")
     parser.add_argument("--console_log", type=str, default="console.log",
                       help="Path to save the console output log file")
+    parser.add_argument("--onnx_model_path", type=str, default=None,
+                      help="Path to save the ONNX model file (defaults to output_dir/model.onnx)")
     
     
     args = parser.parse_args()
