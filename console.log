@@ -1,6 +1,26 @@
 starting inference mode, logging to console.log
-loading model checkpoint from experiments/BirdJEPA_Small_Finetune/weights/best_loss_step_5750.pt
+loading model checkpoint from experiments/BirdJEPA_Small_Finetune/weights/best_loss_step_2750.pt
 Loading pretrained encoder from experiments/BirdJEPA_Small_Untrained
+Conv layer conv1: 320 parameters
+Conv layer conv2: 25632 parameters
+Conv layer conv3: 50208 parameters
+Conv layer conv4: 50208 parameters
+Total convolutional parameters: 126368
+Local attention block 0: 83008 parameters, each token attends to 17 tokens
+Total attention connections in block 0: 17000
+Global attention block 1: 83008 parameters, 10 tokens with global attention
+Total attention connections in block 1: 10990
+Local attention block 2: 83008 parameters, each token attends to 33 tokens
+Total attention connections in block 2: 33000
+Global attention block 3: 83008 parameters, 20 tokens with global attention
+Total attention connections in block 3: 20980
+Local attention block 4: 83008 parameters, each token attends to 33 tokens
+Total attention connections in block 4: 33000
+Global attention block 5: 83008 parameters, 20 tokens with global attention
+Total attention connections in block 5: 20980
+Total transformer parameters: 498048
+Total attention connections across all blocks: 135950
+Total model parameters: 1554753
 
 Loaded checkpoint details:
 Path: experiments/BirdJEPA_Small_Untrained/saved_weights/checkpoint_0.pt
@@ -9,15 +29,4 @@ Encoder optimizer state included: Yes
 Predictor optimizer state included: Yes
 Decoder optimizer state included: Yes
 Model initialized with context_length=1000, num_classes=206, pooling=mean
-forcing cpu-only inference mode
-successfully loaded model weights from checkpoint (step 5750)
-Created mapping for 28552 files
-Initializing dataset from ./temp/test_dir
-Dataset initialized with 5712 samples
-running analysis on validation data
-using cpu for inference
-speed stats: 0.29 samples/sec, 1.78 segments/sec, 17.38s total
-speed stats: 0.21 samples/sec, 1.76 segments/sec, 33.54s total
-speed stats: 0.20 samples/sec, 1.74 segments/sec, 44.88s total
-speed stats: 0.24 samples/sec, 1.74 segments/sec, 62.22s total
-speed stats: 0.26 samples/sec, 1.73 segments/sec, 77.96s total
+loading checkpoint for ONNX export

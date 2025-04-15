@@ -406,7 +406,7 @@ def main():
     parser.add_argument('--dst_dir', type=str, required=True, help='Destination directory to save spectrograms.')
     parser.add_argument('--song_detection_json_path', type=str, default=None,
                         help='Path to the JSON file with song detection data.')
-    parser.add_argument('--step_size', type=int, default=119, help='Hop length for the spectrogram.')
+    parser.add_argument('--step_size', type=int, default=160, help='Hop length for the spectrogram.')
     parser.add_argument('--nfft', type=int, default=1024, help='FFT size for the spectrogram.')
     parser.add_argument('--generate_random_files_number', type=int, default=None,
                         help='Number of random files to process.')

@@ -145,7 +145,7 @@ python3 src/spectrogram_generator.py \
 # Run baseline training, TRAIN CSV: this is for both train and val
 echo "Running finetuning with pre-generated spectrograms..."
 python3 "${PROJECT_ROOT}/src/finetuning.py" \
-    --mode infer \
+    --mode train \
     --train_spec_dir "$TRAIN_SPEC_DIR" \
     --val_spec_dir "$VAL_SPEC_DIR" \
     --taxonomy_file "$TAXONOMY_FILE" \

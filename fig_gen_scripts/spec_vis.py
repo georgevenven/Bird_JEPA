@@ -2,8 +2,10 @@ import numpy as np
 import matplotlib.pyplot as plt
 
 # Load the spectrogram data from npz file
-data = np.load('/tempin_dir/A06195_segment_0.npz')
+data = np.load('/home/george-vengrovski/Downloads/XC173760_segment_0.npz')
 spectrogram = data['s']  # Access the 's' array
+
+print(spectrogram.shape)
 
 # Crop the spectrogram as specified
 spectrogram = spectrogram[10:216, :]
