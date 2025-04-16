@@ -252,7 +252,7 @@ class WavtoSpec:
                                min_timebins=25, save_npz=True):
         try:
             # Use librosa to load audio instead of soundfile (handles both WAV and MP3)
-            data, samplerate = librosa.load(file_path, sr=None, mono=True)
+            data, samplerate = librosa.load(file_path, sr=32000, mono=True)
             
             # Check duration
             length_in_ms = (len(data) / samplerate) * 1000

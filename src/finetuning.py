@@ -22,6 +22,7 @@ import torch.nn.functional as F
 import onnxruntime as ort
 import onnx
 from onnxruntime.quantization import quantize_dynamic, QuantType
+from torch.utils.data import SequentialSampler
 
 # Import from project modules
 from model import BirdJEPA
@@ -90,6 +91,9 @@ class BirdCLEFDataWrapper:
         self.context_length = context_length
         self.infinite_dataset = infinite_dataset
         
+        # DEBUG: Print key initialization parameters
+        print(f"DEBUG: BirdCLEFDataWrapper init with data_dir={data_dir}, infinite_dataset={infinite_dataset}, shuffle={shuffle}")
+        
         # Load CSV file into memory 
         self.csv_data = pd.read_csv(self.csv_path)
         
@@ -122,6 +126,10 @@ class BirdCLEFDataWrapper:
         
         # Initialize the dataset
         self.init_dataset(context_length, collate_fn, shuffle)
+        
+        # DEBUG: Track which files have been processed
+        self.processed_files = []
+        self.batch_counter = 0
 
     def get_label_for_file(self, filename):
         """Get the primary label for a given filename based on XC/iNat identifier"""
@@ -142,21 +150,48 @@ class BirdCLEFDataWrapper:
 
     def init_dataset(self, context_length, collate_fn, shuffle):
         print(f"Initializing dataset from {self.data_dir}")
+        
+        # DEBUG: List actual files in directory
+        try:
+            dir_files = os.listdir(self.data_dir)
+            print(f"DEBUG: Files in {self.data_dir}: {dir_files}")
+        except Exception as e:
+            print(f"DEBUG: Error listing directory: {e}")
+        
         self.dataset = BirdJEPA_Dataset(data_dir=self.data_dir, segment_len=context_length, infinite_dataset=self.infinite_dataset)
+        
+        # DEBUG: Print actual dataset file paths
+        print(f"DEBUG: Dataset file paths: {self.dataset.file_paths}")
+        
         if collate_fn is None:
             collate_fn = data_class_collate_fn
+        
         self.dataloader = torch.utils.data.DataLoader(
             self.dataset,
             batch_size=self.batch_size,
-            shuffle=shuffle,
-            collate_fn=collate_fn if self.infinite_dataset else None
+            shuffle=False,
+            collate_fn=collate_fn if self.infinite_dataset else None,
+            sampler=SequentialSampler(self.dataset)  # Force sequential access
         )
+        
         self.dataloader_iter = iter(self.dataloader)
         print(f"Dataset initialized with {len(self.dataset)} samples")
+        
+        # DEBUG: Track iteration state
+        self.iteration_count = 0
+        self.reset_count = 0
     
     def next_batch(self):
+        # DEBUG: Track batch requests
+        self.batch_counter += 1
+        print(f"\nDEBUG: next_batch called ({self.batch_counter}), iteration_count={self.iteration_count}, reset_count={self.reset_count}")
+        
         try:
+            self.iteration_count += 1
             batch = next(self.dataloader_iter)
+            
+            # DEBUG: Print batch structure for diagnostics
+            print(f"DEBUG: Batch type: {type(batch)}, structure: {type(batch) if not isinstance(batch, (tuple, list)) else [type(item) for item in batch]}")
             
             # If we want to extract labels for the files in this batch
             if isinstance(batch, tuple) and len(batch) >= 6:
@@ -164,7 +199,13 @@ class BirdCLEFDataWrapper:
                 batch_labels = []
                 batch_label_indices = []
                 
+                # DEBUG: Track filenames
+                print(f"DEBUG: Processing batch with filenames: {filenames}")
+                
                 for filename in filenames:
+                    # Track processed files
+                    self.processed_files.append(filename)
+                    
                     label, label_idx = self.get_label_for_file(filename)
                     batch_labels.append(label)
                     batch_label_indices.append(label_idx)
@@ -175,9 +216,17 @@ class BirdCLEFDataWrapper:
             # this is sketchy, but when analyzing, we don't have a collate fn, so we return segment, segment_labels, os.path.basename(file_path) from dataclass
             if isinstance(batch, list) and len(batch) >= 3:
                 filenames = batch[2]
+                
+                # DEBUG: Track filenames
+                print(f"DEBUG: Processing analysis batch with filenames: {filenames}")
+                
                 batch_labels = []
                 batch_label_indices = []
+                
                 for filename in filenames:
+                    # Track processed files
+                    self.processed_files.append(filename)
+                    
                     label, label_idx = self.get_label_for_file(filename)
                     batch_labels.append(label)
                     batch_label_indices.append(label_idx)
@@ -185,11 +234,33 @@ class BirdCLEFDataWrapper:
                 return batch[0], batch_labels, batch_label_indices, filenames
 
             # If no filenames to process, just return the batch with empty label lists
+            print("DEBUG: No filenames found in batch")
             return batch, [], []
         except StopIteration:
-            # Reset iterator if we've gone through the entire dataset
-            self.dataloader_iter = iter(self.dataloader)
-            return self.next_batch()
+            # Handle StopIteration based on whether we're using an infinite dataset
+            if self.infinite_dataset:
+                # Reset iterator if we've gone through the entire dataset
+                self.dataloader_iter = iter(self.dataloader)
+                self.reset_count += 1
+                print(f"DEBUG: StopIteration reached, resetting dataloader_iter (reset #{self.reset_count})")
+                
+                # DEBUG: Report on processed files
+                if self.processed_files:
+                    unique_files = set(self.processed_files)
+                    print(f"DEBUG: Processed {len(self.processed_files)} total files, {len(unique_files)} unique")
+                    print(f"DEBUG: Unique files processed: {sorted(unique_files)}")
+                    
+                    # Count occurrences of each file
+                    from collections import Counter
+                    file_counts = Counter(self.processed_files)
+                    print(f"DEBUG: File counts: {file_counts}")
+                
+                return self.next_batch()
+            else:
+                # For finite datasets, we should not reset - just raise the exception
+                # This allows the caller to know we've processed all files
+                print(f"DEBUG: End of dataset reached after {self.iteration_count} iterations")
+                raise
 
 class Classifier(nn.Module):
     def __init__(self, context_length, num_classes, hidden_dim=64, pool_type='mean'):
@@ -727,61 +798,68 @@ class Inference:
         sys.stdout = self.Tee(self.original_stdout, self.log_file)
         print(f"starting inference mode, logging to {console_log_path}")
         
-        # TEMPORARILY COMMENTED OUT FOR DEBUGGING - model loading and ONNX export
-        # weights_dir = self.run_dir / "weights"
-        # checkpoint_files = list(weights_dir.glob("best_*_step_*.pt"))
-        # if not checkpoint_files:
-        #     raise Exception("no best model checkpoint found for analysis")
-        
-        # # sort checkpoints by step number and pick the latest
-        # def get_step_number(file_path):
-        #     match = re.search(r'step_(\d+)\.pt', str(file_path))
-        #     return int(match.group(1)) if match else 0
-        
-        # checkpoint_file = sorted(checkpoint_files, key=get_step_number)[-1]
-        # print(f"loading model checkpoint from {checkpoint_file}")
-        
-        # load number of classes from training csv
-        self.num_classes = self.load_num_classes(args.train_csv)
-        
-        # TEMPORARILY COMMENTED OUT FOR DEBUGGING - model creation and initialization
-        # # create model instance using minimal parameters
-        # self.model = Model(
-        #     model_path=args.pretrained_model_path,  # can be None if loading from checkpoint
-        #     context_length=args.context_length,
-        #     num_classes=self.num_classes,
-        #     pool_type=args.pool_type
-        # )
-        
-        # # force cpu usage by loading checkpoint with map_location
-        # print("loading checkpoint for ONNX export")
-        # checkpoint = torch.load(checkpoint_file, map_location="cpu")
-        # self.model.load_state_dict(checkpoint['model_state_dict'])
-        # print(f"successfully loaded model weights from checkpoint (step {checkpoint.get('step', 'unknown')})")
-        # self.model.eval()
-        
-        # # Export the model to ONNX format
-        # print("Exporting model to ONNX format")
-        # onnx_path = Path(self.args.onnx_model_path) if self.args.onnx_model_path else self.run_dir / "model.onnx"
-        # self.export_to_onnx(self.model, onnx_path)
-        
-        # # Initialize ONNX runtime session
-        # print(f"Initializing ONNX runtime session from {onnx_path}")
-        # # Configure ONNX runtime session options for optimal CPU performance
-        # sess_options = ort.SessionOptions()
-        # sess_options.graph_optimization_level = ort.GraphOptimizationLevel.ORT_ENABLE_ALL
-        # sess_options.intra_op_num_threads = 4   # set threads to match core count
-        # sess_options.inter_op_num_threads = 4
+        # Load model and prepare for inference
+        weights_dir = self.run_dir / "weights"
+        checkpoint_files = list(weights_dir.glob("best_*_step_*.pt"))
+        if not checkpoint_files:
+            print("Warning: No best model checkpoint found for analysis. Proceeding with random predictions.")
+            self.num_classes = self.load_num_classes(args.train_csv)
+            self.model = None  # Set model to None to indicate no model is loaded
+            self.use_random_predictions = True
+            
+            # Skip ONNX export and runtime initialization when no model is available
+            print("Skipping ONNX export since no model is available. Will use random predictions.")
+            self.ort_session = None
+        else:
+            # sort checkpoints by step number and pick the latest
+            def get_step_number(file_path):
+                match = re.search(r'step_(\d+)\.pt', str(file_path))
+                return int(match.group(1)) if match else 0
 
-        # # Enable parallel execution mode
-        # sess_options.execution_mode = ort.ExecutionMode.ORT_PARALLEL
-        
-        # # Enable profiling
-        # sess_options.enable_profiling = True
+            checkpoint_file = sorted(checkpoint_files, key=get_step_number)[-1]
+            print(f"loading model checkpoint from {checkpoint_file}")
 
-        # self.ort_session = ort.InferenceSession(str(onnx_path), sess_options=sess_options, providers=['CPUExecutionProvider'])
-        # print("ONNX runtime session initialized with optimized CPU settings")
-        print("DEBUGGING MODE: Using random predictions instead of model inference")
+            # load number of classes from training csv
+            self.num_classes = self.load_num_classes(args.train_csv)
+
+            # create model instance using minimal parameters
+            self.model = Model(
+                model_path=args.pretrained_model_path,  # can be None if loading from checkpoint
+                context_length=args.context_length,
+                num_classes=self.num_classes,
+                pool_type=args.pool_type
+            )
+
+            # force cpu usage by loading checkpoint with map_location
+            print("loading checkpoint for ONNX export")
+            checkpoint = torch.load(checkpoint_file, map_location="cpu")
+            self.model.load_state_dict(checkpoint['model_state_dict'])
+            print(f"successfully loaded model weights from checkpoint (step {checkpoint.get('step', 'unknown')})")
+            self.model.eval()
+            
+            self.use_random_predictions = False
+            
+            # Export the model to ONNX format
+            print("Exporting model to ONNX format")
+            onnx_path = Path(self.args.onnx_model_path) if self.args.onnx_model_path else self.run_dir / "model.onnx"
+            self.export_to_onnx(self.model, onnx_path)
+            
+            # Initialize ONNX runtime session
+            print(f"Initializing ONNX runtime session from {onnx_path}")
+            # Configure ONNX runtime session options for optimal CPU performance
+            sess_options = ort.SessionOptions()
+            sess_options.graph_optimization_level = ort.GraphOptimizationLevel.ORT_ENABLE_ALL
+            sess_options.intra_op_num_threads = 4   # set threads to match core count
+            sess_options.inter_op_num_threads = 4
+
+            # Enable parallel execution mode
+            sess_options.execution_mode = ort.ExecutionMode.ORT_PARALLEL
+            
+            # Enable profiling
+            sess_options.enable_profiling = True
+
+            self.ort_session = ort.InferenceSession(str(onnx_path), sess_options=sess_options, providers=['CPUExecutionProvider'])
+            print("ONNX runtime session initialized with optimized CPU settings")
         
         # create validation dataloader with batch size 1, no shuffle, non-infinite dataset
         self.val_wrapper = BirdCLEFDataWrapper(
@@ -794,49 +872,48 @@ class Inference:
             shuffle=False
         )
 
-    # TEMPORARILY COMMENTED OUT FOR DEBUGGING - not needed for random predictions
-    # def export_to_onnx(self, model, onnx_path):
-    #     """Export PyTorch model to ONNX format."""
-    #     # Create dummy input of shape [batch_size, freq, time]
-    #     # Assuming freq dimension is 64, time dimension is 1000
-    #     dummy_input = torch.randn(1, 513, 1000, dtype=torch.float32)
-    #     
-    #     # Export model to ONNX
-    #     torch.onnx.export(
-    #         model,
-    #         dummy_input,
-    #         onnx_path,
-    #         input_names=["input"],
-    #         output_names=["output"],
-    #         opset_version=13,
-    #         do_constant_folding=True,
-    #         dynamic_axes={
-    #             'input': {0: 'batch_size'},
-    #             'output': {0: 'batch_size'}
-    #         }
-    #     )
-    #     
-    #     # Verify the ONNX model
-    #     onnx_model = onnx.load(onnx_path)
-    #     onnx.checker.check_model(onnx_model)
-    #     print(f"Exported ONNX model to {onnx_path}")
-    #     
-    #     # Quantize the model to INT8
-    #     quantized_path = str(onnx_path).replace(".onnx", "_quantized.onnx")
-    #     try:
-    #         print(f"Applying INT8 quantization to model...")
-    #         quantize_dynamic(str(onnx_path), quantized_path, weight_type=QuantType.QInt8)
-    #         print(f"Quantized model saved to {quantized_path}")
-    #         
-    #         # Use the quantized model instead of the original one
-    #         if os.path.exists(quantized_path):
-    #             onnx_path = quantized_path
-    #             print(f"Using quantized model for inference")
-    #         else:
-    #             print(f"Quantization failed, using original model")
-    #     except Exception as e:
-    #         print(f"Quantization error: {e}")
-    #         print(f"Continuing with original model")
+    def export_to_onnx(self, model, onnx_path):
+        """Export PyTorch model to ONNX format."""
+        # Create dummy input of shape [batch_size, freq, time]
+        # Assuming freq dimension is 64, time dimension is 1000
+        dummy_input = torch.randn(1, 513, 1000, dtype=torch.float32)
+        
+        # Export model to ONNX
+        torch.onnx.export(
+            model,
+            dummy_input,
+            onnx_path,
+            input_names=["input"],
+            output_names=["output"],
+            opset_version=13,
+            do_constant_folding=True,
+            dynamic_axes={
+                'input': {0: 'batch_size'},
+                'output': {0: 'batch_size'}
+            }
+        )
+        
+        # Verify the ONNX model
+        onnx_model = onnx.load(onnx_path)
+        onnx.checker.check_model(onnx_model)
+        print(f"Exported ONNX model to {onnx_path}")
+        
+        # Quantize the model to INT8
+        quantized_path = str(onnx_path).replace(".onnx", "_quantized.onnx")
+        try:
+            print(f"Applying INT8 quantization to model...")
+            quantize_dynamic(str(onnx_path), quantized_path, weight_type=QuantType.QInt8)
+            print(f"Quantized model saved to {quantized_path}")
+            
+            # Use the quantized model instead of the original one
+            if os.path.exists(quantized_path):
+                onnx_path = quantized_path
+                print(f"Using quantized model for inference")
+            else:
+                print(f"Quantization failed, using original model")
+        except Exception as e:
+            print(f"Quantization error: {e}")
+            print(f"Continuing with original model")
 
     # tee class to duplicate stdout writes
     class Tee:
@@ -881,123 +958,121 @@ class Inference:
         return segments
 
     def run_analysis(self):
-        print("DEBUGGING MODE: Running with random predictions for Kaggle submission format testing")
+        print("running inference with random predictions" if self.use_random_predictions else "running inference with onnx model")
         rows = []
         num_samples = len(self.val_wrapper.dataset)
-        
-        # Accumulate segments to run in a larger batch
-        segment_batch_accumulator = []
-        filenames_accumulator = []
-        BATCH_SIZE_FOR_INFER = self.args.batch_size  # Use batch size from args
         
         bird_classes = self.val_wrapper.unique_labels
         start_time = time.time()
         last_log_time = start_time
         samples_processed = 0
-        
-        # DEBUGGING: No need for ONNX model input name
-        # input_name = self.ort_session.get_inputs()[0].name
-        
+        segments_processed = 0
+
+        # Process each file
         for i in tqdm(range(num_samples), desc="processing samples"):
             spec_tensor, label, label_idx, filenames = self.val_wrapper.next_batch()
-            if label_idx == -1:
-                print(f"warning: missing label for sample {i}, skipping")
+            
+            if label_idx == -1 or not filenames:
                 continue
-
-            # vectorized segmentation instead of looping in python
+                
+            # Get filename and extract base ID
+            original_filename = filenames[0]
+            base_id = re.sub(r'_segment_\d+.*$', '', original_filename)
+            
+            # Segment the spectrogram
             segments_batch = self.get_segments(spec_tensor, seg_size=1000)
+            num_segments = segments_batch.size(0)
             
-            # Accumulate segments and filenames
-            segment_batch_accumulator.append(segments_batch)
-            filenames_accumulator.append(filenames)
+            # Generate predictions - use ONNX inference or random values
+            if not self.use_random_predictions and self.ort_session is not None:
+                # Real ONNX inference
+                segment_probs = []
+                for segment in segments_batch:
+                    # Convert to numpy, add batch dimension (ONNX expects [batch, freq, time])
+                    onnx_input = segment.numpy().astype(np.float32)
+                    onnx_input = np.expand_dims(onnx_input, axis=0)  
+                    
+                    # Run inference
+                    ort_inputs = {self.ort_session.get_inputs()[0].name: onnx_input}
+                    ort_outputs = self.ort_session.run(None, ort_inputs)
+                    
+                    # Apply sigmoid to convert logits to probabilities
+                    probs = 1.0 / (1.0 + np.exp(-ort_outputs[0]))
+                    segment_probs.append(probs[0])  # Remove batch dimension
+                    
+                segment_probs = np.array(segment_probs)
+            else:
+                # Random predictions if no model is available
+                segment_probs = np.random.rand(num_segments, len(bird_classes))
             
-            # If we've reached BATCH_SIZE_FOR_INFER samples, do a single inference call
-            if len(segment_batch_accumulator) >= BATCH_SIZE_FOR_INFER:
-                # Process the accumulated batch with random predictions instead of model inference
-                self._process_batch(segment_batch_accumulator, filenames_accumulator, None, bird_classes, rows)
-                # Clear accumulators
-                segment_batch_accumulator = []
-                filenames_accumulator = []
-            
+            # Generate a row for each segment
+            for seg_idx in range(num_segments):
+                time_marker = (seg_idx + 1) * 5  # each segment represents 5 sec
+                row_id = f"{base_id}_{time_marker}"
+                
+                row_data = {"row_id": row_id}
+                for cls_idx, class_name in enumerate(bird_classes):
+                    row_data[class_name] = segment_probs[seg_idx, cls_idx]
+                
+                rows.append(row_data)
+                segments_processed += 1
+
             samples_processed += 1
             current_time = time.time()
             if current_time - last_log_time > 10:
                 elapsed = current_time - start_time
                 samples_per_sec = samples_processed / elapsed
-                segments_processed = len(rows)
                 segments_per_sec = segments_processed / elapsed
-                speed_info = (f"speed stats: {samples_per_sec:.2f} samples/sec, "
-                              f"{segments_per_sec:.2f} segments/sec, {elapsed:.2f}s total")
-                print(speed_info)
+                print(f"speed stats: {samples_per_sec:.2f} samples/sec, {segments_per_sec:.2f} segments/sec, {elapsed:.2f}s total")
+                print(f"current file: {base_id} with {num_segments} segments")
                 last_log_time = current_time
-        
-        # Process any remaining samples in the batch
-        if segment_batch_accumulator:
-            self._process_batch(segment_batch_accumulator, filenames_accumulator, None, bird_classes, rows)
-        
+
         total_time = time.time() - start_time
-        final_samples_per_sec = samples_processed / total_time
-        final_segments = len(rows)
-        final_segments_per_sec = final_segments / total_time
-        
-        print(f"\nprocessing complete:")
+        print("\nprocessing complete:")
         print(f"- total time: {total_time:.2f} seconds")
-        print(f"- processed {samples_processed} samples at {final_samples_per_sec:.2f} samples/sec")
-        print(f"- generated {final_segments} segment predictions at {final_segments_per_sec:.2f} segments/sec")
-        
-        # Set pandas options to avoid scientific notation and limit to 4 decimal places
-        pd.set_option('display.float_format', '{:.4f}'.format)
-        
+        print(f"- processed {samples_processed} samples")
+        print(f"- generated {len(rows)} segment predictions")
+
+        # Create DataFrame from rows 
         submission_df = pd.DataFrame(rows)
         
-        # Ensure all float columns have 4 decimal places and no scientific notation
-        for col in submission_df.columns:
-            if col != 'row_id' and submission_df[col].dtype == 'float64':
-                submission_df[col] = submission_df[col].map(lambda x: '{:.4f}'.format(x))
-                
-        submission_df.to_csv(self.args.submission_csv, index=False)
-        print(f"csv file '{self.args.submission_csv}' populated with random predictions for testing") 
+        # Check if we have any rows before proceeding
+        if len(submission_df) == 0:
+            print("WARNING: No rows generated for submission. Creating empty submission file.")
+            submission_df = pd.DataFrame(columns=["row_id"] + list(bird_classes))
+            submission_df.to_csv(self.args.submission_csv, index=False, float_format="%.4f")
+            print(f"Empty csv file '{self.args.submission_csv}' created")
+            return
         
-        # DEBUGGING: No profiling in debug mode
-        # profile_file = self.ort_session.end_profiling()
+        # Drop duplicate row_ids if any exist
+        pre_dedup_count = len(submission_df)
+        submission_df = submission_df.drop_duplicates(subset=["row_id"])
+        post_dedup_count = len(submission_df)
         
-        # # Copy profile file to the same directory as the ONNX model if it's not already there
-        # if os.path.dirname(profile_file) != onnx_dir:
-        #     profile_filename = os.path.basename(profile_file)
-        #     new_profile_path = os.path.join(onnx_dir, profile_filename)
-        #     shutil.copy(profile_file, new_profile_path)
-        #     print(f"ONNX Runtime profiling results copied to {new_profile_path}")
-        # else:
-        #     print(f"ONNX Runtime profiling results saved to {profile_file}")
-
-    def _process_batch(self, segment_batch_accumulator, filenames_accumulator, input_name, bird_classes, rows):
-        """Process a batch of accumulated segments with random predictions for debugging."""
-        # Calculate total number of segments across all batches
-        total_segments = sum(segments.size(0) for segments in segment_batch_accumulator)
+        if pre_dedup_count != post_dedup_count:
+            print(f"Dropped {pre_dedup_count - post_dedup_count} duplicate rows")
         
-        # DEBUGGING: Generate random predictions instead of using model
-        # Format: values between 0 and 1, rounded to 4 decimal places
-        np.random.seed(42)  # for reproducibility
-        probs_all = np.random.random((total_segments, len(bird_classes)))
+        # Filter out rows where time marker is outside the range 5-60
+        def extract_time_marker(row_id):
+            try:
+                return int(row_id.split('_')[-1])
+            except (ValueError, IndexError):
+                return 0
         
-        # Process results for each file
-        offset = 0
-        for j, (segments, filenames) in enumerate(zip(segment_batch_accumulator, filenames_accumulator)):
-            # Get the predictions for this file
-            seg_count = segments.size(0)
-            file_probs = probs_all[offset:offset+seg_count]
-            offset += seg_count
-            
-            # Create rows for each segment
-            base_id = filenames[0].split("_segment_")[0]
-            for seg_idx, segment_probs in enumerate(file_probs):
-                time_marker = (seg_idx + 1) * 5  # each segment represents 5 sec
-                row_id = f"{base_id}_{time_marker}"
-                row_data = {"row_id": row_id}
-                # assign predictions for each class, rounded to 4 decimal places
-                for cls_idx, class_name in enumerate(bird_classes):
-                    row_data[class_name] = round(segment_probs[cls_idx], 4)
-                rows.append(row_data)
+        # Apply the filter - keep only rows with time markers between 5 and 60
+        pre_filter_count = len(submission_df)
+        valid_time_mask = submission_df['row_id'].apply(extract_time_marker).between(5, 60)
+        submission_df = submission_df[valid_time_mask]
+        post_filter_count = len(submission_df)
+        
+        if pre_filter_count != post_filter_count:
+            print(f"Filtered out {pre_filter_count - post_filter_count} rows with time markers outside 5-60 range")
+        
+        print(f"- after filtering: {len(submission_df)} rows remain (removed duplicates and out-of-range time markers)")
+        
+        # Write to CSV with fixed float formatting
+        submission_df.to_csv(self.args.submission_csv, index=False, float_format="%.4f")
+        print(f"csv file '{self.args.submission_csv}' populated with model predictions")
 
 def main():
     parser = argparse.ArgumentParser()
