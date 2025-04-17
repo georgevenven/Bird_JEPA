@@ -3,7 +3,7 @@
 set -euo pipefail
 
 # Parameter to control whether to recreate temp and generate specs
-recreate_temp=true  # set to false to skip temp/spec generation
+recreate_temp=false  # set to false to skip temp/spec generation
 
 # Get the absolute path of the script directory
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" >/dev/null 2>&1 && pwd)"
@@ -127,7 +127,7 @@ fi
 # Run baseline training, TRAIN CSV: this is for both train and val
 echo "Running finetuning with pre-generated spectrograms..."
 python3 "${PROJECT_ROOT}/src/finetuning.py" \
-    --mode train \
+    --mode infer \
     --train_spec_dir "$TRAIN_SPEC_DIR" \
     --val_spec_dir "$VAL_SPEC_DIR" \
     --train_csv "$TRAIN_CSV" \

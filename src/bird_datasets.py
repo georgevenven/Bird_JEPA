@@ -2,6 +2,7 @@ import os, random, numpy as np, torch
 from pathlib import Path
 from torch.utils.data import Dataset, DataLoader, SequentialSampler
 from typing import List, Tuple, Dict
+import pandas as pd
 
 # ---------- helpers ----------
 def load_np(path: str):
@@ -21,7 +22,11 @@ class BirdSpectrogramDataset(Dataset):
                  verbose: bool = False):
         self.paths: List[str] = [e.path for e in os.scandir(data_dir)]
         if not self.paths:
-            raise RuntimeError(f'no files found in {data_dir}')
+            # Gracefully handle empty directory: create empty CSV with just column labels
+            empty_csv_path = os.path.join(data_dir, "empty.csv")
+            if not os.path.exists(empty_csv_path):
+                pd.DataFrame(columns=["filename", "primary_label"]).to_csv(empty_csv_path, index=False)
+            self.paths = []  # keep dataset empty, but do not crash
         self.segment_len = segment_len
         self.infinite = infinite
         self.verbose = verbose
@@ -57,6 +62,8 @@ class BirdSpectrogramDataset(Dataset):
     # ---------------------------------------------------
 
     def __getitem__(self, idx: int):
+        if not self.paths:
+            raise IndexError("No data available in dataset.")
         if self.infinite:
             idx = random.randint(0, len(self.paths) - 1)
         path = self.paths[idx]

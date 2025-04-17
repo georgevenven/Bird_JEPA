@@ -274,20 +274,9 @@ class Infer:
     def run(self):
         rows, y_true = [], []
         t0 = time.time(); files_done = 0
-        # ---- micro-profiler (optional, cpu-only, 1 file, 3 lines) ----
-        import torch.profiler as prof
-        for spec, _, fname in self.data.val_loader:
-            segs  = self._segment(spec)                  # (N,F,T)
-            with prof.profile(
-                    activities=[prof.ProfilerActivity.CPU],
-                    record_shapes=False, with_stack=False, profile_memory=True) as p:
-                _ = self._predict_one(segs[0])
-            # Write profile to log_dir
-            log_dir = getattr(self.args, 'log_dir', self.args.output_dir)
-            with open(Path(log_dir) / "infer_profile.txt", "w") as f:
-                print(p.key_averages().table(sort_by="cpu_time_total")[:20], file=f)
-            break
-        # -------------------------------------------------------------
+        log_dir = getattr(self.args, 'log_dir', self.args.output_dir)
+        profile_path = Path(log_dir) / "onnx_profile.json"
+        self.session.start_profiling(str(profile_path))
         for spec, _, fname in self.data.val_loader:
             # full file → 5‑sec chunks
             segs  = self._segment(spec)                  # (N,F,T)
@@ -306,14 +295,20 @@ class Infer:
                 y_true.append(truth)                     # same label for each chunk
 
             files_done += 1
-            if files_done % 10 == 0:                      # every 10 files
-                fps = files_done / (time.time() - t0)
-                self.log(f' processed {files_done} files '
-                         f'({fps:.2f} files/s) — last file {base}')
+            if files_done >= 100:
+                break
+        self.session.end_profiling()
+
         # ---------- write & score -------------------------------
         sub_df = pd.DataFrame(rows)
         log_dir = getattr(self.args, 'log_dir', self.args.output_dir)
         sub_df.to_csv(Path(log_dir) / self.args.submission_csv, index=False, float_format='%.8f')
+
+        if sub_df.empty:
+            # No predictions made, create empty sol_df with correct columns
+            sol_df = pd.DataFrame(columns=["row_id"] + list(self.classes))
+            print(f"No predictions were made. Wrote empty submission to {Path(log_dir) / self.args.submission_csv}")
+            return
 
         sol_df = pd.DataFrame(y_true, columns=self.classes)
         sol_df.insert(0, "row_id", sub_df["row_id"])
