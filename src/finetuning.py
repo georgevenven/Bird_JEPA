@@ -12,7 +12,7 @@ import onnx, onnxruntime as ort
 # local imports (unchanged public interface)
 from data    import BirdSpectrogramDataset                        # new path
 from models  import BJConfig                            # encoder
-from src.models import jepa
+from models.birdjepa import BirdJEPA
 from utils   import load_pretrained_encoder                       # simple helper
 
 # ╭──────────────────────────────────────────────────────────────────────────╮

@@ -1,7 +1,7 @@
 import torch
 import json
 import os
-from model import BirdJEPA
+from models import BirdJEPA
 import glob
 
 

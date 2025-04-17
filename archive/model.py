@@ -1,151 +1,314 @@
-# birdjepa.py
 import torch
 import torch.nn as nn
-import math
 import torch.nn.functional as F
-from custom_transformer import CustomEncoderBlock
+import math
+import torch.cuda
+import sys
 
-class ConvolutionalFeatureExtractor(nn.Module):
+################################################################################
+# LOCAL AND GLOBAL ATTENTION IMPLEMENTATIONS
+################################################################################
+
+class LocalAttentionBlock(nn.Module):
     """
-    This module applies 4 convolutional + pooling layers
-    across the frequency dimension only, preserving the time dimension T.
+    a transformer encoder block that restricts attention to a sliding local window.
+    precomputes an attention mask up to max_seq_len, then slices it at runtime.
     """
-    def __init__(self):
+    def __init__(self, d_model, num_heads, window_size, mlp_dim, dropout=0.1, max_seq_len=512):
         super().__init__()
-        # Each conv uses kernel_size=(5,5) with padding=2, stride=1
-        # Each pool uses kernel_size=(2,1), stride=(2,1) => halves freq, keeps time
-        self.conv1 = nn.Conv2d(in_channels=1, out_channels=32, kernel_size=(5,5), stride=1, padding=2)
-        self.pool1 = nn.MaxPool2d(kernel_size=(2,1), stride=(2,1))
+        self.d_model = d_model
+        self.num_heads = num_heads
+        self.window_size = window_size
+        
+        self.attn = nn.MultiheadAttention(d_model, num_heads, dropout=dropout, batch_first=True)
+        self.mlp = nn.Sequential(
+            nn.Linear(d_model, mlp_dim),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(mlp_dim, d_model),
+            nn.Dropout(dropout)
+        )
+        self.norm1 = nn.LayerNorm(d_model)
+        self.norm2 = nn.LayerNorm(d_model)
 
-        self.conv2 = nn.Conv2d(in_channels=32, out_channels=64, kernel_size=(5,5), stride=1, padding=2)
-        self.pool2 = nn.MaxPool2d(kernel_size=(2,1), stride=(2,1))
+        # precompute the local attention mask up to max_seq_len
+        attn_mask = torch.ones((max_seq_len, max_seq_len), dtype=torch.bool)
+        for i in range(max_seq_len):
+            start = max(i - self.window_size, 0)
+            end = min(i + self.window_size + 1, max_seq_len)
+            attn_mask[i, start:end] = False
+        self.register_buffer("precomputed_attn_mask", attn_mask, persistent=False)
 
-        self.conv3 = nn.Conv2d(in_channels=64, out_channels=64, kernel_size=(5,5), stride=1, padding=2)
-        self.pool3 = nn.MaxPool2d(kernel_size=(2,1), stride=(2,1))
+    def forward(self, x, debug=False):
+        # x shape: (B, T, d_model)
+        B, T, _ = x.shape
 
-        self.conv4 = nn.Conv2d(in_channels=64, out_channels=64, kernel_size=(5,5), stride=1, padding=2)
-        self.pool4 = nn.MaxPool2d(kernel_size=(2,1), stride=(2,1))
+        # slice the precomputed mask
+        attn_mask = self.precomputed_attn_mask[:T, :T]
+        attn_mask = attn_mask.to(x.device)
+
+        x_norm = self.norm1(x)
+        attn_output, _ = self.attn(
+            x_norm,
+            x_norm,
+            x_norm,
+            attn_mask=attn_mask,
+        )
+        x = x + attn_output
+
+        x_norm = self.norm2(x)
+        mlp_output = self.mlp(x_norm)
+        x = x + mlp_output
+            
+        return x
+
+
+class GlobalAttentionBlock(nn.Module):
+    """
+    a transformer encoder block that provides global attention every stride steps.
+    specifically, tokens at indices multiple of 'global_stride' can attend to all tokens,
+    while others attend only to themselves.
+    precomputes an attention mask up to max_seq_len, then slices it at runtime.
+    """
+    def __init__(self, d_model, num_heads, global_stride, mlp_dim, dropout=0.1, max_seq_len=512):
+        super().__init__()
+        self.d_model = d_model
+        self.num_heads = num_heads
+        self.global_stride = global_stride
+
+        self.attn = nn.MultiheadAttention(d_model, num_heads, dropout=dropout, batch_first=True)
+        self.mlp = nn.Sequential(
+            nn.Linear(d_model, mlp_dim),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(mlp_dim, d_model),
+            nn.Dropout(dropout)
+        )
+        self.norm1 = nn.LayerNorm(d_model)
+        self.norm2 = nn.LayerNorm(d_model)
+
+        # precompute the global attention mask up to max_seq_len
+        attn_mask = torch.ones((max_seq_len, max_seq_len), dtype=torch.bool)
+        for i in range(max_seq_len):
+            if i % self.global_stride == 0:
+                attn_mask[i, :] = False  # can attend anywhere
+            else:
+                attn_mask[i, :] = True
+                attn_mask[i, i] = False
+        self.register_buffer("precomputed_attn_mask", attn_mask, persistent=False)
+
+    def forward(self, x, debug=False):
+        # x shape: (B, T, d_model)
+        B, T, _ = x.shape
+
+        # slice the precomputed mask
+        attn_mask = self.precomputed_attn_mask[:T, :T]
+        attn_mask = attn_mask.to(x.device)
+
+        x_norm = self.norm1(x)
+        attn_output, _ = self.attn(
+            x_norm,
+            x_norm,
+            x_norm,
+            attn_mask=attn_mask
+        )
+        x = x + attn_output
+
+        x_norm = self.norm2(x)
+        mlp_output = self.mlp(x_norm)
+        x = x + mlp_output
+            
+        return x
+
+################################################################################
+# POSITIONAL ENCODING (SINE, WITHOUT FIXED MAX LENGTH LIMIT)
+################################################################################
+
+class SinePositionalEncoding(nn.Module):
+    """
+    standard sine positional encoding for variable-length input.
+    """
+    def __init__(self, d_model):
+        super().__init__()
+        self.d_model = d_model
 
     def forward(self, x):
-        """
-        x: (B, 1, D, T)
-          - B is batch size
-          - 1 is 'channel' dimension for spectrogram
-          - D is freq bins
-          - T is time
+        # x shape: (B, T, d_model)
+        B, T, D = x.shape
+        device = x.device
 
-        Returns:
-          out: (B, C, D', T) after 4 conv+pool layers
-        """
-        # conv1 + pool1
-        x = F.gelu(self.conv1(x))
-        x = self.pool1(x)
-        # conv2 + pool2
-        x = F.gelu(self.conv2(x))
-        x = self.pool2(x)
-        # conv3 + pool3
-        x = F.gelu(self.conv3(x))
-        x = self.pool3(x)
-        # conv4 + pool4
-        x = F.gelu(self.conv4(x))
-        x = self.pool4(x)
+        pe = torch.zeros(T, D, device=device)
+        position = torch.arange(0, T, device=device).unsqueeze(1)
+        div_term = torch.exp(torch.arange(0, D, 2, device=device) * -(math.log(10000.0) / D))
+        pe[:, 0::2] = torch.sin(position * div_term)
+        pe[:, 1::2] = torch.cos(position * div_term)
 
-        return x  # shape (B, 64, new_freq, T)
+        x = x + pe.unsqueeze(0)
+        return x
 
-class ViT(nn.Module):
+################################################################################
+# CONVOLUTIONAL FEATURE EXTRACTOR
+################################################################################
+
+class BirdCLEF_ConvolutionalFeatureExtractor(nn.Module):
     """
-    A Vision-Transformer-like encoder, with four initial convolutional layers
-    that reduce frequency dimension but preserve time dimension T.
-    After the conv stack, we flatten the freq dimension and project
-    to hidden_dim, then apply standard transformer blocks.
+    4-layer convolution stack with progressively larger kernels and out_channels,
+    reducing frequency dimension (height) while preserving time dimension.
+    """
+    def __init__(self, in_channels=1, debug=False):
+        super().__init__()
+        self.debug = debug
+
+        self.conv1 = nn.Conv2d(in_channels, 32, kernel_size=(3,3), stride=(2,1), padding=(1,1))
+        self.bn1 = nn.BatchNorm2d(32)
+
+        self.conv2 = nn.Conv2d(32, 32, kernel_size=(5,5), stride=(2,1), padding=(2,2))
+        self.bn2 = nn.BatchNorm2d(32)
+
+        self.conv3 = nn.Conv2d(32, 32, kernel_size=(7,7), stride=(2,1), padding=(3,3))
+        self.bn3 = nn.BatchNorm2d(32)
+
+        self.conv4 = nn.Conv2d(32, 32, kernel_size=(7,7), stride=(2,1), padding=(3,3))
+        self.bn4 = nn.BatchNorm2d(32)
+
+    def forward(self, x):
+        # x shape: (B, 1, F, T)
+        x = self.conv1(x)
+        x = self.bn1(x)
+        x = F.gelu(x)
+
+        x = self.conv2(x)
+        x = self.bn2(x)
+        x = F.gelu(x)
+
+        x = self.conv3(x)
+        x = self.bn3(x)
+        x = F.gelu(x)
+
+        x = self.conv4(x)
+        x = self.bn4(x)
+        x = F.gelu(x)
+        
+        return x
+
+################################################################################
+# ENCODER WITH LOCAL THEN GLOBAL ATTENTION
+################################################################################
+
+class BirdCLEFEncoder(nn.Module):
+    """
+    applies the convolutional feature extractor, flattens the freq dimension,
+    projects to hidden_dim, then applies a series of blocks as specified
+    by the blocks_config parameter.
     """
     def __init__(
         self,
-        input_dim,      # This is freq bins, but we won't directly use it because conv blocks handle that.
-        hidden_dim=64,
-        depth=3,
-        num_heads=4,
-        mlp_ratio=4.0,
+        input_dim,
+        hidden_dim=256,
+        blocks_config=None,
+        mlp_dim=1024,
         dropout=0.1,
-        max_len=512
+        max_len=512,
+        debug=False
     ):
         super().__init__()
+        self.debug = debug
 
-        # --- 4-layer CNN feature extractor (freq-downsample, preserve T) ---
-        self.feature_extractor = ConvolutionalFeatureExtractor()
-        
-        # We'll figure out how many channels and freq remain after CNN
-        # Let's assume the final channel count is 64, but freq is (input_dim // 2^4)
-        # or something similar. Instead of computing dynamically, we can do a small hack:
-        #   - We'll pass a dummy tensor through the conv stack in __init__ to get the shape.
+        self.feature_extractor = BirdCLEF_ConvolutionalFeatureExtractor(in_channels=1, debug=debug)
 
-        dummy = torch.zeros(1, 1, input_dim, max_len)  # (B=1,1,D,T)
-        conv_out = self.feature_extractor(dummy)
-        _, final_channels, final_freq, _ = conv_out.shape
-        conv_output_size = final_channels * final_freq  # This is the dimension we flatten to
+        # dimension calculation
+        dummy = torch.zeros(1, 1, input_dim, max_len)
+        with torch.no_grad():
+            test_out = self.feature_extractor(dummy)
+        _, c_out, freq_out, _ = test_out.shape
+        self.flattened_dim = c_out * freq_out
 
-        # Project from conv_output_size -> hidden_dim
-        self.input_proj = nn.Linear(conv_output_size, hidden_dim)
-
-        self.hidden_dim = hidden_dim
-        self.cls_token = nn.Parameter(torch.randn(1, 1, hidden_dim))
+        self.input_proj = nn.Linear(self.flattened_dim, hidden_dim)
         self.dropout = nn.Dropout(dropout)
 
-        # Create the transformer blocks
-        self.layers = nn.ModuleList([
-            CustomEncoderBlock(
-                d_model=hidden_dim,
-                num_heads=num_heads,
-                ffn_dim=int(hidden_dim * mlp_ratio),
-                dropout=dropout,
-                pos_enc_type="relative",
-                length=max_len + 1  # +1 for CLS token
-            ) for _ in range(depth)
-        ])
+        self.pos_enc = SinePositionalEncoding(hidden_dim)
 
-    def forward(self, x):
-        """
-        x: (B, 1, D, T) or (B, D, T)
-          - B is batch size
-          - 1 is 'channel' dimension for spectrogram (optional)
-          - D is freq bins
-          - T is time
-        """
-        # Check input dimensionality and add channel dimension if needed
-        if x.dim() == 3:  # If (B, D, T)
-            x = x.unsqueeze(1)  # Add channel dimension -> (B, 1, D, T)
+        self.attention_blocks = nn.ModuleList()
         
-        B, _, D, T = x.shape
+        if not blocks_config:
+            blocks_config = [
+                {"type": "local", "window_size": 8},
+                {"type": "global", "stride": 100}
+            ]
+            
+        for block in blocks_config:
+            if block["type"] == "local":
+                self.attention_blocks.append(
+                    LocalAttentionBlock(
+                        d_model=hidden_dim,
+                        num_heads=8,
+                        window_size=block["window_size"],
+                        mlp_dim=mlp_dim,
+                        dropout=dropout,
+                        max_seq_len=max_len
+                    )
+                )
+            elif block["type"] == "global":
+                self.attention_blocks.append(
+                    GlobalAttentionBlock(
+                        d_model=hidden_dim,
+                        num_heads=8,
+                        global_stride=block["stride"],
+                        mlp_dim=mlp_dim,
+                        dropout=dropout,
+                        max_seq_len=max_len
+                    )
+                )
 
-        # 1) CNN feature extractor -> (B, 64, D', T)
-        feats = self.feature_extractor(x)  # shape: (B, final_channels, new_freq, T)
+    def forward(self, x, layer_index=None, dict_key=None):
+        """
+        x shape: (B,1,D,T) or (B,D,T)
+        returns final hidden representation of shape (B, T, hidden_dim)
+        plus a list of intermediate outputs if needed.
+        
+        If layer_index and dict_key are provided, returns only the output
+        from the specified layer for inference optimization.
+        """
+        if x.dim() == 3:
+            x = x.unsqueeze(1)
 
-        # 2) Flatten freq dimension
-        #    shape => (B, final_channels*new_freq, T)
-        B, C, D_prime, T = feats.shape
-        feats = feats.view(B, C * D_prime, T)  # (B, C*D', T)
+        x = self.feature_extractor(x)
+        B, C, Freq, T = x.shape
+        x = x.view(B, C * Freq, T)
+        x = x.transpose(1, 2)
 
-        # 3) Transpose to (B, T, conv_output_size) for a standard BxTxF
-        feats = feats.transpose(1, 2)  # (B, T, C*D')
-
-        # 4) Linear projection to hidden_dim
-        feats = self.input_proj(feats)  # (B, T, hidden_dim)
-
-        # 5) Prepend CLS token => shape (B, T+1, hidden_dim)
-        cls_tokens = self.cls_token.expand(B, -1, -1)  # (B,1,H)
-        x = torch.cat((cls_tokens, feats), dim=1)
-
+        x = self.input_proj(x)
         x = self.dropout(x)
 
-        layer_outputs = []
-        for block in self.layers:
-            block_output = block(x)
-            x = block_output['feed_forward_output']
-            # Collect the per-layer output *excluding* CLS (like the previous code)
-            layer_outputs.append(x[:, 1:])  # shape (B, T, hidden_dim)
+        x = self.pos_enc(x)
+        
+        initial_embedding = x
+        
+        if layer_index == 0 and dict_key is not None:
+            return {dict_key: initial_embedding}, []
+        
+        intermediate_outputs = []
+        intermediate_outputs.append({"attention_output": initial_embedding})
+        
+        for i, block in enumerate(self.attention_blocks):
+            x = block(x, debug=self.debug)
+            intermediate_outputs.append({"attention_output": x})
+            
+            if layer_index is not None and dict_key is not None and i + 1 == layer_index:
+                return {dict_key: x}, []
+        
+        if layer_index == -1 and dict_key is not None:
+            return {dict_key: x}, []
+            
+        if layer_index is None or dict_key is None:
+            return x, intermediate_outputs[1:]
+        else:
+            print(f"Warning: layer_index {layer_index} is out of range. Using the last layer instead.")
+            return {dict_key: x}, []
 
-        # Final output: (B, T, hidden_dim) ignoring the prepended CLS token
-        return x[:, 1:], layer_outputs
+################################################################################
+# PREDICTOR (AS BEFORE)
+################################################################################
 
 class Predictor(nn.Module):
     def __init__(self, dim=256):
@@ -158,6 +321,54 @@ class Predictor(nn.Module):
     def forward(self, x):
         return self.net(x)
 
+class PredictorViT(nn.Module):
+    """
+    retained for interface consistency; you can still use the same approach,
+    or just keep a simpler MLP. here we'll do something minimal for compatibility.
+    """
+    def __init__(self, 
+                 hidden_dim=384,  
+                 depth=6,         
+                 num_heads=6, 
+                 mlp_dim=1024,
+                 dropout=0.1,
+                 max_len=512,
+                 debug=False):   
+        super().__init__()
+        self.hidden_dim = hidden_dim
+        self.dropout = nn.Dropout(dropout)
+        self.max_len = max_len
+        self.debug = debug
+
+        self.input_proj = nn.Linear(hidden_dim, hidden_dim)
+
+        self.layers = nn.ModuleList([
+            nn.Sequential(
+                nn.LayerNorm(hidden_dim),
+                nn.Linear(hidden_dim, mlp_dim),
+                nn.GELU(),
+                nn.Dropout(dropout),
+                nn.Linear(mlp_dim, hidden_dim),
+                nn.Dropout(dropout)
+            )
+            for _ in range(depth)
+        ])
+
+    def forward(self, x):
+        # x shape: (B, T, H)
+        x = self.input_proj(x)
+            
+        for layer in self.layers:
+            ln_out = layer[0](x)
+            ff_out = layer[1:](ln_out)
+            x = x + ff_out
+            
+        return x
+
+################################################################################
+# EMA
+################################################################################
+
 class EMA:
     def __init__(self, beta):
         super().__init__()
@@ -168,48 +379,9 @@ class EMA:
             return new
         return old * self.beta + (1 - self.beta) * new
 
-class PredictorViT(nn.Module):
-    def __init__(self, 
-                 hidden_dim=384,  
-                 depth=6,         
-                 num_heads=6, 
-                 mlp_dim=1024,
-                 dropout=0.1,
-                 max_len=512):   
-        super().__init__()
-        self.hidden_dim = hidden_dim
-        self.dropout = nn.Dropout(dropout)
-        self.max_len = max_len
-
-        # Add input projection to match dimensions
-        self.input_proj = nn.Linear(hidden_dim, hidden_dim)
-
-        # Make sure max_len matches the input sequence length
-        self.layers = nn.ModuleList([
-            CustomEncoderBlock(
-                d_model=hidden_dim,
-                num_heads=num_heads,
-                ffn_dim=mlp_dim,
-                dropout=dropout,
-                pos_enc_type="relative",
-                length=max_len
-            ) for _ in range(depth)
-        ])
-
-    def forward(self, x):
-        B, T, H = x.shape
-        assert H == self.hidden_dim, f"Expected hidden dim {self.hidden_dim}, got {H}"
-        assert T <= self.max_len, f"Input sequence length {T} exceeds maximum length {self.max_len}"
-        
-        # Project input
-        x = self.input_proj(x)
-        
-        # Apply transformer layers
-        for block in self.layers:
-            block_output = block(x)
-            x = block_output['feed_forward_output']
-
-        return x  # (B,T,H)
+################################################################################
+# THE MAIN BirdJEPA MODULE
+################################################################################
 
 class BirdJEPA(nn.Module):
     def __init__(self, 
@@ -224,10 +396,10 @@ class BirdJEPA(nn.Module):
                  pred_num_heads=4,
                  pred_mlp_dim=1024,
                  max_seq_len=512,
-                 zero_predictor_input=False):
+                 zero_predictor_input=False,
+                 debug=False,
+                 blocks_config=None):
         super().__init__()
-        
-        # Store configuration
         self.input_dim = input_dim
         self.hidden_dim = hidden_dim
         self.num_layers = num_layers
@@ -235,192 +407,230 @@ class BirdJEPA(nn.Module):
         self.dropout = dropout
         self.mlp_dim = mlp_dim
         self.zero_predictor_input = zero_predictor_input
-        
-        # If pred_num_heads not specified, use same as encoder
-        if pred_num_heads is None:
-            pred_num_heads = num_heads
-        
-        # Initialize encoders with max_seq_len parameter
-        self.context_encoder = ViT(input_dim=input_dim, 
-                                 hidden_dim=hidden_dim, 
-                                 depth=num_layers, 
-                                 num_heads=num_heads, 
-                                 dropout=dropout, 
-                                 mlp_ratio=mlp_dim/hidden_dim,
-                                 max_len=max_seq_len)
-        
-        self.target_encoder = ViT(input_dim=input_dim, 
-                                hidden_dim=hidden_dim,
-                                depth=num_layers, 
-                                num_heads=num_heads,
-                                dropout=dropout, 
-                                mlp_ratio=mlp_dim/hidden_dim,
-                                max_len=max_seq_len)
+        self.debug = debug
 
-        # Update predictor to use specified number of heads
+        self.context_encoder = BirdCLEFEncoder(
+            input_dim=input_dim,
+            hidden_dim=hidden_dim,
+            blocks_config=blocks_config,
+            mlp_dim=mlp_dim,
+            dropout=dropout,
+            max_len=max_seq_len,
+            debug=debug
+        )
+        self.target_encoder = BirdCLEFEncoder(
+            input_dim=input_dim,
+            hidden_dim=hidden_dim,
+            blocks_config=blocks_config,
+            mlp_dim=mlp_dim,
+            dropout=dropout,
+            max_len=max_seq_len,
+            debug=False
+        )
+
         self.predictor = PredictorViT(
             hidden_dim=hidden_dim,
             depth=pred_num_layers,
             num_heads=pred_num_heads,
             mlp_dim=pred_mlp_dim,
             dropout=dropout,
-            max_len=max_seq_len
+            max_len=max_seq_len,
+            debug=debug
         )
 
-        # Fix decoder to handle the sequence dimension correctly
         self.decoder = nn.Sequential(
-            nn.LayerNorm(hidden_dim),  # Add LayerNorm
+            nn.LayerNorm(hidden_dim),
             nn.Linear(hidden_dim, input_dim),
             nn.GELU()
         )
-        
-        # Initialize EMA with beta=0.5
+
         self.ema_updater = EMA(0.95)
         self.ema_m = 0.95
+
+        # Count and print parameters for different components
+        self._count_parameters(max_seq_len, blocks_config)
+
+        if self.debug:
+            context_trainable = sum(p.numel() for p in self.context_encoder.parameters() if p.requires_grad)
+            decoder_trainable = sum(p.numel() for p in self.decoder.parameters() if p.requires_grad)
+            print(f"[BirdJEPA] context encoder trainable params: {context_trainable}")
+            print(f"[BirdJEPA] decoder trainable params: {decoder_trainable}")
+
+    def _count_parameters(self, max_seq_len, blocks_config):
+        # Count parameters in convolutional layers
+        conv_params = 0
+        for name, module in self.context_encoder.feature_extractor.named_modules():
+            if isinstance(module, nn.Conv2d):
+                layer_params = sum(p.numel() for p in module.parameters())
+                conv_params += layer_params
+                print(f"Conv layer {name}: {layer_params} parameters")
+        print(f"Total convolutional parameters: {conv_params}")
+
+        # Count parameters in transformer encoders
+        if not blocks_config:
+            blocks_config = [
+                {"type": "local", "window_size": 8},
+                {"type": "global", "stride": 100}
+            ]
         
-        # Debug print to verify trainable parameters
-        context_trainable = sum(p.requires_grad for p in self.context_encoder.parameters())
-        decoder_trainable = sum(p.requires_grad for p in self.decoder.parameters())
-        print(f"Context encoder has {context_trainable} trainable parameters")
-        print(f"Decoder has {decoder_trainable} trainable parameters")
+        transformer_params = 0
+        attention_tokens = 0
+        
+        for i, block_config in enumerate(blocks_config):
+            block = self.context_encoder.attention_blocks[i]
+            block_params = sum(p.numel() for p in block.parameters())
+            transformer_params += block_params
+            
+            if block_config["type"] == "local":
+                window_size = block_config["window_size"]
+                # For each position, it attends to 2*window_size+1 tokens (itself + window_size on each side)
+                local_attention = (2 * window_size + 1) * max_seq_len
+                print(f"Local attention block {i}: {block_params} parameters, each token attends to {2*window_size+1} tokens")
+                print(f"Total attention connections in block {i}: {local_attention}")
+                attention_tokens += local_attention
+            
+            elif block_config["type"] == "global":
+                stride = block_config["stride"]
+                # Calculate global attention tokens
+                global_positions = max_seq_len // stride
+                if max_seq_len % stride != 0:
+                    global_positions += 1
+                # Global tokens attend to all tokens, others only to themselves
+                global_attention = global_positions * max_seq_len + (max_seq_len - global_positions)
+                print(f"Global attention block {i}: {block_params} parameters, {global_positions} tokens with global attention")
+                print(f"Total attention connections in block {i}: {global_attention}")
+                attention_tokens += global_attention
+        
+        print(f"Total transformer parameters: {transformer_params}")
+        print(f"Total attention connections across all blocks: {attention_tokens}")
+        
+        # Total model parameters
+        total_params = sum(p.numel() for p in self.parameters())
+        print(f"Total model parameters: {total_params}")
 
     @torch.no_grad()
     def update_ema(self):
-        """Update target encoder parameters using EMA"""
         for param_q, param_k in zip(self.context_encoder.parameters(), self.target_encoder.parameters()):
             param_k.data = self.ema_updater.update_average(param_k.data, param_q.data)
 
     def forward(self, context_spectrogram, target_spectrogram, use_no_mask=False):
-        """
-        context_spectrogram: (B,1,D,T)
-        target_spectrogram:  (B,1,D,T)
-        """
-        # Determine which positions are masked
-        # (Here we assume masked positions in freq or amplitude are zeroed out, so this is a quick check.)
-        mask = (context_spectrogram == 0.0).any(dim=1)  # (B, D, T) => (B, T) after .any(dim=1)
+        context_repr, _ = self.context_encoder(context_spectrogram)
 
-        context_clean = context_spectrogram
+        # if user wants to zero out
+        # (the original code references a mask, but doesn't define it in forward,
+        # so we just keep the check for consistency)
+        if self.zero_predictor_input and use_no_mask:
+            pass  # do nothing here, no mask is defined in original code
 
-        # 1) Encode context
-        context_repr, _ = self.context_encoder(context_clean)  # (B, T, hidden_dim)
-
-        if self.zero_predictor_input:
-            mask_3d = mask.unsqueeze(-1).expand_as(context_repr)
-            context_repr = context_repr.clone()
-            context_repr[mask_3d] = 0
-
-        # 2) Encode target with frozen encoder
         with torch.no_grad():
             target_repr, _ = self.target_encoder(target_spectrogram)
 
-        # 3) Predictor
-        pred = self.predictor(context_repr)  # (B, T, hidden_dim)
+        pred = self.predictor(context_repr)
 
-        # 4) Decoder
-        decoded = self.decoder(pred)  # (B, T, input_dim)
-        decoded = decoded.transpose(1, 2)  # (B, input_dim, T)
-
+        decoded = self.decoder(pred)  # (B,T,input_dim)
+        decoded = decoded.transpose(1, 2)  # (B,input_dim,T)
+        
         return decoded, target_repr
 
     def compute_latent_loss(self, context_spectrogram, target_spectrogram, mask, is_eval_step=False):
-        """Computes loss in embedding space between predictor output and target encoding"""
-        # Ensure inputs have the channel dimension for the CNN part
-        if context_spectrogram.dim() == 3:  # If (B,D,T)
-            context_spectrogram = context_spectrogram.unsqueeze(1)  # (B,1,D,T)
-        
-        if target_spectrogram.dim() == 3:  # If (B,D,T)
-            target_spectrogram = target_spectrogram.unsqueeze(1)  # (B,1,D,T)
-        
-        # Get context representation and predict target
-        context_repr, _ = self.context_encoder(context_spectrogram)  # (B,T,H)
-        
-        # Add new logic to zero out masked embeddings
+        if context_spectrogram.dim() == 3:
+            context_spectrogram = context_spectrogram.unsqueeze(1)
+        if target_spectrogram.dim() == 3:
+            target_spectrogram = target_spectrogram.unsqueeze(1)
+
+        context_repr, _ = self.context_encoder(context_spectrogram)
+
         if self.zero_predictor_input:
-            mask_3d = mask.unsqueeze(-1).expand_as(context_repr)
-            context_repr = context_repr.clone()
+            mask_3d = mask.any(dim=1, keepdim=True).transpose(1,2)
             context_repr[mask_3d] = 0
-        
-        pred = self.predictor(context_repr)  # (B,T,H)
-        
-        # Get target representation (with no grad since it's the target)
+
         with torch.no_grad():
-            target_repr, _ = self.target_encoder(target_spectrogram)  # (B,T,H)
-        
-        # Fix mask dimension for loss computation
-        mask = mask.unsqueeze(-1)  # (B,T,1) to broadcast across hidden dim
-        
-        # Calculate squared differences
-        diff = ((pred - target_repr)**2 * mask)  # (B,T,H)
-        
-        # Compute both sum-based and average-based losses for debugging
-        with torch.no_grad():
-            total_loss = diff.sum()
-            num_masked = mask.sum()
-            avg_loss = total_loss / (num_masked + 1e-8)
-            if is_eval_step:
-                print(f"debug>>> sum_loss={total_loss.item():.4f}, "
-                      f"avg_loss={avg_loss.item():.4f}, "
-                      f"masked_positions={num_masked.item()}")
-        
-        # Use average-based loss for training
-        loss = diff.sum() / (mask.sum() + 1e-8)
-        
-        return loss, diff, pred, target_repr, context_repr
+            target_repr, _ = self.target_encoder(target_spectrogram)
+
+        pred = self.predictor(context_repr)
+
+        # Collapse F – we only care "is *any* freq‑bin masked at t?"
+        mask2d = mask.any(dim=1)  # (B,T)
+        diff = (pred - target_repr) ** 2 * mask2d.unsqueeze(-1)
+        total_loss = diff.sum()
+        num_masked = mask2d.sum()
+        avg_loss = total_loss / (num_masked + 1e-8)
+        if self.debug or is_eval_step:
+            msg = f"[BirdJEPA] sum_loss={total_loss.item():.4f}, avg_loss={avg_loss.item():.4f}, num_masked={num_masked.item()}"
+            if hasattr(sys.stdout, 'log_file'):
+                sys.stdout.log_file.write(msg + "\n")
+                sys.stdout.log_file.flush()
+            else:
+                print(msg)
+
+        return avg_loss, diff, pred, target_repr, context_repr
 
     def training_step(self, context_spectrogram, target_spectrogram, mask):
         return self.compute_latent_loss(context_spectrogram, target_spectrogram, mask)
 
     def train_forward(self, context_spectrogram, target_spectrogram):
-        # context_spectrogram: (B,D,T) already masked from dataloader
-        # target_spectrogram: (B,D,T) already contains original values
-        
-        # encode context (using already masked input)
-        context_repr, intermediate_outputs = self.context_encoder(context_spectrogram)
-        
-        # encode target with frozen target encoder
+        if context_spectrogram.dim() == 3:
+            context_spectrogram = context_spectrogram.unsqueeze(1)
+        if target_spectrogram.dim() == 3:
+            target_spectrogram = target_spectrogram.unsqueeze(1)
+
+        context_repr, inter_ctx = self.context_encoder(context_spectrogram)
+
         with torch.no_grad():
-            target_repr, target_outputs = self.target_encoder(target_spectrogram)
+            target_repr, inter_tgt = self.target_encoder(target_spectrogram)
+
+        pred = self.predictor(context_repr)
+        decoded_pred = self.decoder(pred)
+        decoded_pred = decoded_pred.transpose(1,2)
         
-        # predict and decode
-        pred = self.predictor(context_repr)       # (B,T,H)
-        decoded_pred = self.decoder(pred)         # (B,T,D)
-        decoded_pred = decoded_pred.transpose(1,2)  # (B,D,T)
-        
-        return decoded_pred, mask, target_spectrogram, {
-            "layer_outputs": torch.stack(intermediate_outputs, dim=0),
-            "target_outputs": torch.stack(target_outputs, dim=0)
+        return decoded_pred, None, target_spectrogram, {
+            "layer_outputs": torch.stack([]),
+            "target_outputs": torch.stack([])
         }
 
-    # def mse_loss(self, predictions, spec, mask, intermediate_layers=None, vocalization=None):
-    #     """Computes loss in spectrogram space for training decoder"""
-    #     # Add frequency dimension to mask
-    #     mask = mask.unsqueeze(1)  # (B,1,T)
+    def inference_forward(self, x, layer_index=None, dict_key=None):
+        """
+        run model in inference mode (no masking).
+        x: (B,1,T,F) => reorder to (B,F,T)
+        returns (context_repr, layers)
         
-    #     # predictions, spec: (B,D,T), mask: (B,1,T)
-    #     masked_loss = ((predictions - spec)**2 * mask.float()).mean()
-    #     with torch.no_grad():
-    #         masked_seq_acc = masked_loss
-    #         unmasked_seq_acc = ((predictions - spec)**2 * (~mask).float()).mean()
-    #     return masked_loss, masked_seq_acc, unmasked_seq_acc
-
-    def inference_forward(self, x):
+        If layer_index and dict_key are provided, returns the output from
+        the specified layer directly in the second return value.
         """
-        Run the model in inference mode without masking.
-        Args:
-            x: Input tensor of shape (B,1,T,F) from analysis code
-        Returns:
-            tuple: (context_repr, layers) where:
-                - context_repr: Final representation (B,T,H)
-                - layers: List of dicts containing intermediate attention outputs
-        """
-        # Remove channel dimension and transpose to (B,F,T)
-        x = x.squeeze(1)  # (B,T,F)
-        x = x.transpose(1,2)  # (B,F,T)
+        x = x.squeeze(1)
+        x = x.transpose(1,2)
+        
+        if dict_key is None:
+            dict_key = "attention_output"
+            
+        context_repr, intermediate_outputs = self.context_encoder(x.unsqueeze(1), layer_index=layer_index, dict_key=dict_key)
+        
+        if isinstance(context_repr, dict):
+            if dict_key in context_repr:
+                return None, context_repr
+            else:
+                if len(context_repr) > 0:
+                    first_key = list(context_repr.keys())[0]
+                    output_dict = {dict_key: context_repr[first_key]}
+                    return None, output_dict
+                else:
+                    return None, {dict_key: None}
+        
+        if len(intermediate_outputs) > 0:
+            formatted_outputs = []
+            for i, layer_output in enumerate(intermediate_outputs):
+                if isinstance(layer_output, dict) and dict_key in layer_output:
+                    formatted_outputs.append(layer_output)
+                else:
+                    formatted_outputs.append({dict_key: layer_output})
+            return context_repr, formatted_outputs
+        else:
+            empty_dict = {dict_key: None}
+            return context_repr, [empty_dict]
 
-        # Encode without masking
-        context_repr, intermediate_outputs = self.context_encoder(x)
-
-        # Format intermediate outputs as list of dicts
-        layers = [{"attention_output": out} for out in intermediate_outputs]
-
-        return context_repr, layers
+def get_memory_usage():
+    if torch.cuda.is_available():
+        mem_allocated = torch.cuda.memory_allocated() / 1024**2  # MB
+        mem_reserved = torch.cuda.memory_reserved() / 1024**2    # MB
+        return f"Memory: {mem_allocated:.1f}MB allocated, {mem_reserved:.1f}MB reserved"
+    return "CUDA not available"

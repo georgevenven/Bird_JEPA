@@ -32,7 +32,7 @@ def main() -> None:
         usage=(
             "python main.py {pretrain,finetune,infer} [<script‑specific flags>]\n\n"
             "Examples\n"
-            "  python main.py pretrain  --name jepa_base --steps 500k --batch_size 64\n"
+            "  python main.py pretrain  --run_dir jepa_base --steps 500k --batch_size 64\n"
             "  python main.py finetune  --train_spec_dir data/train_specs "
             "                           --val_spec_dir data/val_specs\n"
             "  python main.py infer     --val_spec_dir data/val_specs "
