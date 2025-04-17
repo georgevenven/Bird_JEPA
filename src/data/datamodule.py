@@ -1,7 +1,7 @@
 import pandas as pd, re
 from pathlib import Path
 from torch.utils.data import DataLoader, SequentialSampler
-from bird_datasets import BirdSpectrogramDataset
+from src.data.bird_datasets import BirdSpectrogramDataset
 
 class BirdDataModule:
     """

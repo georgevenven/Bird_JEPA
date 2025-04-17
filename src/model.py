@@ -541,7 +541,7 @@ class BirdJEPA(nn.Module):
         context_repr, _ = self.context_encoder(context_spectrogram)
 
         if self.zero_predictor_input:
-            mask_3d = mask.unsqueeze(-1).expand_as(context_repr)
+            mask_3d = mask.any(dim=1, keepdim=True).transpose(1,2)
             context_repr[mask_3d] = 0
 
         with torch.no_grad():
@@ -549,10 +549,11 @@ class BirdJEPA(nn.Module):
 
         pred = self.predictor(context_repr)
 
-        mask = mask.unsqueeze(-1)
-        diff = (pred - target_repr) ** 2 * mask
+        # Collapse F – we only care "is *any* freq‑bin masked at t?"
+        mask2d = mask.any(dim=1)  # (B,T)
+        diff = (pred - target_repr) ** 2 * mask2d.unsqueeze(-1)
         total_loss = diff.sum()
-        num_masked = mask.sum()
+        num_masked = mask2d.sum()
         avg_loss = total_loss / (num_masked + 1e-8)
         if self.debug or is_eval_step:
             msg = f"[BirdJEPA] sum_loss={total_loss.item():.4f}, avg_loss={avg_loss.item():.4f}, num_masked={num_masked.item()}"

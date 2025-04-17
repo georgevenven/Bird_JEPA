@@ -6,7 +6,7 @@ from matplotlib.widgets import Button
 from matplotlib.backend_bases import KeyEvent
 
 # ===== MODIFY THESE PARAMETERS =====
-NPZ_DIR = '/home/george-vengrovski/Documents/projects/Bird_JEPA/temp/test_dir'
+NPZ_DIR = '/Users/georgev/Documents/codebases/BirdJEPA/xeno_specs'
 PATTERN = '*.npz'        # File pattern to match
 SPEC_KEY = 's'           # Key for the spectrogram in the NPZ file
 CROP_TOP = 0            # Crop from the top

@@ -20,7 +20,10 @@ class BirdSpectrogramDataset(Dataset):
                  segment_len: int = 50,
                  infinite: bool = True,
                  verbose: bool = False):
-        self.paths: List[str] = [e.path for e in os.scandir(data_dir)]
+        self.paths: List[str] = [
+            e.path for e in os.scandir(data_dir)
+            if e.is_file() and e.name.lower().endswith(".npz")
+        ]
         if not self.paths:
             # Gracefully handle empty directory: create empty CSV with just column labels
             empty_csv_path = os.path.join(data_dir, "empty.csv")
@@ -67,7 +70,13 @@ class BirdSpectrogramDataset(Dataset):
         if self.infinite:
             idx = random.randint(0, len(self.paths) - 1)
         path = self.paths[idx]
-        npz  = load_np(path)
+        try:
+            npz = load_np(path)
+        except Exception as exc:
+            print(f"[dataset] could not read {path}: {exc}")
+            if self.infinite:
+                return self.__getitem__(random.randint(0, len(self.paths)-1))
+            raise  # let the dataloader know we're out of data
         spec = npz['s'][:, :-1]              # drop final STFT frame
         labels = npz['labels']
 
