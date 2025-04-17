@@ -132,16 +132,16 @@ def create_zip_archive(experiment_path, output_dir="zips", pretrained_path=None,
             exp_weights_dir = exp_temp_path / "weights"
             os.makedirs(exp_weights_dir, exist_ok=True)
             
-            best_weight_files = list(weights_dir.glob("best_*_step_*.pt"))
-            if best_weight_files:
+            ckpt_files = list(weights_dir.glob("ckpt_step_*.pt"))
+            if ckpt_files:
                 def get_step_number(file_path):
-                    match = re.search(r'step_(\d+)\.pt', str(file_path))
+                    match = re.search(r'step_(\d+)\\.pt', str(file_path))
                     return int(match.group(1)) if match else 0
-                best_weight_file = sorted(best_weight_files, key=get_step_number)[-1]
-                shutil.copy2(best_weight_file, exp_weights_dir)
-                print(f"added best weight file: {best_weight_file.name}")
+                ckpt_file = sorted(ckpt_files, key=get_step_number)[-1]
+                shutil.copy2(ckpt_file, exp_weights_dir)
+                print(f"added checkpoint file: {ckpt_file.name}")
             else:
-                print("warning: no best weight files found!")
+                print("warning: no checkpoint files found!")
         
         # include pretrained model if provided
         if pretrained_path:

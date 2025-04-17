@@ -61,7 +61,8 @@ echo "created temporary directory: $TEMP_DIR"
 # 1. split files into train and test (python writes train_files.txt and test_files.txt)
 python3 scripts/test_train_split.py "$INPUT_DIR" "$TEST_PERCENTAGE" \
         --train_output "$TRAIN_FILE_LIST" \
-        --test_output "$TEST_FILE_LIST"
+        --test_output "$TEST_FILE_LIST" \
+        --full_paths
 
 # 2. read the file lists into arrays
 train_files=()

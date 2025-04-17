@@ -29,7 +29,8 @@ class WavtoSpec:
         step_size=119,
         nfft=1024,
         generate_random_files_number=None,
-        single_threaded=True
+        single_threaded=True,
+        file_list=None
     ):
         """
         Constructor for the WavtoSpec class.
@@ -42,6 +43,7 @@ class WavtoSpec:
             nfft (int): FFT size for the STFT.
             generate_random_files_number (int or None): If set, processes only N random files.
             single_threaded (bool): Whether to run single-threaded (True) or multi-threaded (False).
+            file_list (str or None): Path to a text file containing file paths to process.
         """
         self.src_dir = src_dir
         self.dst_dir = dst_dir
@@ -51,6 +53,7 @@ class WavtoSpec:
         self.nfft = nfft
         self.generate_random_files_number = generate_random_files_number
         self.single_threaded = single_threaded
+        self.file_list = file_list
         
         # Initialize the shared counter
         manager = multiprocessing.Manager()
@@ -67,14 +70,18 @@ class WavtoSpec:
 
     def process_directory(self):
         print("Starting process_directory")
-        print(f"Source directory: {self.src_dir}")
-
-        # Gather .wav and .mp3 files
-        audio_files = [
-            os.path.join(root, file)
-            for root, dirs, files in os.walk(self.src_dir)
-            for file in files if file.lower().endswith(('.wav', '.mp3', '.ogg'))
-        ]
+        if self.file_list is not None:
+            print(f"Using file list: {self.file_list}")
+            with open(self.file_list, 'r') as f:
+                audio_files = [line.strip() for line in f if line.strip()]
+        else:
+            print(f"Source directory: {self.src_dir}")
+            # Gather .wav and .mp3 files
+            audio_files = [
+                os.path.join(root, file)
+                for root, dirs, files in os.walk(self.src_dir)
+                for file in files if file.lower().endswith(('.wav', '.mp3', '.ogg'))
+            ]
 
         # Handle random file selection if user requested
         if (self.generate_random_files_number is not None 
@@ -402,7 +409,9 @@ class WavtoSpec:
 
 def main():
     parser = argparse.ArgumentParser(description="Convert WAV files to spectrograms.")
-    parser.add_argument('--src_dir', type=str, required=True, help='Source directory containing WAV files.')
+    group = parser.add_mutually_exclusive_group(required=True)
+    group.add_argument('--src_dir', type=str, help='Source directory containing WAV files.')
+    group.add_argument('--file_list', type=str, help='Text file with list of files to process.')
     parser.add_argument('--dst_dir', type=str, required=True, help='Destination directory to save spectrograms.')
     parser.add_argument('--song_detection_json_path', type=str, default=None,
                         help='Path to the JSON file with song detection data.')
@@ -429,7 +438,8 @@ def main():
         step_size=args.step_size,
         nfft=args.nfft,
         generate_random_files_number=args.generate_random_files_number,
-        single_threaded=single_threaded
+        single_threaded=single_threaded,
+        file_list=args.file_list
     )
     wav_to_spec.process_directory()  
 

@@ -1,1124 +1,381 @@
-import os
-import pandas as pd
-import torch
-import torch.nn as nn
-import argparse
-import re
-import numpy as np
-import matplotlib.pyplot as plt
+# src/finetuning.py
+# end‑to‑end training + inference script with on‑the‑fly kaggle ROC‑AUC
+
+import argparse, json, shutil, time, re
 from pathlib import Path
-import json
-import time
-from datetime import datetime
-import pandas.api.types
-import sklearn.metrics
-from sklearn.metrics import roc_auc_score
-import shutil
-from tqdm import tqdm
-import csv 
-import sys
-# func torch
-import torch.nn.functional as F
-import onnxruntime as ort
-import onnx
+import numpy as np, pandas as pd, torch, torch.nn as nn, torch.nn.functional as F
+import matplotlib.pyplot as plt
+import onnx, onnxruntime as ort
 from onnxruntime.quantization import quantize_dynamic, QuantType
-from torch.utils.data import SequentialSampler
 
-# Import from project modules
-from model import BirdJEPA
-from utils import load_model
-from spectrogram_generator import WavtoSpec
-from data_class import BirdJEPA_Dataset, collate_fn as data_class_collate_fn
+from datamodule import BirdDataModule
+from model import BirdJEPA           # unchanged upstream import
+from utils import load_model         # unchanged upstream import
+from collate import masking_collate  # reuse
 
-# ParticipantVisibleError for Kaggle metrics
-class ParticipantVisibleError(Exception):
-    pass
+# ------------------------------------------------------------------
+# self‑contained kaggle‑style macro ROC‑AUC (no external deps)
+from sklearn.metrics import roc_auc_score
 
-# Kaggle evaluation function
-def kaggle_score(solution: pd.DataFrame, submission: pd.DataFrame, row_id_column_name: str) -> float:
-    '''
-    Version of macro-averaged ROC-AUC score that ignores all classes that have no true positive labels.
-    '''
-    del solution[row_id_column_name]
-    del submission[row_id_column_name]
+def kaggle_roc_auc(solution_df: pd.DataFrame,
+                   submission_df: pd.DataFrame,
+                   row_id: str = "row_id") -> float:
+    """
+    Replicates Kaggle's BirdCLEF macro‑ROC‑AUC metric:
+      • drop the row‑id col
+      • ignore any species with zero positives in the ground‑truth
+      • average AUC over the remaining species
+      • silently skip constant‑prediction errors
 
-    if not pandas.api.types.is_numeric_dtype(submission.values):
-        bad_dtypes = {x: submission[x].dtype for x in submission.columns if not pandas.api.types.is_numeric_dtype(submission[x])}
-        raise ParticipantVisibleError(f'Invalid submission data types found: {bad_dtypes}')
+    Returns NaN if no class is score‑able.
+    """
+    # split off label columns
+    sol = solution_df.drop(columns=[row_id])
+    sub = submission_df.drop(columns=[row_id])
 
-    solution_sums = solution.sum(axis=0)
-    scored_columns = list(solution_sums[solution_sums > 0].index.values)
-    assert len(scored_columns) > 0
-
-    try:
-        return roc_auc_score(solution[scored_columns].values, submission[scored_columns].values, average='macro')
-    except Exception as e:
-        # Handle potential errors in scoring
-        print(f"Error in calculating score: {e}")
-        return 0.0
-
-# Safe implementation for calculating ROC AUC score (equivalent to kaggle_metric_utilities.safe_call_score)
-def safe_roc_auc_score(y_true, y_pred, average='macro'):
-    """Safely calculate ROC AUC score, handling edge cases."""
-    try:
-        return roc_auc_score(y_true, y_pred, average=average)
-    except ValueError as e:
-        # Handle case where a class might not have both positive and negative samples
-        print(f"Warning in ROC AUC calculation: {e}")
-        # Fall back to calculating for classes that can be scored
-        if average == 'macro':
-            # Calculate per-class scores where possible
-            classes = np.unique(np.where(y_true == 1)[1])
-            if len(classes) == 0:
-                return 0.0
-            scores = []
-            for c in classes:
-                try:
-                    class_score = roc_auc_score(y_true[:, c], y_pred[:, c])
-                    scores.append(class_score)
-                except ValueError:
-                    # Skip classes that cause errors
-                    pass
-            return np.mean(scores) if scores else 0.0
-        return 0.0
-
-# --- modified BirdCLEFDataWrapper to allow custom collate_fn and shuffle ---
-class BirdCLEFDataWrapper:
-    def __init__(self, csv_path, data_dir, context_length, batch_size, infinite_dataset=True, collate_fn=None, shuffle=True):
-        self.csv_path = csv_path
-        self.data_dir = data_dir
-        self.batch_size = batch_size
-        self.context_length = context_length
-        self.infinite_dataset = infinite_dataset
-        
-        # DEBUG: Print key initialization parameters
-        print(f"DEBUG: BirdCLEFDataWrapper init with data_dir={data_dir}, infinite_dataset={infinite_dataset}, shuffle={shuffle}")
-        
-        # Load CSV file into memory 
-        self.csv_data = pd.read_csv(self.csv_path)
-        
-        # Extract primary_label and filename columns
-        self.primary_labels = self.csv_data['primary_label'].values
-        self.filenames = self.csv_data['filename'].values if 'filename' in self.csv_data.columns else self.csv_data['file_name'].values
-        
-        # Get unique classes and create label mapping
-        self.unique_labels = sorted(self.csv_data['primary_label'].unique())
-        self.num_classes = len(self.unique_labels)
-        self.label_to_idx = {label: i for i, label in enumerate(self.unique_labels)}
-        
-        # Create a mapping from identifier to label
-        self.identifier_to_label = {}
-        pattern = re.compile(r'(XC\d+|iNat\d+|CSA\d+)')
-        
-        for i, row in self.csv_data.iterrows():
-            filename = row['filename'] if 'filename' in self.csv_data.columns else row['file_name']
-            # Remove directory part if present
-            if '/' in filename:
-                filename = filename.split('/')[-1]
-            
-            # Extract the identifier (XC number or iNat number)
-            match = pattern.search(filename)
-            if match:
-                identifier = match.group(1)
-                self.identifier_to_label[identifier] = row['primary_label']
-        
-        print(f"Created mapping for {len(self.identifier_to_label)} files")
-        
-        # Initialize the dataset
-        self.init_dataset(context_length, collate_fn, shuffle)
-        
-        # DEBUG: Track which files have been processed
-        self.processed_files = []
-        self.batch_counter = 0
-
-    def get_label_for_file(self, filename):
-        """Get the primary label for a given filename based on XC/iNat identifier"""
-        # Extract the identifier from the filename
-        pattern = re.compile(r'(XC\d+|iNat\d+|CSA\d+)')
-        
-        # Extract the identifier from the filename
-        match = pattern.search(filename)
-        if match:
-            identifier = match.group(1)
-            if identifier in self.identifier_to_label:
-                label = self.identifier_to_label[identifier]
-                label_idx = self.label_to_idx[label]
-                return label, label_idx
-        
-        print(f"Warning: No label found for {filename}")
-        return None, -1
-
-    def init_dataset(self, context_length, collate_fn, shuffle):
-        print(f"Initializing dataset from {self.data_dir}")
-        
-        # DEBUG: List actual files in directory
+    aucs = []
+    for col in sol.columns:
+        if sol[col].sum() == 0:
+            continue                    # skip species never present
         try:
-            dir_files = os.listdir(self.data_dir)
-            print(f"DEBUG: Files in {self.data_dir}: {dir_files}")
-        except Exception as e:
-            print(f"DEBUG: Error listing directory: {e}")
-        
-        self.dataset = BirdJEPA_Dataset(data_dir=self.data_dir, segment_len=context_length, infinite_dataset=self.infinite_dataset)
-        
-        # DEBUG: Print actual dataset file paths
-        print(f"DEBUG: Dataset file paths: {self.dataset.file_paths}")
-        
-        if collate_fn is None:
-            collate_fn = data_class_collate_fn
-        
-        self.dataloader = torch.utils.data.DataLoader(
-            self.dataset,
-            batch_size=self.batch_size,
-            shuffle=False,
-            collate_fn=collate_fn if self.infinite_dataset else None,
-            sampler=SequentialSampler(self.dataset)  # Force sequential access
-        )
-        
-        self.dataloader_iter = iter(self.dataloader)
-        print(f"Dataset initialized with {len(self.dataset)} samples")
-        
-        # DEBUG: Track iteration state
-        self.iteration_count = 0
-        self.reset_count = 0
-    
-    def next_batch(self):
-        # DEBUG: Track batch requests
-        self.batch_counter += 1
-        print(f"\nDEBUG: next_batch called ({self.batch_counter}), iteration_count={self.iteration_count}, reset_count={self.reset_count}")
-        
-        try:
-            self.iteration_count += 1
-            batch = next(self.dataloader_iter)
-            
-            # DEBUG: Print batch structure for diagnostics
-            print(f"DEBUG: Batch type: {type(batch)}, structure: {type(batch) if not isinstance(batch, (tuple, list)) else [type(item) for item in batch]}")
-            
-            # If we want to extract labels for the files in this batch
-            if isinstance(batch, tuple) and len(batch) >= 6:
-                filenames = batch[5]
-                batch_labels = []
-                batch_label_indices = []
-                
-                # DEBUG: Track filenames
-                print(f"DEBUG: Processing batch with filenames: {filenames}")
-                
-                for filename in filenames:
-                    # Track processed files
-                    self.processed_files.append(filename)
-                    
-                    label, label_idx = self.get_label_for_file(filename)
-                    batch_labels.append(label)
-                    batch_label_indices.append(label_idx)
-                
-                # Return batch along with extracted labels
-                return batch, batch_labels, batch_label_indices
-            
-            # this is sketchy, but when analyzing, we don't have a collate fn, so we return segment, segment_labels, os.path.basename(file_path) from dataclass
-            if isinstance(batch, list) and len(batch) >= 3:
-                filenames = batch[2]
-                
-                # DEBUG: Track filenames
-                print(f"DEBUG: Processing analysis batch with filenames: {filenames}")
-                
-                batch_labels = []
-                batch_label_indices = []
-                
-                for filename in filenames:
-                    # Track processed files
-                    self.processed_files.append(filename)
-                    
-                    label, label_idx = self.get_label_for_file(filename)
-                    batch_labels.append(label)
-                    batch_label_indices.append(label_idx)
+            aucs.append(roc_auc_score(sol[col].values, sub[col].values))
+        except ValueError:
+            # happens if predictions are constant 0/1 – just skip
+            pass
 
-                return batch[0], batch_labels, batch_label_indices, filenames
+    return float(np.mean(aucs)) if aucs else np.nan
 
-            # If no filenames to process, just return the batch with empty label lists
-            print("DEBUG: No filenames found in batch")
-            return batch, [], []
-        except StopIteration:
-            # Handle StopIteration based on whether we're using an infinite dataset
-            if self.infinite_dataset:
-                # Reset iterator if we've gone through the entire dataset
-                self.dataloader_iter = iter(self.dataloader)
-                self.reset_count += 1
-                print(f"DEBUG: StopIteration reached, resetting dataloader_iter (reset #{self.reset_count})")
-                
-                # DEBUG: Report on processed files
-                if self.processed_files:
-                    unique_files = set(self.processed_files)
-                    print(f"DEBUG: Processed {len(self.processed_files)} total files, {len(unique_files)} unique")
-                    print(f"DEBUG: Unique files processed: {sorted(unique_files)}")
-                    
-                    # Count occurrences of each file
-                    from collections import Counter
-                    file_counts = Counter(self.processed_files)
-                    print(f"DEBUG: File counts: {file_counts}")
-                
-                return self.next_batch()
-            else:
-                # For finite datasets, we should not reset - just raise the exception
-                # This allows the caller to know we've processed all files
-                print(f"DEBUG: End of dataset reached after {self.iteration_count} iterations")
-                raise
-
+# --------------------------------------------------------------------------
+# classifier head -----------------------------------------------------------
 class Classifier(nn.Module):
-    def __init__(self, context_length, num_classes, hidden_dim=64, pool_type='mean'):
-        super(Classifier, self).__init__()
-        self.pool_type = pool_type  # 'mean' or 'max'
-        
-        # MLP after pooling (much smaller now)
-        self.mlp = nn.Sequential(
+    def __init__(self, hidden_dim: int, num_classes: int, pool: str = "mean"):
+        super().__init__()
+        self.pool = pool
+        self.mlp  = nn.Sequential(
             nn.Linear(hidden_dim, 128),
             nn.ReLU(),
             nn.Dropout(0.3),
-            nn.Linear(128, num_classes)
-            # Remove sigmoid/softmax - BCEWithLogitsLoss will apply sigmoid internally
-        )    
+            nn.Linear(128, num_classes))
 
     def forward(self, x):
-        # x shape: [batch_size, context_length, hidden_dim]
-        
-        # Apply global pooling across temporal dimension
-        if self.pool_type == 'mean':
-            # Mean pooling over the temporal dimension
-            pooled = torch.mean(x, dim=1)  # [batch_size, hidden_dim]
-        elif self.pool_type == 'max':
-            # Max pooling over the temporal dimension
-            pooled, _ = torch.max(x, dim=1)  # [batch_size, hidden_dim]
-        
-        # Pass through MLP
-        return self.mlp(pooled)
+        x = x.mean(1) if self.pool == "mean" else x.max(1).values
+        return self.mlp(x)
 
-class Model(nn.Module):
-    def __init__(self, model_path=None, context_length=500, num_classes=1, pool_type='mean'):
-        super(Model, self).__init__()
-        self.model_path = model_path
-        self.context_length = context_length
-        self.num_classes = num_classes
-        self.encoder = None
-        self.classifier = Classifier(context_length, num_classes, hidden_dim=64, pool_type=pool_type)
-        
-        # Load pretrained model if path is provided
-        if model_path:
-            print(f"Loading pretrained encoder from {model_path}")
-            self.encoder = load_model(model_path, load_weights=True)
-        else:
-            print("No pretrained encoder path provided. Model will need to be initialized from a checkpoint.")
-        
-        print(f"Model initialized with context_length={context_length}, num_classes={num_classes}, pooling={pool_type}")
-    
-    def forward(self, x):
-        # Get embeddings from encoder
-        x = x.unsqueeze(1)
-        x = x.transpose(2, 3)
+# --------------------------------------------------------------------------
+# complete net --------------------------------------------------------------
+class Net(nn.Module):
+    def __init__(self, encoder_path: str, context_len: int,
+                 num_classes: int, pool: str):
+        super().__init__()
+        self.encoder = load_model(encoder_path, load_weights=True) \
+                       if encoder_path else None
+        self.classifier = Classifier(64, num_classes, pool)
 
-        if self.encoder is None:
-            raise RuntimeError("Encoder not initialized. Please load a pretrained model or checkpoint.")
+    def forward(self, spec):                 # spec (B,F,T)
+        spec = spec.unsqueeze(1).transpose(2, 3)   # (B,1,T,F)
+        emb  = self.encoder.inference_forward(spec)[0]
+        return self.classifier(emb)
 
-        embedding_repr = self.encoder.inference_forward(x)
-
-        embedding_repr = embedding_repr[0]  # [batch_size, context_length, hidden_dim]
-        # No need to flatten, pass directly to classifier
-        outputs = self.classifier(embedding_repr)
-        return outputs
-        
-    def load_from_checkpoint(self, checkpoint_path, strict=True):
-        """
-        Load model weights from a checkpoint file
-        """
-        print(f"Loading model from checkpoint: {checkpoint_path}")
-        checkpoint = torch.load(checkpoint_path, map_location="cpu")
-        
-        # Check if model_config is available in the checkpoint
-        if 'model_config' in checkpoint and self.encoder is None:
-            config = checkpoint['model_config']
-            if 'pretrained_model_path' in config and config['pretrained_model_path']:
-                print(f"Initializing encoder from config: {config['pretrained_model_path']}")
-                self.encoder = load_model(config['pretrained_model_path'], load_weights=True)
-        
-        # Load state dict with specified strictness
-        self.load_state_dict(checkpoint['model_state_dict'], strict=strict)
-        return checkpoint
-
+# --------------------------------------------------------------------------
+# trainer -------------------------------------------------------------------
 class Trainer:
     def __init__(self, args):
         self.args = args
-        
-        # Initialize data wrappers first to get num_classes
-        print("Initializing data wrappers...")
-        self.train_wrapper = BirdCLEFDataWrapper(
-            csv_path=self.args.train_csv, 
-            data_dir=self.args.train_spec_dir,
-            context_length=self.args.context_length,
-            batch_size=self.args.batch_size
+        self.data = BirdDataModule(args.train_csv,
+                                   args.train_spec_dir,
+                                   args.val_spec_dir,
+                                   args.context_length,
+                                   args.batch_size,
+                                   num_workers=args.num_workers)
+
+        self.net  = Net(args.pretrained_model_path,
+                        args.context_length,
+                        self.data.num_classes,
+                        args.pool_type)
+
+        self.dev  = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+        self.net.to(self.dev)
+        self.crit = nn.BCEWithLogitsLoss()
+        self.opt  = torch.optim.Adam(
+            self.net.classifier.parameters() if args.freeze_encoder
+            else self.net.parameters(),
+            lr=args.learning_rate)
+        self.best_loss = 9e9
+
+        # -------- dirs & metadata -----------------------------------
+        self.run_dir     = Path(args.output_dir)
+        self.weights_dir = self.run_dir / "weights"
+        self.run_dir.mkdir(parents=True, exist_ok=True)
+        self.weights_dir.mkdir(exist_ok=True)
+        (self.run_dir / "config.json").write_text(
+            json.dumps(vars(args), indent=2)
         )
 
-        self.val_wrapper = BirdCLEFDataWrapper(
-            csv_path=self.args.train_csv, 
-            data_dir=self.args.val_spec_dir,
-            context_length=self.args.context_length,
-            batch_size=self.args.batch_size
-        )
-        
-        # Now initialize model with proper num_classes
-        self.model = Model(
-            args.pretrained_model_path, 
-            args.context_length,
-            num_classes=self.train_wrapper.num_classes,
-            pool_type=args.pool_type
-        )
-        
-        # If a resume checkpoint is provided, load it
-        if hasattr(args, 'resume_checkpoint') and args.resume_checkpoint:
-            print(f"Resuming from checkpoint: {args.resume_checkpoint}")
-            checkpoint = self.model.load_from_checkpoint(args.resume_checkpoint, strict=False)
-            print(f"Loaded checkpoint from step {checkpoint.get('step', 'unknown')}")
-        
-        # Set up optimizer and loss function
-        if self.args.freeze_encoder:
-            # Only train the classifier if freeze_encoder is enabled
-            self.optimizer = torch.optim.Adam(
-                self.model.classifier.parameters(), 
-                lr=self.args.learning_rate
-            )
-            print("Freezing encoder: only classifier will be trained")
-        else:
-            # Train both encoder and classifier by default
-            self.optimizer = torch.optim.Adam(
-                self.model.parameters(), 
-                lr=self.args.learning_rate
-            )
-            print("Training both encoder and classifier")
-        self.criterion = nn.BCEWithLogitsLoss()  # use BCEWithLogitsLoss for multi-label classification
-        
-        # Move model to device
-        self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-        self.model.classifier.to(self.device)
-        if self.model.encoder:
-            self.model.encoder.to(self.device)
-            
-        # Initialize loss and metric tracking
-        self.train_losses = []
-        self.val_losses = []
-        self.train_losses_ema = []
-        self.val_losses_ema = []
-        self.eval_steps = []
-        self.ema_alpha = args.ema_alpha if hasattr(args, 'ema_alpha') else 0.2
-        
-        self.val_roc_auc_scores = []
-        self.val_roc_auc_scores_ema = []
-        
-        # new output directory handling: if a folder already exists with the same name, move it to /archive
-        if args.output_dir:
-            self.run_dir = Path(args.output_dir)
-            if self.run_dir.exists():
-                archive_dir = self.run_dir.parent / "archive"
-                archive_dir.mkdir(parents=True, exist_ok=True)
-                archive_path = archive_dir / f"{self.run_dir.name}_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
-                print(f"existing folder detected. archiving to {archive_path}")
-                shutil.move(str(self.run_dir), str(archive_path))
-            self.run_dir.mkdir(parents=True, exist_ok=True)
-            # dump config details to config.json along with encoder config if available
-            config_path = self.run_dir / "config.json"
-            config_data = vars(self.args).copy()
-            if self.model.encoder is not None:
-                # assuming the encoder provides its relevant parameters via a get_config() method
-                # otherwise, manually specify the attributes you want to save (e.g., num_layers, hidden_dim, etc.)
-                if hasattr(self.model.encoder, "get_config"):
-                    config_data['encoder_config'] = self.model.encoder.get_config()
-                else:
-                    config_data['encoder_config'] = {
-                        "dummy_key": "dummy_value"  # replace with relevant encoder parameters
-                    }
-            with open(config_path, "w") as f:
-                json.dump(config_data, f, indent=4)
-        else:
-            self.run_dir = None
-        
-        # get unique bird classes for ROC-AUC evaluation
-        self.bird_classes = self.train_wrapper.unique_labels
+        # tee everything
+        self.log = Tee(self.run_dir / "train_log.txt")
 
-    def calculate_ema(self, current_value, previous_ema=None):
-        if previous_ema is None:
-            return current_value
-        return self.ema_alpha * current_value + (1 - self.ema_alpha) * previous_ema
+    # ---------------------------------------------------------------
+    def step_batch(self, batch):
+        # batch can be (spec, lab, fnames)   or   (spec, tgt, ctx, lab, mask, fnames)
+        if len(batch) == 3:                 # new no‑mask collate
+            x, _, fnames = batch
+        else:                               # legacy masking tuple
+            x, _, _, _, _, fnames = batch
+        idxs = [self.data.label_idx(f) for f in fnames]
+        if -1 in idxs: return None          # skip unlabeled
+        y = torch.zeros(len(idxs), self.data.num_classes, device=self.dev)
+        for i, c in enumerate(idxs): y[i, c] = 1
 
+        x, y = x.to(self.dev), y.to(self.dev)
+        self.opt.zero_grad()
+        loss = self.crit(self.net(x), y)
+        loss.backward()
+        self.opt.step()
+        return loss.item()
+
+    # ---------------------------------------------------------------
     def train(self):
-        print(f"Starting training loop for {self.args.max_steps} steps")
-        running_loss = 0.0
-        best_val_loss = float('inf')
-        best_roc_auc = 0.0
-        patience_counter = 0
-        
-        for step in range(self.args.max_steps):
-            batch_tuple, batch_labels, batch_label_indices = self.train_wrapper.next_batch()
-            if -1 in batch_label_indices:
-                print("Skipping batch with missing labels")
-                continue
+        raw_loss, tr_hist, val_hist, steps = [], [], [], []
+        impatience = 0
+        ema_val = None
+        ema_train = None
+        alpha = 0.1  # smoothing factor for EMA
+        for step in range(1, self.args.max_steps + 1):
+            l = self.step_batch(next(iter(self.data.train_loader)))
+            if l is None: continue
+            raw_loss.append(l)
 
-            inputs = batch_tuple[0].to(self.device)
-            batch_size = len(batch_label_indices)
-            labels = torch.zeros(batch_size, self.train_wrapper.num_classes, device=self.device)
-            for i, idx in enumerate(batch_label_indices):
-                labels[i, idx] = 1.0
+            if step % self.args.eval_interval: continue
+            val = self.evaluate()
 
-            self.optimizer.zero_grad()
-            outputs = self.model.forward(inputs)
-            loss = self.criterion(outputs, labels)            
-            loss.backward()
-            self.optimizer.step()
+            steps.append(step)
+            # Compute EMA for train loss
+            if ema_train is None:
+                ema_train = l
+            else:
+                ema_train = alpha * l + (1 - alpha) * ema_train
+            tr_hist.append(ema_train)
+            # Compute EMA for val loss
+            if ema_val is None:
+                ema_val = val
+            else:
+                ema_val = alpha * val + (1 - alpha) * ema_val
+            val_hist.append(ema_val)
+            # ---- grad‑norm -------------------------------------------------
+            gn_sq = 0.0
+            for p in self.net.parameters():
+                if p.grad is not None:
+                    gn_sq += p.grad.norm() ** 2
+            grad_norm = gn_sq ** 0.5
 
-            running_loss += loss.item()
-            if (step + 1) % self.args.eval_interval == 0:
-                avg_train_loss = running_loss / self.args.eval_interval
-                val_loss, roc_auc_score_val = self.evaluate(model=self.model, criterion=self.criterion, val_wrapper=self.val_wrapper)
+            self.log(f'step {step:05d} | loss {ema_train:.4f} '
+                     f'| val {ema_val:.4f} | grad‑norm {grad_norm:.2f}')
 
-                self.train_losses.append(avg_train_loss)
-                self.val_losses.append(val_loss)
-                self.val_roc_auc_scores.append(roc_auc_score_val)
-                self.eval_steps.append(step + 1)
-                
-                if len(self.train_losses_ema) == 0:
-                    self.train_losses_ema.append(avg_train_loss)
-                    self.val_losses_ema.append(val_loss)
-                    self.val_roc_auc_scores_ema.append(roc_auc_score_val)
-                else:
-                    self.train_losses_ema.append(self.calculate_ema(avg_train_loss, self.train_losses_ema[-1]))
-                    self.val_losses_ema.append(self.calculate_ema(val_loss, self.val_losses_ema[-1]))
-                    self.val_roc_auc_scores_ema.append(self.calculate_ema(roc_auc_score_val, self.val_roc_auc_scores_ema[-1]))
-                
-                print(f"Step {step+1}/{self.args.max_steps}, Training Loss: {avg_train_loss:.4f} (EMA: {self.train_losses_ema[-1]:.4f}), "
-                      f"Validation Loss: {val_loss:.4f} (EMA: {self.val_losses_ema[-1]:.4f}), "
-                      f"ROC-AUC: {roc_auc_score_val:.4f} (EMA: {self.val_roc_auc_scores_ema[-1]:.4f})")
-                
-                if self.args.save_best_metric == 'loss' and val_loss < best_val_loss and self.run_dir:
-                    best_val_loss = val_loss
-                    patience_counter = 0
-                    self.save_model(step, "best_loss")
-                elif self.args.save_best_metric == 'roc_auc' and roc_auc_score_val > best_roc_auc and self.run_dir:
-                    best_roc_auc = roc_auc_score_val
-                    patience_counter = 0
-                    self.save_model(step, "best_roc_auc")
-                else:
-                    patience_counter += 1
-                
-                if (step + 1) % self.args.save_interval == 0 and self.run_dir:
-                    self.save_model(step, "checkpoint")
-                
-                if patience_counter >= self.args.early_stopping_patience:
-                    print(f"Early stopping triggered at step {step+1}")
-                    break
-                
-                running_loss = 0.0
-        
-        self.save_loss_data()
-        self.plot_losses()
-        self.plot_roc_auc()
-        self.model.eval()
+            if val < self.best_loss:                   # improvement
+                self.best_loss = val
+                impatience = 0
+            else:
+                impatience += 1
+            if step % self.args.save_interval == 0:
+                self.save(step, 'ckpt')
+            if impatience >= self.args.early_stopping_patience:
+                self.log(f'early stop at step {step} '
+                         f'(val not improved for {impatience} evals)')
+                self.save(step, 'ckpt')
+                break
 
-    def save_model(self, step, prefix="checkpoint"):
-        if not self.run_dir:
-            return
-        # save weight checkpoints to a 'weights' subfolder
-        weights_dir = self.run_dir / "weights"
-        weights_dir.mkdir(exist_ok=True)
-        save_path = weights_dir / f"{prefix}_step_{step+1}.pt"
-        
-        # Save more comprehensive information about the model
-        model_config = {
-            'context_length': self.args.context_length,
-            'num_classes': self.train_wrapper.num_classes,
-            'pool_type': self.args.pool_type,
-            'freeze_encoder': self.args.freeze_encoder,
-            'pretrained_model_path': self.args.pretrained_model_path
-        }
-        
-        torch.save({
-            'step': step + 1,
-            'model_state_dict': self.model.state_dict(),
-            'optimizer_state_dict': self.optimizer.state_dict(),
-            'train_loss': self.train_losses[-1] if self.train_losses else None,
-            'val_loss': self.val_losses[-1] if self.val_losses else None,
-            'model_config': model_config,
-        }, save_path)
-        print(f"Model saved to {save_path}")
+        # ---------- artifacts --------------------------------------
+        loss_dict = {"step": steps, "train_loss": tr_hist, "val_loss": val_hist}
+        (self.run_dir / "loss.json").write_text(json.dumps(loss_dict, indent=2))
 
-    def save_loss_data(self):
-        if not self.run_dir:
-            return
-        loss_data = {
-            'steps': self.eval_steps,
-            'train_loss': self.train_losses,
-            'val_loss': self.val_losses,
-            'train_loss_ema': self.train_losses_ema,
-            'val_loss_ema': self.val_losses_ema,
-            'val_roc_auc': self.val_roc_auc_scores,
-            'val_roc_auc_ema': self.val_roc_auc_scores_ema
-        }
-        # save loss data as loss.json (instead of metrics_data.json)
-        json_path = self.run_dir / 'loss.json'
-        with open(json_path, 'w') as f:
-            json.dump(loss_data, f, indent=4)
-        
-        csv_path = self.run_dir / 'loss_data.csv'
-        df = pd.DataFrame(loss_data)
-        df.to_csv(csv_path, index=False)
-        
-        print(f"Loss data saved to {json_path} and {csv_path}")
-
-    # plot_losses and plot_roc_auc remain unchanged
-    def plot_losses(self):
-        if not self.run_dir:
-            return
-        plt.figure(figsize=(10, 6))
-        plt.plot(self.eval_steps, self.train_losses, 'b-', alpha=0.3, label='Train Loss')
-        plt.plot(self.eval_steps, self.val_losses, 'r-', alpha=0.3, label='Validation Loss')
-        plt.plot(self.eval_steps, self.train_losses_ema, 'b-', linewidth=2, label='Train Loss (EMA)')
-        plt.plot(self.eval_steps, self.val_losses_ema, 'r-', linewidth=2, label='Validation Loss (EMA)')
-        plt.title('Training and Validation Loss')
-        plt.xlabel('Steps')
-        plt.ylabel('Loss')
-        plt.legend()
-        plt.grid(True, alpha=0.3)
-        plot_path = self.run_dir / 'loss_plot.png'
-        plt.savefig(plot_path, dpi=300, bbox_inches='tight')
-        plt.close()
-        print(f"Loss plot saved to {plot_path}")
-
-    def plot_roc_auc(self):
-        if not self.run_dir or not self.val_roc_auc_scores:
-            return
-        plt.figure(figsize=(10, 6))
-        plt.plot(self.eval_steps, self.val_roc_auc_scores, 'g-', alpha=0.3, label='Validation ROC-AUC')
-        plt.plot(self.eval_steps, self.val_roc_auc_scores_ema, 'g-', linewidth=2, label='Validation ROC-AUC (EMA)')
-        plt.title('Validation ROC-AUC Score')
-        plt.xlabel('Steps')
-        plt.ylabel('ROC-AUC')
-        plt.legend()
-        plt.grid(True, alpha=0.3)
-        plt.ylim(0.5, 1.05)
-        plot_path = self.run_dir / 'roc_auc_plot.png'
-        plt.savefig(plot_path, dpi=300, bbox_inches='tight')
-        plt.close()
-        print(f"ROC-AUC plot saved to {plot_path}")
-
-    # evaluate remains unchanged
-    def evaluate(self, model, criterion, val_wrapper):
-        model.eval()
-        total_loss = 0.0
-        num_batches = 5
-        all_labels = []
-        all_preds = []
-        with torch.no_grad():
-            for _ in range(num_batches):
-                batch_tuple, batch_labels, batch_label_indices = val_wrapper.next_batch()
-                if -1 in batch_label_indices:
-                    continue
-                inputs = batch_tuple[0].to(self.device)
-                batch_size = len(batch_label_indices)
-                labels = torch.zeros(batch_size, val_wrapper.num_classes, device=self.device)
-                for i, idx in enumerate(batch_label_indices):
-                    labels[i, idx] = 1.0
-                outputs = model.forward(inputs)
-                loss = criterion(outputs, labels)
-                total_loss += loss.item()
-                probs = torch.sigmoid(outputs)
-                all_labels.append(labels.cpu().numpy())
-                all_preds.append(probs.cpu().numpy())
-        avg_loss = total_loss / num_batches
-        roc_auc = 0.0
-        if all_labels and all_preds:
-            try:
-                all_labels = np.vstack(all_labels)
-                all_preds = np.vstack(all_preds)
-                solution_df = pd.DataFrame(all_labels, columns=self.bird_classes)
-                submission_df = pd.DataFrame(all_preds, columns=self.bird_classes)
-                row_ids = [f"row_{i}" for i in range(len(solution_df))]
-                solution_df.insert(0, "row_id", row_ids)
-                submission_df.insert(0, "row_id", row_ids)
-                roc_auc = kaggle_score(solution_df.copy(), submission_df.copy(), "row_id")
-            except Exception as e:
-                print(f"Error calculating ROC-AUC: {e}")
-        model.train()
-        return avg_loss, roc_auc
-
-class Analysis:
-    def __init__(self, args):
-        self.args = args
-        self.run_dir = Path(args.output_dir)
-        weights_dir = self.run_dir / "weights"
-        checkpoint_files = list(weights_dir.glob("best_*_step_*.pt"))
-        if not checkpoint_files:
-            raise Exception("no best model checkpoint found for analysis")
-        
-        # Extract step numbers from filenames and sort by numeric value
-        def get_step_number(file_path):
-            match = re.search(r'step_(\d+)\.pt', str(file_path))
-            if match:
-                return int(match.group(1))  # Convert to integer for numeric sorting
-            return 0
-        
-        # Sort by step number, so "5750" will be higher than "750"
-        checkpoint_file = sorted(checkpoint_files, key=get_step_number)[-1]
-        
-        print(f"Loading model checkpoint from {checkpoint_file}")
-        
-        # Load number of classes from training csv
-        self.num_classes = self.load_num_classes(args.train_csv)
-        
-        # Create the model first with minimal parameters
-        self.model = Model(
-            model_path=args.pretrained_model_path,  # This can be None if loading from checkpoint
-            context_length=args.context_length,
-            num_classes=self.num_classes,
-            pool_type=args.pool_type
-        )
-        
-        # Load the checkpoint weights into the model
-        checkpoint = torch.load(checkpoint_file, map_location="cpu")
-        self.model.load_state_dict(checkpoint['model_state_dict'])
-        print(f"Successfully loaded model weights from checkpoint (step {checkpoint.get('step', 'unknown')})")
-        
-        self.model.eval()
-        
-        # Create validation dataloader with batch size 1, no shuffle, no custom collate_fn, and non-infinite dataset
-        self.val_wrapper = BirdCLEFDataWrapper(
-            csv_path=args.train_csv,
-            data_dir=args.val_spec_dir,
-            context_length=None,
-            batch_size=1,
-            infinite_dataset=False,
-            collate_fn=None,
-            shuffle=False
-        )
-    
-    def load_num_classes(self, csv_path):
-        df = pd.read_csv(csv_path)
-        return len(sorted(df['primary_label'].unique()))
-
-    def run_analysis(self):
-        print("running analysis on validation data")
-        all_labels = []
-        all_preds = []
-        num_samples = len(self.val_wrapper.dataset)  # Limit to 500 samples for debugging
-        device = torch.device("cpu")
-        self.model.to(device)
-        
-        for i in tqdm(range(num_samples), desc="Processing samples"):
-            spec_tensor, label, label_idx, filenames = self.val_wrapper.next_batch()
-            
-            # Skip if no valid label
-            if label_idx == -1:
-                print(f"warning: missing label for sample {i}, skipping")
-                continue
-                
-            # slice the spec tensor into 5 second segments, and shape it as batch x freq x timebins
-            segments = []
-            for j in range(0, spec_tensor.shape[-1], 1000):
-                segment = spec_tensor[..., j:j+1000]
-                if segment.shape[-1] < 1000:
-                    # Pad with zeros to reach 1000
-                    pad_size = 1000 - segment.shape[-1]
-                    pad_tensor = torch.zeros(*segment.shape[:-1], pad_size, device=segment.device)
-                    segment = torch.cat([segment, pad_tensor], dim=-1)
-                segments.append(segment)
-            
-            if not segments:
-                continue
-                
-            segments = torch.stack(segments, dim=0)
-            segments = segments.squeeze(1)
-            
-            # Run the model on each segment
-            with torch.no_grad():
-                segments = segments.to(device)
-                outputs = self.model.forward(segments)
-                probs = torch.sigmoid(outputs).cpu().numpy()
-                
-                # Average predictions across all segments
-                avg_prob = np.mean(probs, axis=0)
-                
-                # Create one-hot encoded true label
-                true_label = np.zeros(self.num_classes)
-                true_label[label_idx] = 1.0
-                
-                all_labels.append(true_label)
-                all_preds.append(avg_prob)
-                
-        if len(all_labels) == 0:
-            print("No valid samples for analysis")
-            return
-            
-        # Calculate ROC-AUC score
-        all_labels_arr = np.vstack(all_labels)
-        all_preds_arr = np.vstack(all_preds)
-        
-        # Get bird class names
-        bird_classes = sorted(pd.read_csv(self.args.train_csv)['primary_label'].unique())
-        
-        # Create dataframes for scoring
-        solution_df = pd.DataFrame(all_labels_arr, columns=bird_classes)
-        submission_df = pd.DataFrame(all_preds_arr, columns=bird_classes)
-        
-        # Add row_id column
-        row_ids = [f"row_{i}" for i in range(solution_df.shape[0])]
-        solution_df.insert(0, "row_id", row_ids)
-        submission_df.insert(0, "row_id", row_ids)
-        
-        # Calculate score
-        score = kaggle_score(solution_df.copy(), submission_df.copy(), "row_id")
-        
-        # Prepare results string
-        result_str = f"Analysis results:\nNum samples: {len(all_labels)}\nROC-AUC: {score:.4f}\n"
-        
-        # Print results
-        print(result_str)
-        
-        # Save results to file
-        results_path = self.run_dir / "analysis_results.txt"
-        with open(results_path, "w") as f:
-            f.write(result_str)
-            
-        print(f"Analysis results saved to {results_path}")
-
-class Inference:
-    def __init__(self, args):
-        self.args = args
-        self.run_dir = Path(args.output_dir)
-        
-        # limit to 4 cores for inference (for AMD EPYC env)
-        torch.set_num_threads(4)
-        print("limiting pytorch to 4 cpu cores for inference")
-        
-        # setup logging to console.log file
-        console_log_path = args.console_log
-        self.log_file = open(console_log_path, "w")
-        self.original_stdout = sys.stdout
-        sys.stdout = self.Tee(self.original_stdout, self.log_file)
-        print(f"starting inference mode, logging to {console_log_path}")
-        
-        # Load model and prepare for inference
-        weights_dir = self.run_dir / "weights"
-        checkpoint_files = list(weights_dir.glob("best_*_step_*.pt"))
-        if not checkpoint_files:
-            print("Warning: No best model checkpoint found for analysis. Proceeding with random predictions.")
-            self.num_classes = self.load_num_classes(args.train_csv)
-            self.model = None  # Set model to None to indicate no model is loaded
-            self.use_random_predictions = True
-            
-            # Skip ONNX export and runtime initialization when no model is available
-            print("Skipping ONNX export since no model is available. Will use random predictions.")
-            self.ort_session = None
-        else:
-            # sort checkpoints by step number and pick the latest
-            def get_step_number(file_path):
-                match = re.search(r'step_(\d+)\.pt', str(file_path))
-                return int(match.group(1)) if match else 0
-
-            checkpoint_file = sorted(checkpoint_files, key=get_step_number)[-1]
-            print(f"loading model checkpoint from {checkpoint_file}")
-
-            # load number of classes from training csv
-            self.num_classes = self.load_num_classes(args.train_csv)
-
-            # create model instance using minimal parameters
-            self.model = Model(
-                model_path=args.pretrained_model_path,  # can be None if loading from checkpoint
-                context_length=args.context_length,
-                num_classes=self.num_classes,
-                pool_type=args.pool_type
-            )
-
-            # force cpu usage by loading checkpoint with map_location
-            print("loading checkpoint for ONNX export")
-            checkpoint = torch.load(checkpoint_file, map_location="cpu")
-            self.model.load_state_dict(checkpoint['model_state_dict'])
-            print(f"successfully loaded model weights from checkpoint (step {checkpoint.get('step', 'unknown')})")
-            self.model.eval()
-            
-            self.use_random_predictions = False
-            
-            # Export the model to ONNX format
-            print("Exporting model to ONNX format")
-            onnx_path = Path(self.args.onnx_model_path) if self.args.onnx_model_path else self.run_dir / "model.onnx"
-            self.export_to_onnx(self.model, onnx_path)
-            
-            # Initialize ONNX runtime session
-            print(f"Initializing ONNX runtime session from {onnx_path}")
-            # Configure ONNX runtime session options for optimal CPU performance
-            sess_options = ort.SessionOptions()
-            sess_options.graph_optimization_level = ort.GraphOptimizationLevel.ORT_ENABLE_ALL
-            sess_options.intra_op_num_threads = 4   # set threads to match core count
-            sess_options.inter_op_num_threads = 4
-
-            # Enable parallel execution mode
-            sess_options.execution_mode = ort.ExecutionMode.ORT_PARALLEL
-            
-            # Enable profiling
-            sess_options.enable_profiling = True
-
-            self.ort_session = ort.InferenceSession(str(onnx_path), sess_options=sess_options, providers=['CPUExecutionProvider'])
-            print("ONNX runtime session initialized with optimized CPU settings")
-        
-        # create validation dataloader with batch size 1, no shuffle, non-infinite dataset
-        self.val_wrapper = BirdCLEFDataWrapper(
-            csv_path=args.train_csv,
-            data_dir=args.val_spec_dir,
-            context_length=None,
-            batch_size=1,
-            infinite_dataset=False,
-            collate_fn=None,
-            shuffle=False
-        )
-
-    def export_to_onnx(self, model, onnx_path):
-        """Export PyTorch model to ONNX format."""
-        # Create dummy input of shape [batch_size, freq, time]
-        # Assuming freq dimension is 64, time dimension is 1000
-        dummy_input = torch.randn(1, 513, 1000, dtype=torch.float32)
-        
-        # Export model to ONNX
-        torch.onnx.export(
-            model,
-            dummy_input,
-            onnx_path,
-            input_names=["input"],
-            output_names=["output"],
-            opset_version=13,
-            do_constant_folding=True,
-            dynamic_axes={
-                'input': {0: 'batch_size'},
-                'output': {0: 'batch_size'}
-            }
-        )
-        
-        # Verify the ONNX model
-        onnx_model = onnx.load(onnx_path)
-        onnx.checker.check_model(onnx_model)
-        print(f"Exported ONNX model to {onnx_path}")
-        
-        # Quantize the model to INT8
-        quantized_path = str(onnx_path).replace(".onnx", "_quantized.onnx")
         try:
-            print(f"Applying INT8 quantization to model...")
-            quantize_dynamic(str(onnx_path), quantized_path, weight_type=QuantType.QInt8)
-            print(f"Quantized model saved to {quantized_path}")
-            
-            # Use the quantized model instead of the original one
-            if os.path.exists(quantized_path):
-                onnx_path = quantized_path
-                print(f"Using quantized model for inference")
-            else:
-                print(f"Quantization failed, using original model")
+            plt.figure(figsize=(8, 5))
+            plt.plot(steps, tr_hist, label='train')
+            plt.plot(steps, val_hist, label='val')
+            plt.legend(); plt.xlabel('step'); plt.ylabel('loss'); plt.grid(alpha=.3)
+            plt.tight_layout()
+            plt.savefig(self.run_dir / "loss_plot.png", dpi=300)
+            plt.close()
         except Exception as e:
-            print(f"Quantization error: {e}")
-            print(f"Continuing with original model")
+            print("plotting failed:", e)
 
-    # tee class to duplicate stdout writes
-    class Tee:
-        def __init__(self, stdout, log_file):
-            self.stdout = stdout
-            self.log_file = log_file
+    # ---------------------------------------------------------------
+    def evaluate(self, n_batches: int = 5):
+        self.net.eval(); tot = 0.
+        with torch.no_grad():
+            for _ in range(n_batches):
+                try: batch = next(iter(self.data.val_loader))
+                except StopIteration: break
+                spec, _, fname = batch
+                idx = self.data.label_idx(fname[0])
+                if idx == -1: continue
+                x = spec.to(self.dev)
+                y = torch.zeros(1, self.data.num_classes, device=self.dev)
+                y[0, idx] = 1
+                tot += self.crit(self.net(x), y).item()
+        self.net.train()
+        return tot / max(1, n_batches)
 
-        def write(self, message):
-            self.stdout.write(message)
-            self.log_file.write(message)
-            self.log_file.flush()
+    # ---------------------------------------------------------------
+    def save(self, step, tag='ckpt'):
+        fn = self.weights_dir / f'{tag}_step_{step}.pt'
+        torch.save({'step': step,
+                    'model_state_dict': self.net.state_dict()}, fn)
+        print('saved', fn)
 
-        def flush(self):
-            self.stdout.flush()
-            self.log_file.flush()
+# --------------------------------------------------------------------------
+# inference -----------------------------------------------------------------
+class Infer:
+    def __init__(self, args):
+        self.args = args
+        # use val directory for both slots; we only need label mapping + files
+        self.data = BirdDataModule(args.train_csv,
+                                   args.val_spec_dir,
+                                   args.val_spec_dir,
+                                   context_len=None, batch_size=1,
+                                   infinite_train=False, num_workers=0)
 
-    def __del__(self):
-        if hasattr(self, 'original_stdout') and hasattr(self, 'log_file'):
-            sys.stdout = self.original_stdout
-            self.log_file.close()
-            print("inference complete, log file closed")
+        self.classes = self.data.classes
 
-    def load_num_classes(self, csv_path):
-        df = pd.read_csv(csv_path)
-        return len(sorted(df['primary_label'].unique()))
+        ckpts = sorted((Path(args.output_dir) / "weights").glob('ckpt*'))
+        if not ckpts:
+            raise RuntimeError('no ckpt found in weights/')
+        ckpt = torch.load(ckpts[-1], map_location='cpu')
 
-    def get_segments(self, spec_tensor, seg_size=1000):
-        """
-        vectorizes the segmentation of the spectrogram using torch.unfold.
-        assumes spec_tensor is of shape (1, F, T); returns a tensor of shape (num_segments, F, seg_size).
-        """
-        T = spec_tensor.shape[-1]
-        remainder = T % seg_size
-        if remainder:
-            pad_size = seg_size - remainder
-            spec_tensor = F.pad(spec_tensor, (0, pad_size))
-        # after padding, use unfold along the time dimension
-        # spec_tensor shape: (1, F, T_pad); unfolding gives shape (1, F, num_segments, seg_size)
-        segments = spec_tensor.unfold(dimension=-1, size=seg_size, step=seg_size)
-        # rearrange to shape (num_segments, F, seg_size)
-        segments = segments.squeeze(0).permute(1, 0, 2)
-        return segments
+        self.net = Net(args.pretrained_model_path, args.context_length,
+                       self.data.num_classes, args.pool_type)
+        self.net.load_state_dict(ckpt['model_state_dict'])
+        self.net.eval()
+        self.net.to('cpu')
 
-    def run_analysis(self):
-        print("running inference with random predictions" if self.use_random_predictions else "running inference with onnx model")
-        rows = []
-        num_samples = len(self.val_wrapper.dataset)
-        
-        bird_classes = self.val_wrapper.unique_labels
-        start_time = time.time()
-        last_log_time = start_time
-        samples_processed = 0
-        segments_processed = 0
+        onnx_path = Path(args.onnx_model_path or args.output_dir) / 'model.onnx'
+        if not onnx_path.exists():
+            dummy = torch.randn(1, 513, args.context_length)
+            torch.onnx.export(self.net, dummy, onnx_path,
+                              input_names=['input'], output_names=['out'],
+                              dynamic_axes={'input': {0: 'b'},
+                                            'out':   {0: 'b'}},
+                              opset_version=13)
+        self.session = ort.InferenceSession(str(onnx_path),
+                                            providers=['CPUExecutionProvider'])
 
-        # Process each file
-        for i in tqdm(range(num_samples), desc="processing samples"):
-            spec_tensor, label, label_idx, filenames = self.val_wrapper.next_batch()
-            
-            if label_idx == -1 or not filenames:
-                continue
-                
-            # Get filename and extract base ID
-            original_filename = filenames[0]
-            base_id = re.sub(r'_segment_\d+.*$', '', original_filename)
-            
-            # Segment the spectrogram
-            segments_batch = self.get_segments(spec_tensor, seg_size=1000)
-            num_segments = segments_batch.size(0)
-            
-            # Generate predictions - use ONNX inference or random values
-            if not self.use_random_predictions and self.ort_session is not None:
-                # Real ONNX inference
-                segment_probs = []
-                for segment in segments_batch:
-                    # Convert to numpy, add batch dimension (ONNX expects [batch, freq, time])
-                    onnx_input = segment.numpy().astype(np.float32)
-                    onnx_input = np.expand_dims(onnx_input, axis=0)  
-                    
-                    # Run inference
-                    ort_inputs = {self.ort_session.get_inputs()[0].name: onnx_input}
-                    ort_outputs = self.ort_session.run(None, ort_inputs)
-                    
-                    # Apply sigmoid to convert logits to probabilities
-                    probs = 1.0 / (1.0 + np.exp(-ort_outputs[0]))
-                    segment_probs.append(probs[0])  # Remove batch dimension
-                    
-                segment_probs = np.array(segment_probs)
-            else:
-                # Random predictions if no model is available
-                segment_probs = np.random.rand(num_segments, len(bird_classes))
-            
-            # Generate a row for each segment
-            for seg_idx in range(num_segments):
-                time_marker = (seg_idx + 1) * 5  # each segment represents 5 sec
-                row_id = f"{base_id}_{time_marker}"
-                
-                row_data = {"row_id": row_id}
-                for cls_idx, class_name in enumerate(bird_classes):
-                    row_data[class_name] = segment_probs[seg_idx, cls_idx]
-                
-                rows.append(row_data)
-                segments_processed += 1
+        # Use log_dir for logs and outputs
+        log_dir = getattr(args, 'log_dir', args.output_dir)
+        Path(log_dir).mkdir(parents=True, exist_ok=True)
+        self.log = Tee(Path(log_dir) / "infer_log.txt")
 
-            samples_processed += 1
-            current_time = time.time()
-            if current_time - last_log_time > 10:
-                elapsed = current_time - start_time
-                samples_per_sec = samples_processed / elapsed
-                segments_per_sec = segments_processed / elapsed
-                print(f"speed stats: {samples_per_sec:.2f} samples/sec, {segments_per_sec:.2f} segments/sec, {elapsed:.2f}s total")
-                print(f"current file: {base_id} with {num_segments} segments")
-                last_log_time = current_time
+    # ---------------------------------------------------------------
+    def _predict_one(self, spec):
+        inp = spec.numpy().astype(np.float32)[None]
+        out = self.session.run(None, {self.session.get_inputs()[0].name: inp})[0]
+        return 1. / (1. + np.exp(-out))  # sigmoid
 
-        total_time = time.time() - start_time
-        print("\nprocessing complete:")
-        print(f"- total time: {total_time:.2f} seconds")
-        print(f"- processed {samples_processed} samples")
-        print(f"- generated {len(rows)} segment predictions")
+    # ---------------------------------------------------------------
+    def run(self):
+        rows, y_true = [], []
+        t0 = time.time(); files_done = 0
+        # ---- micro-profiler (optional, cpu-only, 1 file, 3 lines) ----
+        import torch.profiler as prof
+        for spec, _, fname in self.data.val_loader:
+            segs  = self._segment(spec)                  # (N,F,T)
+            with prof.profile(
+                    activities=[prof.ProfilerActivity.CPU],
+                    record_shapes=False, with_stack=False, profile_memory=True) as p:
+                _ = self._predict_one(segs[0])
+            # Write profile to log_dir
+            log_dir = getattr(self.args, 'log_dir', self.args.output_dir)
+            with open(Path(log_dir) / "infer_profile.txt", "w") as f:
+                print(p.key_averages().table(sort_by="cpu_time_total")[:20], file=f)
+            break
+        # -------------------------------------------------------------
+        for spec, _, fname in self.data.val_loader:
+            # full file → 5‑sec chunks
+            segs  = self._segment(spec)                  # (N,F,T)
+            probs = [self._predict_one(s) for s in segs] # list of (1,C)
 
-        # Create DataFrame from rows 
-        submission_df = pd.DataFrame(rows)
-        
-        # Check if we have any rows before proceeding
-        if len(submission_df) == 0:
-            print("WARNING: No rows generated for submission. Creating empty submission file.")
-            submission_df = pd.DataFrame(columns=["row_id"] + list(bird_classes))
-            submission_df.to_csv(self.args.submission_csv, index=False, float_format="%.4f")
-            print(f"Empty csv file '{self.args.submission_csv}' created")
-            return
-        
-        # Drop duplicate row_ids if any exist
-        pre_dedup_count = len(submission_df)
-        submission_df = submission_df.drop_duplicates(subset=["row_id"])
-        post_dedup_count = len(submission_df)
-        
-        if pre_dedup_count != post_dedup_count:
-            print(f"Dropped {pre_dedup_count - post_dedup_count} duplicate rows")
-        
-        # Filter out rows where time marker is outside the range 5-60
-        def extract_time_marker(row_id):
-            try:
-                return int(row_id.split('_')[-1])
-            except (ValueError, IndexError):
-                return 0
-        
-        # Apply the filter - keep only rows with time markers between 5 and 60
-        pre_filter_count = len(submission_df)
-        valid_time_mask = submission_df['row_id'].apply(extract_time_marker).between(5, 60)
-        submission_df = submission_df[valid_time_mask]
-        post_filter_count = len(submission_df)
-        
-        if pre_filter_count != post_filter_count:
-            print(f"Filtered out {pre_filter_count - post_filter_count} rows with time markers outside 5-60 range")
-        
-        print(f"- after filtering: {len(submission_df)} rows remain (removed duplicates and out-of-range time markers)")
-        
-        # Write to CSV with fixed float formatting
-        submission_df.to_csv(self.args.submission_csv, index=False, float_format="%.4f")
-        print(f"csv file '{self.args.submission_csv}' populated with model predictions")
+            base  = re.sub(r'_segment_\d+$', '', Path(fname[0]).stem)
+            truth = np.zeros(len(self.classes))
+            truth[self.data.label_idx(fname[0])] = 1
 
+            for i, pr in enumerate(probs):
+                tm   = (i + 1) * 5                       # 5,10,15…
+                row_id = f"{base}_{tm}"
+                row = {"row_id": row_id}
+                row.update({c: pr[0, j] for j, c in enumerate(self.classes)})
+                rows.append(row)
+                y_true.append(truth)                     # same label for each chunk
+
+            files_done += 1
+            if files_done % 10 == 0:                      # every 10 files
+                fps = files_done / (time.time() - t0)
+                self.log(f' processed {files_done} files '
+                         f'({fps:.2f} files/s) — last file {base}')
+        # ---------- write & score -------------------------------
+        sub_df = pd.DataFrame(rows)
+        log_dir = getattr(self.args, 'log_dir', self.args.output_dir)
+        sub_df.to_csv(Path(log_dir) / self.args.submission_csv, index=False, float_format='%.8f')
+
+        sol_df = pd.DataFrame(y_true, columns=self.classes)
+        sol_df.insert(0, "row_id", sub_df["row_id"])
+
+        auc = kaggle_roc_auc(sol_df, sub_df)
+        print(f'wrote {Path(log_dir) / self.args.submission_csv}  |  ROC‑AUC = {auc:.4f}')
+
+    # ---------------------------------------------------------------
+    @staticmethod
+    def _segment(spec, seg=1000):
+        T = spec.shape[-1]
+        if T % seg:
+            spec = F.pad(spec, (0, seg - T % seg))
+        return spec.unfold(-1, seg, seg).squeeze(0).permute(1, 0, 2)
+
+# --------------------------------------------------------------------------
+# -------- poor‑man's tee ----------------------------------------------------
+class Tee:
+    """print(msg) will also append to <run_dir>/<fname>"""
+    def __init__(self, path):
+        self.file = open(path, "a", buffering=1)  # line‑buffered
+
+    def __call__(self, *msg):
+        text = " ".join(str(m) for m in msg)
+        print(text)
+        self.file.write(text + "\n")
+
+    def close(self):
+        self.file.close()
+
+# --------------------------------------------------------------------------
 def main():
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--mode", type=str, required=True, choices=["train", "infer", "debug", "analyze"])
-    parser.add_argument("--context_length", type=int, default=1000)
-    
-    # Training arguments
-    parser.add_argument("--train_spec_dir", type=str, help="Directory containing training spectrograms")
-    parser.add_argument("--val_spec_dir", type=str, help="Directory containing validation spectrograms")
-    parser.add_argument("--taxonomy_file", type=str, help="Path to taxonomy file")
-    parser.add_argument("--train_csv", type=str, help="Path to training CSV file")
-    parser.add_argument("--output_dir", type=str, help="Directory to save model outputs", default=".")
-    parser.add_argument("--pretrained_model_path", type=str, help="Path to pretrained model weights", default=None)
-    parser.add_argument("--resume_checkpoint", type=str, help="Path to checkpoint for resuming training")
-    parser.add_argument("--freeze_encoder", action="store_true", help="If set, only train the classifier and freeze the encoder weights. By default, both encoder and classifier are trained.")
-    parser.add_argument("--learning_rate", type=float, default=1e-4, help="Learning rate")
-    parser.add_argument("--batch_size", type=int, default=4, help="Batch size")
-    parser.add_argument("--max_steps", type=int, default=100, help="Maximum training steps")
-    parser.add_argument("--early_stopping_patience", type=int, default=10, help="Patience for early stopping")
-    parser.add_argument("--save_interval", type=int, default=10, help="Steps between model checkpoints")
-    parser.add_argument("--eval_interval", type=int, default=5, help="Steps between evaluations")
-    parser.add_argument("--use_baseline", action="store_true", help="Whether to use baseline model instead of pretrained")
-    parser.add_argument("--ema_alpha", type=float, default=0.2, help="EMA smoothing factor (0-1)")
-    parser.add_argument("--save_best_metric", type=str, default="loss", choices=["loss", "roc_auc"], 
-                       help="Metric to use for saving best model (loss or roc_auc)")
-    parser.add_argument("--pool_type", type=str, default="mean", choices=["mean", "max"],
-                       help="Type of pooling to use in the classifier")
-    parser.add_argument("--submission_csv", type=str, default="submission.csv", 
-                       help="Path to save the inference results CSV")
-    parser.add_argument("--console_log", type=str, default="console.log",
-                      help="Path to save the console output log file")
-    parser.add_argument("--onnx_model_path", type=str, default=None,
-                      help="Path to save the ONNX model file (defaults to output_dir/model.onnx)")
-    
-    
-    args = parser.parse_args()
+    p = argparse.ArgumentParser()
+    p.add_argument('--mode', required=True, choices=['train', 'infer'])
+    p.add_argument('--train_spec_dir'); p.add_argument('--val_spec_dir')
+    p.add_argument('--train_csv');      p.add_argument('--output_dir', default='.')
+    p.add_argument('--pretrained_model_path')
+    p.add_argument('--context_length', type=int, default=1000)
+    p.add_argument('--batch_size', type=int, default=4)
+    p.add_argument('--learning_rate', type=float, default=1e-4)
+    p.add_argument('--max_steps', type=int, default=10000)
+    p.add_argument('--eval_interval', type=int, default=100)
+    p.add_argument('--save_interval', type=int, default=250)
+    p.add_argument('--early_stopping_patience', type=int, default=100)
+    p.add_argument('--pool_type', choices=['mean', 'max'], default='mean')
+    p.add_argument('--freeze_encoder', action='store_true')
+    p.add_argument('--submission_csv', default='submission.csv')
+    p.add_argument('--onnx_model_path')
+    p.add_argument('--num_workers', type=int, default=4)
+    p.add_argument('--log_dir', type=str, help='Directory for inference logs and outputs (defaults to output_dir)')
+    args = p.parse_args()
 
-    if args.mode == "train":
-        trainer = Trainer(args)
-        trainer.train()
-    elif args.mode == "analyze":
-        analyzer = Analysis(args)
-        analyzer.run_analysis()
-    elif args.mode == "infer":
-        infer = Inference(args)
-        infer.run_analysis()
+    Path(args.output_dir, 'weights').mkdir(parents=True, exist_ok=True)
 
-if __name__ == "__main__":
+    if args.mode == 'train':
+        t = Trainer(args); t.train(); t.log.close()
+    else:
+        # Set log_dir for inference
+        if not hasattr(args, 'log_dir') or args.log_dir is None:
+            args.log_dir = args.output_dir
+        Path(args.log_dir).mkdir(parents=True, exist_ok=True)
+        i = Infer(args); i.run(); i.log.close()
+
+if __name__ == '__main__':
     main()
