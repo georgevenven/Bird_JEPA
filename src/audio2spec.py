@@ -66,9 +66,15 @@ class WavToSpec:
         self.min_timebins = min_timebins
 
         self._setup_logging()
-        self.skipped = mp.Value("i", 0)          # share across workers
+        mgr = mp.Manager()
+        self.skipped = mgr.Value("i", 0)  # share across workers, manager-backed
 
         self.audio_files = self._gather_files()
+
+    def __getstate__(self):
+        st = self.__dict__.copy()
+        st.pop("skipped", None)  # mp.Value isn't picklable
+        return st
 
     # ──────────────────────────────────────────────────────────────────────
     # misc
@@ -113,14 +119,19 @@ class WavToSpec:
 
         else:
             # ───── multi‑process pool ─────
-            cpu = mp.cpu_count()
-            with mp.get_context("spawn").Pool(processes=cpu, maxtasksperchild=100) as pool:
+            ctx_name = "fork" if mp.get_start_method(allow_none=True) != "spawn" else "spawn"
+            ctx = mp.get_context(ctx_name)
+            cpu = ctx.cpu_count()
+            mgr = mp.Manager()
+            failures = mgr.list()
+            with ctx.Pool(processes=cpu, maxtasksperchild=100) as pool:
 
                 def _done(_):
                     pbar.update()
 
-                def _err(e):
-                    logging.error(f"[pool] {e}")
+                def _err(e, fp=None):
+                    logging.error(f"[pool] {fp}: {e}")
+                    failures.append(str(fp))
                     self.skipped.value += 1
                     pbar.update()
 
@@ -133,11 +144,17 @@ class WavToSpec:
                         self._safe_process,
                         args=(fp,),
                         callback=_done,
-                        error_callback=_err
+                        error_callback=lambda e, fp=fp: _err(e, fp)
                     )
 
                 pool.close()
                 pool.join()
+
+            # Retry failed files single-threaded
+            if failures:
+                print("retrying failed files single‑thread…")
+                for fp in failures:
+                    self._safe_process(Path(fp))
 
         pbar.close()
         print(f"Total processed: {len(self.audio_files) - self.skipped.value}")

@@ -3,6 +3,7 @@ from pathlib import Path
 from torch.utils.data import Dataset, DataLoader, SequentialSampler
 from typing import List, Tuple, Dict
 import pandas as pd
+from utils import build_label_map
 
 # ---------- helpers ----------
 def load_np(path: str):
@@ -19,7 +20,8 @@ class BirdSpectrogramDataset(Dataset):
                  data_dir: str,
                  segment_len: int = 50,
                  infinite: bool = True,
-                 verbose: bool = False):
+                 verbose: bool = False,
+                 csv_path: str | None = None):
         self.paths: List[str] = [
             e.path for e in os.scandir(data_dir)
             if e.is_file() and e.name.lower().endswith(".npz")
@@ -33,6 +35,12 @@ class BirdSpectrogramDataset(Dataset):
         self.segment_len = segment_len
         self.infinite = infinite
         self.verbose = verbose
+
+        if csv_path is not None:
+            self.fname2lab, self.classes = build_label_map(csv_path)
+            self.label_to_idx = {c:i for i,c in enumerate(self.classes)}
+        else:
+            self.fname2lab, self.classes, self.label_to_idx = {}, [], {}
 
     # ---------------------------------------------------
 
@@ -97,3 +105,10 @@ class BirdSpectrogramDataset(Dataset):
         return (torch.from_numpy(seg).float(),
                 torch.from_numpy(seg_lab).long(),
                 os.path.basename(path))
+
+    def label_idx(self, npz_name: str):
+        """
+        npz_name: 'XC12345.npz' → returns int label or -1 if unknown
+        """
+        key = Path(npz_name).with_suffix('.ogg').name
+        return self.label_to_idx.get(self.fname2lab.get(key, ''), -1)

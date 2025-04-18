@@ -1,88 +1,90 @@
+#!/usr/bin/env python3
+"""
+split_npz.py
+
+move or copy .npz files from a source folder into train/ and test/ subfolders
+with a random split.
+
+usage:
+    python split_npz.py /path/to/src /path/to/train /path/to/test \
+        --train_frac 0.8 [--copy] [--seed 42]
+"""
+
 import os
-import random
+import shutil
 import argparse
-from pathlib import Path
+import random
+import sys
 
-def collect_all_files(input_dir):
-    """
-    Recursively collects all files in the input directory.
+def parse_args():
+    parser = argparse.ArgumentParser(
+        description="randomly split .npz files into train and test folders (move by default)"
+    )
+    parser.add_argument("src_dir",
+                        help="source directory containing .npz files")
+    parser.add_argument("train_dir",
+                        help="destination directory for training files")
+    parser.add_argument("test_dir",
+                        help="destination directory for testing files")
+    parser.add_argument("--train_frac", "-f",
+                        type=float,
+                        default=0.8,
+                        help="fraction of files to assign to train (default: 0.8)")
+    parser.add_argument("--copy", "-c",
+                        action="store_true",
+                        help="copy files instead of moving")
+    parser.add_argument("--seed", "-s",
+                        type=int,
+                        default=None,
+                        help="random seed for reproducibility")
+    return parser.parse_args()
 
-    Args:
-        input_dir (str): The directory to search for files.
-
-    Returns:
-        list: A list of file paths.
-    """
-    file_paths = []
-    for root, dirs, files in os.walk(input_dir):
-        for name in files:
-            file_paths.append(os.path.join(root, name))
-    return file_paths
-
-def split_files(input_dir, test_percentage):
-    """
-    Splits the files in the input directory into training and testing sets based on the specified percentage.
-
-    Args:
-        input_dir (str): The directory containing files or subdirectories with files.
-        test_percentage (float): The percentage of files to be used for testing.
-
-    Returns:
-        tuple: Two lists of file paths, one for training and one for testing.
-    """
-    # Collect all files in the input directory, including nested files
-    all_files = collect_all_files(input_dir)
-    print(f"Found {len(all_files)} files in {input_dir}")
-
-    # Calculate the number of files to be used for testing
-    total_files = len(all_files)
-    num_test_files = int(total_files * test_percentage / 100)
-
-    # Shuffle the list of files
-    random.shuffle(all_files)
-
-    # Split the shuffled list into test and train sets
-    test_files = all_files[:num_test_files]
-    train_files = all_files[num_test_files:]
-
-    return train_files, test_files
+def ensure_dir(path):
+    try:
+        os.makedirs(path, exist_ok=True)
+    except OSError as e:
+        print(f"error creating directory {path}: {e}", file=sys.stderr)
+        sys.exit(1)
 
 def main():
-    # Set up argument parsing
-    parser = argparse.ArgumentParser(description="Split files into training and testing sets.")
-    parser.add_argument("input_dir", type=str, help="The directory containing files or subdirectories with files.")
-    parser.add_argument("test_percentage", type=float, help="The percentage of files to be used for testing.")
-    parser.add_argument("--train_output", type=str, default="train_files.txt", help="File to write train file paths.")
-    parser.add_argument("--test_output", type=str, default="test_files.txt", help="File to write test file paths.")
-    parser.add_argument("--full_paths", action="store_true", help="Store full paths instead of basenames")
-    args = parser.parse_args()
+    args = parse_args()
 
-    # Validate the input directory
-    if not os.path.isdir(args.input_dir):
-        print(f"Error: Directory {args.input_dir} does not exist.")
-        return
+    # set random seed if provided
+    if args.seed is not None:
+        random.seed(args.seed)
 
-    # Validate the test percentage
-    if args.test_percentage < 0 or args.test_percentage > 100:
-        print("Error: Test percentage must be a number between 0 and 100.")
-        return
+    # ensure destination dirs exist
+    ensure_dir(args.train_dir)
+    ensure_dir(args.test_dir)
 
-    # Split the files into training and testing sets
-    train_files, test_files = split_files(args.input_dir, args.test_percentage)
+    # collect .npz files
+    all_files = [f for f in os.listdir(args.src_dir) if f.lower().endswith(".npz")]
+    if not all_files:
+        print("no .npz files found in source directory.", file=sys.stderr)
+        sys.exit(1)
 
-    # Write the lists of files to the specified output files
-    with open(args.train_output, 'w') as f:
-        for file_path in train_files:
-            path = file_path if args.full_paths else Path(file_path).name
-            f.write(f"{path}\n")
+    # shuffle and split
+    random.shuffle(all_files)
+    n_train = int(len(all_files) * args.train_frac)
+    train_files = all_files[:n_train]
+    test_files = all_files[n_train:]
 
-    with open(args.test_output, 'w') as f:
-        for file_path in test_files:
-            path = file_path if args.full_paths else Path(file_path).name
-            f.write(f"{path}\n")
+    op = shutil.copy2 if args.copy else shutil.move
 
-    print(f"Train files written to {args.train_output}")
-    print(f"Test files written to {args.test_output}")
+    # perform operation
+    for fname in train_files:
+        src = os.path.join(args.src_dir, fname)
+        dst = os.path.join(args.train_dir, fname)
+        op(src, dst)
+    for fname in test_files:
+        src = os.path.join(args.src_dir, fname)
+        dst = os.path.join(args.test_dir, fname)
+        op(src, dst)
+
+    # summary
+    action = "copied" if args.copy else "moved"
+    print(f"{len(train_files)} files {action} to {args.train_dir}")
+    print(f"{len(test_files)} files {action} to {args.test_dir}")
 
 if __name__ == "__main__":
     main()

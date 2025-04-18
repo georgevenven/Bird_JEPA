@@ -26,6 +26,7 @@ def local_mask(T: int, radius: int, device):
     for d in range(-radius, radius + 1):
         j = (i + d).clamp_(0, T - 1)
         m[i, j] = False
+    m = m & (~torch.eye(T, dtype=torch.bool, device=device))
     return m
 
 def global_mask(T: int, stride: int, device):
@@ -33,14 +34,14 @@ def global_mask(T: int, stride: int, device):
     m = torch.ones(T, T, dtype=torch.bool, device=device)
     m[g, :] = False
     m[:, g] = False
-    m.fill_diagonal_(False)
+    m = m & (~torch.eye(T, dtype=torch.bool, device=device))
     return m
 
 # ------------------------------------------------------------------
 class GLBlock(nn.Module):
     """
     local or global attention block depending on `mode`
-    mode ∊ {'local','global','full'}
+    mode ∊ {'local','global','full'}
     """
     def __init__(self, d_model, n_heads, ff_mult,
                  mode: str = "local",
@@ -51,6 +52,9 @@ class GLBlock(nn.Module):
         self.core = _SA(d_model, n_heads, ff_mult)
 
     def _mask(self, T: int, device):
+        # during torch.onnx.export we're inside a tracing context; bail to full attention
+        if torch.jit.is_tracing():
+            return None
         if self.mode == "local":
             return local_mask(T, self.radius or 4, device)
         if self.mode == "global":

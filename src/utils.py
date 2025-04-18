@@ -3,6 +3,10 @@ import json
 import os
 from models import BirdJEPA
 import glob
+import pandas as pd
+from pathlib import Path
+from models.birdjepa import BirdJEPA, BJConfig
+import torch.nn as nn
 
 
 def load_config(config_path):
@@ -96,3 +100,18 @@ def load_model(experiment_folder, return_checkpoint=False, load_weights=True, ra
         print("Initialized model with random weights.")
     
     return model
+
+def build_label_map(csv_path: str):
+    df = pd.read_csv(csv_path, usecols=['filename', 'primary_label'])
+    df['filename'] = df['filename'].apply(lambda s: Path(s).name)
+    fname2lab = dict(zip(df.filename, df.primary_label))
+    classes   = sorted(df.primary_label.unique())
+    return fname2lab, classes
+
+def load_pretrained_encoder(cfg: BJConfig, ckpt_path: str | None):
+    model = BirdJEPA(cfg)
+    enc = nn.Sequential(model.stem, model.encoder)
+    if ckpt_path:
+        sd = torch.load(ckpt_path, map_location="cpu")
+        enc.load_state_dict(sd, strict=False)
+    return enc

@@ -4,17 +4,17 @@
 # ──────────────────────────────────────────────────────────────────────────────
 import argparse, json, re, time
 from pathlib import Path
+import shutil, uuid, datetime as dt
 
 import numpy as np, pandas as pd, torch, torch.nn as nn, torch.nn.functional as F
 import matplotlib.pyplot as plt
 import onnx, onnxruntime as ort
 
 # local imports (unchanged public interface)
-from data    import BirdSpectrogramDataset                        # new path
 from models  import BJConfig                            # encoder
 from models.birdjepa import BirdJEPA
 from utils   import load_pretrained_encoder                       # simple helper
-
+from data.bird_datasets import BirdSpectrogramDataset
 # ╭──────────────────────────────────────────────────────────────────────────╮
 # │  Kaggle‑style macro ROC‑AUC – self‑contained, no external dependency     │
 # ╰──────────────────────────────────────────────────────────────────────────╯
@@ -80,7 +80,10 @@ class Net(nn.Module):
         self.clf     = Classifier(cfg.d_model, n_cls, pool)
     def forward(self, spec):                                      # (B,F,T)
         spec = spec.unsqueeze(1).transpose(2,3)                   # (B,1,T,F)
-        emb , _  = self.encoder.inference_forward(spec)
+        if hasattr(self.encoder, "inference_forward"):
+            emb, _ = self.encoder.inference_forward(spec)   # full BirdJEPA case
+        else:
+            emb = self.encoder(spec)                       # Sequential(stem,enc) case
         return self.clf(emb)
 
 # ╭──────────────────────────────────────────────────────────────────────────╮
@@ -91,10 +94,12 @@ class Trainer:
         self.args = args
         # ── data ───────────────────────────────────────────────
         self.train_ds = BirdSpectrogramDataset(args.train_spec_dir,
-                                               segment_len=args.context_length)
+                                               segment_len=args.context_length,
+                                               csv_path=args.train_csv)
         self.val_ds   = BirdSpectrogramDataset(args.val_spec_dir,
                                                segment_len=args.context_length,
-                                               infinite=False)
+                                               infinite=False,
+                                               csv_path=args.train_csv)
         self.classes  = self.train_ds.classes
         self.train_dl = torch.utils.data.DataLoader(self.train_ds,
                                                     args.batch_size, shuffle=True,
@@ -125,6 +130,9 @@ class Trainer:
 
         # state
         self.best_val = 9e9; self.bad_evals = 0
+
+        # stats history
+        self.hist = {"step":[], "train":[], "val":[], "grad":[]}
 
     # ----------------------------------------------------------
     def _label_tensor(self, fnames):
@@ -171,6 +179,12 @@ class Trainer:
             self.log(f"step {step:06d} | loss {ema_train:.4f} | "
                      f"val {ema_val:.4f} | gnorm {gnorm:.2f}")
 
+            # record
+            self.hist["step"].append(step)
+            self.hist["train"].append(ema_train)
+            self.hist["val"].append(ema_val)
+            self.hist["grad"].append(gnorm)
+
             # early‑stop bookkeeping
             improved = v < self.best_val - 1e-5
             if improved:
@@ -185,6 +199,20 @@ class Trainer:
                 break
             if step>=self.args.max_steps: break
 
+        # --- after training loop: dump metrics and plots ---
+        df = pd.DataFrame(self.hist)
+        df.to_csv(self.run_dir/'metrics.csv', index=False)
+
+        plt.figure(figsize=(5,4))
+        plt.plot(df.step, df.train, label='train ema')
+        plt.plot(df.step, df.val,   label='val ema')
+        plt.xlabel('step'); plt.ylabel('loss'); plt.legend()
+        plt.tight_layout(); plt.savefig(self.run_dir/'loss_curve.png', dpi=150); plt.close()
+
+        plt.figure(figsize=(5,4))
+        plt.plot(df.step, df.grad); plt.xlabel('step'); plt.ylabel('grad‑norm')
+        plt.tight_layout(); plt.savefig(self.run_dir/'grad_norm.png', dpi=150); plt.close()
+
     # ----------------------------------------------------------
     def _save(self,step,tag):
         torch.save({'step':step,'model':self.net.state_dict()},
@@ -197,7 +225,9 @@ class Trainer:
 class Infer:
     def __init__(self,args):
         self.args=args
-        self.ds  = BirdSpectrogramDataset(args.val_spec_dir, segment_len=None, infinite=False)
+        self.ds  = BirdSpectrogramDataset(args.val_spec_dir,
+                                          segment_len=None, infinite=False,
+                                          csv_path=args.train_csv)
         self.classes=self.ds.classes
 
         ckpt = sorted((Path(args.output_dir)/"weights").glob("best_*.pt"))[-1]
@@ -215,7 +245,10 @@ class Infer:
                               input_names=['input'],output_names=['out'],
                               dynamic_axes={'input':{0:'b'},'out':{0:'b'}},
                               opset_version=13)
+        opt = ort.SessionOptions()
+        opt.enable_profiling = True
         self.sess=ort.InferenceSession(str(self.onnx_path),
+                                       sess_options=opt,
                                        providers=['CPUExecutionProvider'])
 
         self.log=Tee(Path(args.log_dir or args.output_dir)/"infer_log.txt")
@@ -235,7 +268,8 @@ class Infer:
     # ----------------------------------------------------------
     def run(self):
         rows=[]; y_true=[]
-        self.sess.start_profiling(str(Path(self.args.log_dir or self.args.output_dir)/"onnx_profile.json"))
+        profile_path = None
+        # drop explicit start; ORT starts auto‑profiling when enabled
         for spec,_,fn in self.ds:
             segs=self._segment(spec)
             probs=[self._predict(s) for s in segs]
@@ -247,13 +281,15 @@ class Infer:
                 row_id=f"{base}_{(i+1)*5}"
                 rows.append({"row_id":row_id,**{c:float(p[j]) for j,c in enumerate(self.classes)}})
                 y_true.append(lab)
-        self.sess.end_profiling()
+        profile_path = self.sess.end_profiling()   # returns file path
 
         out_csv=Path(self.args.log_dir or self.args.output_dir)/self.args.submission_csv
         sub=pd.DataFrame(rows); sub.to_csv(out_csv,index=False,float_format="%.8f")
         sol=pd.DataFrame(y_true,columns=self.classes); sol.insert(0,"row_id",sub["row_id"])
         auc=kaggle_roc_auc(sol,sub)
         print(f"wrote {out_csv} | ROC‑AUC {auc:.4f}")
+        if profile_path:
+            self.log(f"onnx profile saved → {profile_path}")
 
 # ╭──────────────────────────────────────────────────────────────────────────╮
 # │  CLI                                                                    │
@@ -262,25 +298,35 @@ def main():
     p=argparse.ArgumentParser()
     p.add_argument("--mode",choices=["train","infer"],required=True)
     p.add_argument("--train_spec_dir"); p.add_argument("--val_spec_dir")
-    p.add_argument("--output_dir",default="runs/finetune")
-    p.add_argument("--train_csv")           # still accepted, unused now
+    p.add_argument("--output_dir",default="runs/finetuned")
+    p.add_argument("--train_csv", required=True)
     p.add_argument("--pretrained_model_path")
     p.add_argument("--onnx_model_path")
     p.add_argument("--log_dir")
     p.add_argument("--context_length",type=int,default=1000)
     p.add_argument("--batch_size",type=int,default=4)
-    p.add_argument("--learning_rate",type=float,default=1e-4)
-    p.add_argument("--max_steps",type=int,default=10000)
+    p.add_argument("--learning_rate",type=float,default=5e-4)
+    p.add_argument("--max_steps",type=int,default=1000)
     p.add_argument("--eval_interval",type=int,default=100)
-    p.add_argument("--save_interval",type=int,default=250)
+    p.add_argument("--save_interval",type=int,default=1000)
     p.add_argument("--early_stopping_patience",type=int,default=100)
     p.add_argument("--pool_type",choices=["mean","max"],default="mean")
     p.add_argument("--freeze_encoder",action="store_true")
     p.add_argument("--num_workers",type=int,default=4)
-    p.add_argument("--enc_width",type=int,default=64,help="JEPA hidden size d_model")
+    p.add_argument("--enc_width",type=int,default=48,help="JEPA hidden size d_model")
     args=p.parse_args()
 
-    Path(args.output_dir).mkdir(parents=True,exist_ok=True)
+    run_root = Path(args.output_dir)
+    if args.mode == "train" and run_root.exists():
+        from shutil import move
+        import uuid, datetime as dt
+        stamp = dt.datetime.now().strftime('%Y%m%d_%H%M%S')
+        tag   = uuid.uuid4().hex[:6]
+        arch  = Path('runs/archive')/f'{run_root.name}_{stamp}_{tag}'
+        arch.parent.mkdir(parents=True, exist_ok=True)
+        move(run_root, arch)
+        print(f'[finetune] previous run moved → {arch}')
+    run_root.mkdir(parents=True, exist_ok=True)
 
     if args.mode=="train":
         Trainer(args).train()
