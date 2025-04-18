@@ -98,7 +98,8 @@ class WavToSpec:
             ]
 
         if not files:
-            raise RuntimeError("No audio files found.")
+            print("no audio files matched ‑ nothing to do.")
+            return []
 
         if self.take_n_random and self.take_n_random < len(files):
             files = random.sample(files, self.take_n_random)
@@ -109,7 +110,9 @@ class WavToSpec:
     # public entry
     # ──────────────────────────────────────────────────────────────────────
     def run(self) -> None:
-        pbar = tqdm(total=len(self.audio_files), desc="Processing files")
+        if not self.audio_files:
+            return                       # exit 0, no fuss
+        pbar = tqdm(total=len(self.audio_files), desc="processing files")
 
         if self.single:
             # ───── single threaded ─────

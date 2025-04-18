@@ -5,6 +5,7 @@
 import argparse, json, re, time
 from pathlib import Path
 import shutil, uuid, datetime as dt
+import zipfile
 
 import numpy as np, pandas as pd, torch, torch.nn as nn, torch.nn.functional as F
 import matplotlib.pyplot as plt
@@ -167,37 +168,42 @@ class Trainer:
     # ----------------------------------------------------------
     def train(self):
         ema_train=None; ema_val=None; α=.1
-        for step, batch in enumerate(self.train_dl,1):
-            l = self.step(batch)
-            ema_train = l if ema_train is None else α*l+(1-α)*ema_train
+        step = 0
+        while step < self.args.max_steps:
+            for batch in self.train_dl:
+                step += 1
+                l = self.step(batch)
+                ema_train = l if ema_train is None else α*l+(1-α)*ema_train
 
-            if step%self.args.eval_interval: continue
-            v = self.eval_loss()
-            ema_val = v if ema_val is None else α*v+(1-α)*ema_val
+                if step%self.args.eval_interval: continue
+                v = self.eval_loss()
+                ema_val = v if ema_val is None else α*v+(1-α)*ema_val
 
-            gnorm = grad_norm(self.net)
-            self.log(f"step {step:06d} | loss {ema_train:.4f} | "
-                     f"val {ema_val:.4f} | gnorm {gnorm:.2f}")
+                gnorm = grad_norm(self.net)
+                self.log(f"step {step:06d} | loss {ema_train:.4f} | "
+                         f"val {ema_val:.4f} | gnorm {gnorm:.2f}")
 
-            # record
-            self.hist["step"].append(step)
-            self.hist["train"].append(ema_train)
-            self.hist["val"].append(ema_val)
-            self.hist["grad"].append(gnorm)
+                # record
+                self.hist["step"].append(step)
+                self.hist["train"].append(ema_train)
+                self.hist["val"].append(ema_val)
+                self.hist["grad"].append(gnorm)
 
-            # early‑stop bookkeeping
-            improved = v < self.best_val - 1e-5
-            if improved:
-                self.best_val = v; self.bad_evals=0
-                self._save(step,'best')
-            else:
-                self.bad_evals += 1
+                # early‑stop bookkeeping
+                improved = v < self.best_val - 1e-5
+                if improved:
+                    self.best_val = v; self.bad_evals=0
+                    self._save(step,'best')
+                else:
+                    self.bad_evals += 1
 
-            if step%self.args.save_interval==0: self._save(step,'ckpt')
-            if self.bad_evals>=self.args.early_stopping_patience:
-                self.log(f"early stop (no improve for {self.bad_evals} evals)")
+                if step%self.args.save_interval==0: self._save(step,'ckpt')
+                if self.bad_evals>=self.args.early_stopping_patience:
+                    self.log(f"early stop (no improve for {self.bad_evals} evals)")
+                    break
+                if step>=self.args.max_steps: break
+            if step>=self.args.max_steps or self.bad_evals>=self.args.early_stopping_patience:
                 break
-            if step>=self.args.max_steps: break
 
         # --- after training loop: dump metrics and plots ---
         df = pd.DataFrame(self.hist)
@@ -263,24 +269,32 @@ class Infer:
     def _predict(self,spec):
         out=self.sess.run(None,{self.sess.get_inputs()[0].name:
                                 spec.numpy().astype(np.float32)[None]})[0]
-        return 1/(1+np.exp(-out))
+        return 1/(1+np.exp(-out)).squeeze(0)
 
     # ----------------------------------------------------------
     def run(self):
         rows=[]; y_true=[]
+        times=[]
         profile_path = None
         # drop explicit start; ORT starts auto‑profiling when enabled
-        for spec,_,fn in self.ds:
-            segs=self._segment(spec)
-            probs=[self._predict(s) for s in segs]
-            probs=np.vstack(probs)
+        for i, (spec, _, fn) in enumerate(self.ds):
+            # if i >= 100:
+            #     break
+            t0=time.time()
+            try:
+                segs = self._segment(spec)
+                probs = [self._predict(s) for s in segs]
 
-            base=re.sub(r'_segment_\d+$','',Path(fn).stem)
-            lab = np.zeros(len(self.classes)); lab[self.ds.label_idx(fn)]=1
-            for i,p in enumerate(probs):
-                row_id=f"{base}_{(i+1)*5}"
-                rows.append({"row_id":row_id,**{c:float(p[j]) for j,c in enumerate(self.classes)}})
-                y_true.append(lab)
+                base = re.sub(r'_segment_\d+$', '', Path(fn).stem)
+                lab = np.zeros(len(self.classes)); lab[self.ds.label_idx(fn)] = 1
+                for i, p in enumerate(probs):
+                    row_id = f"{base}_{(i+1)*5}"
+                    rows.append({"row_id": row_id, **{c: float(p[j]) for j, c in enumerate(self.classes)}})
+                    y_true.append(lab)
+            except (zipfile.BadZipFile, ValueError, OSError):
+                self.log(f"skip corrupt {fn}")
+                continue
+            times.append(time.time()-t0)
         profile_path = self.sess.end_profiling()   # returns file path
 
         out_csv=Path(self.args.log_dir or self.args.output_dir)/self.args.submission_csv
@@ -290,6 +304,12 @@ class Infer:
         print(f"wrote {out_csv} | ROC‑AUC {auc:.4f}")
         if profile_path:
             self.log(f"onnx profile saved → {profile_path}")
+
+        # ── timing summary ─────────────────────────────────────
+        if times:
+            tot, avg = sum(times), np.mean(times)
+            self.log(f"processed {len(times)} files | "
+                     f"total {tot:.1f}s | mean {avg*1000:.1f} ms per file")
 
 # ╭──────────────────────────────────────────────────────────────────────────╮
 # │  CLI                                                                    │
@@ -303,17 +323,18 @@ def main():
     p.add_argument("--pretrained_model_path")
     p.add_argument("--onnx_model_path")
     p.add_argument("--log_dir")
+    p.add_argument("--submission_csv", default="submission.csv")
     p.add_argument("--context_length",type=int,default=1000)
-    p.add_argument("--batch_size",type=int,default=2)
+    p.add_argument("--batch_size",type=int,default=64)
     p.add_argument("--learning_rate",type=float,default=5e-4)
-    p.add_argument("--max_steps",type=int,default=1000)
+    p.add_argument("--max_steps",type=int,default=100000)
     p.add_argument("--eval_interval",type=int,default=100)
     p.add_argument("--save_interval",type=int,default=1000)
     p.add_argument("--early_stopping_patience",type=int,default=100)
     p.add_argument("--pool_type",choices=["mean","max"],default="mean")
     p.add_argument("--freeze_encoder",action="store_true")
     p.add_argument("--num_workers",type=int,default=4)
-    p.add_argument("--enc_width",type=int,default=24,help="JEPA hidden size d_model")
+    p.add_argument("--enc_width",type=int,default=96,help="JEPA hidden size d_model")
     p.add_argument("--attn_pattern", default="local50,global100,local50,global100")
     args=p.parse_args()
 

@@ -4,6 +4,7 @@ from torch.utils.data import Dataset, DataLoader, SequentialSampler
 from typing import List, Tuple, Dict
 import pandas as pd
 from utils import build_label_map
+import zipfile
 
 # ---------- helpers ----------
 def load_np(path: str):
@@ -80,11 +81,13 @@ class BirdSpectrogramDataset(Dataset):
         path = self.paths[idx]
         try:
             npz = load_np(path)
-        except Exception as exc:
-            print(f"[dataset] could not read {path}: {exc}")
+        except (zipfile.BadZipFile, ValueError, OSError) as exc:
+            if getattr(self, 'verbose', False):
+                print(f"[dataset] skip {path}: {exc}")
             if self.infinite:
-                return self.__getitem__(random.randint(0, len(self.paths)-1))
-            raise  # let the dataloader know we're out of data
+                return self.__getitem__(random.randint(0, len(self.paths) - 1))
+            else:
+                raise IndexError("corrupt file skipped")
         spec = npz['s'][:, :-1]              # drop final STFT frame
         labels = npz['labels']
 
