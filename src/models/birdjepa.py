@@ -5,6 +5,7 @@
 import math, torch, torch.nn as nn
 import torch.nn.functional as F
 from dataclasses import dataclass, field
+from .rope import rope
 
 print(">> birdjepa loaded from", __file__)
 
@@ -72,6 +73,7 @@ class SDPABlock(nn.Module):
     def forward(self, x):
         B, T, D = x.shape
         x_norm = self.norm1(x)
+        x_norm = rope(x_norm)
         q = self.q_proj(x_norm).view(B, T, self.n_heads, self.d_head).transpose(1, 2)
         k = self.k_proj(x_norm).view(B, T, self.n_heads, self.d_head).transpose(1, 2)
         v = self.v_proj(x_norm).view(B, T, self.n_heads, self.d_head).transpose(1, 2)

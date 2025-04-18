@@ -108,12 +108,22 @@ def build_label_map(csv_path: str):
     classes   = sorted(df.primary_label.unique())
     return fname2lab, classes
 
+class _StemSeq(nn.Module):
+    def __init__(self, stem, proj):
+        super().__init__()
+        self.stem, self.proj = stem, proj
+    def forward(self, x):             # x (B,1,F,T)
+        z = self.stem(x)              # (B,C,F',T')
+        z = z.permute(0,3,1,2).flatten(2)  # (B,T',C*F')
+        return self.proj(z)           # (B,T',D)
+
 def load_pretrained_encoder(cfg: BJConfig, ckpt_path: str | None):
     # if no checkpoint → random init
     if not ckpt_path or str(ckpt_path).lower() in {"none", "null"}:
+        model = BirdJEPA(cfg)
         return nn.Sequential(
-            BirdJEPA(cfg).stem,          # conv stem
-            BirdJEPA(cfg).encoder        # transformer encoder (fresh weights)
+            _StemSeq(model.stem, model.proj),
+            model.encoder
         )
 
     sd = torch.load(ckpt_path, map_location="cpu")

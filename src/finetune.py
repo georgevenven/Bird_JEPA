@@ -140,6 +140,11 @@ class Trainer:
         # stats history
         self.hist = {"step":[], "train":[], "val":[], "grad":[]}
 
+        # --- new for AUC EMA tracking ---
+        self.ema_alpha = 0.1
+        self.ema_auc   = None
+        self.hist_auc  = []  # list of dicts for csv/plot
+
     # ----------------------------------------------------------
     def _label_tensor(self, fnames):
         y = torch.zeros(len(fnames), len(self.classes), device=self.dev)
@@ -171,6 +176,36 @@ class Trainer:
         return tot/cnt
 
     # ----------------------------------------------------------
+    def _validate(self, step):
+        # from sklearn.metrics import roc_auc_score
+        self.net.eval()
+        all_probs, all_labels = [], []
+        with torch.no_grad():
+            for spec, _, fnames in self.val_dl:   # <- rename for clarity
+                spec = spec.to(self.dev)
+                y    = self._label_tensor(fnames)          # pass the tuple/list directly
+                p = torch.sigmoid(self.net(spec))
+                all_probs.append(p.cpu())
+                all_labels.append(y.cpu())
+        # auc = roc_auc_score(torch.cat(all_labels),
+        #                     torch.cat(all_probs), average="macro")
+
+        # ---- EMA --------------------------------------------------
+        # if self.ema_auc is None:
+        #     self.ema_auc = auc
+        # else:
+        #     self.ema_auc = self.ema_alpha*auc + (1-self.ema_alpha)*self.ema_auc
+
+        # print(f"[val] step {step:06d}  auc {auc:.4f}  ema {self.ema_auc:.4f}")
+
+        # keep for later plotting
+        # self.hist_auc.append({"step": step, "val_auc": auc, "val_auc_ema": self.ema_auc})
+
+        self.net.train()
+        # return auc
+        return None
+
+    # ----------------------------------------------------------
     def train(self):
         ema_train=None; ema_val=None; α=.1
         step = 0
@@ -181,12 +216,16 @@ class Trainer:
                 ema_train = l if ema_train is None else α*l+(1-α)*ema_train
 
                 if step%self.args.eval_interval: continue
-                v = self.eval_loss()
-                ema_val = v if ema_val is None else α*v+(1-α)*ema_val
+                v = self._validate(step)
+                if v is None:
+                    v = self.eval_loss()
+                    ema_val = None
+                else:
+                    ema_val = v if ema_val is None else α*v+(1-α)*ema_val
 
                 gnorm = grad_norm(self.net)
                 self.log(f"step {step:06d} | loss {ema_train:.4f} | "
-                         f"val {ema_val:.4f} | gnorm {gnorm:.2f}")
+                         f"val {ema_val if ema_val is not None else 'NA'} | gnorm {gnorm:.2f}")
 
                 # record
                 self.hist["step"].append(step)
@@ -195,12 +234,13 @@ class Trainer:
                 self.hist["grad"].append(gnorm)
 
                 # early‑stop bookkeeping
-                improved = v < self.best_val - 1e-5
-                if improved:
-                    self.best_val = v; self.bad_evals=0
-                    self._save(step,'best')
-                else:
-                    self.bad_evals += 1
+                if v is not None:
+                    improved = v < self.best_val - 1e-5
+                    if improved:
+                        self.best_val = v; self.bad_evals=0
+                        self._save(step,'best')
+                    else:
+                        self.bad_evals += 1
 
                 if step%self.args.save_interval==0: self._save(step,'ckpt')
                 if self.bad_evals>=self.args.early_stopping_patience:
@@ -255,7 +295,7 @@ class Infer:
             torch.onnx.export(self.net,dummy,self.onnx_path,
                               input_names=['input'],output_names=['out'],
                               dynamic_axes={'input':{0:'b'},'out':{0:'b'}},
-                              opset_version=13)
+                              opset_version=18)
         opt = ort.SessionOptions()
         opt.enable_profiling = True
         self.sess=ort.InferenceSession(str(self.onnx_path),
@@ -330,9 +370,9 @@ def main():
     p.add_argument("--log_dir")
     p.add_argument("--submission_csv", default="submission.csv")
     p.add_argument("--context_length",type=int,default=1000)
-    p.add_argument("--batch_size",type=int,default=1)
-    p.add_argument("--learning_rate",type=float,default=5e-4)
-    p.add_argument("--max_steps",type=int,default=100000)
+    p.add_argument("--batch_size",type=int,default=128)
+    p.add_argument("--learning_rate",type=float,default=1e-3)
+    p.add_argument("--max_steps",type=int,default=1000)
     p.add_argument("--eval_interval",type=int,default=100)
     p.add_argument("--save_interval",type=int,default=1000)
     p.add_argument("--early_stopping_patience",type=int,default=100)
