@@ -1,6 +1,6 @@
 import torch.nn as nn, torch
 from .bj_config import BJConfig
-from .layers import GLBlock
+from .layers import GLBlock, LocalBlock, GlobalBlock
 import copy
 
 # ------------------------------------------------------------------
@@ -21,6 +21,26 @@ class ConvStem(nn.Module):
         return self.proj(z).flatten(2).transpose(1, 2)   # B,seq,d
 
 # ------------------------------------------------------------------
+def _make_encoder(cfg: BJConfig, pattern: str):
+    """
+    pattern example: "local64,global128,local64,global128"
+    """
+    enc = nn.ModuleList()
+    for token in pattern.split(','):
+        if token.startswith('local'):
+            w = int(token[5:])
+            enc.append(LocalBlock(cfg.d_model, cfg.n_heads,
+                                  cfg.ff_mult, window=w))
+        elif token.startswith('global'):
+            s = int(token[6:])
+            enc.append(GlobalBlock(cfg.d_model, cfg.n_heads,
+                                   cfg.ff_mult, stride=s))
+        else:                                   # fallback full
+            enc.append(GLBlock(cfg.d_model, cfg.n_heads, cfg.ff_mult,
+                               "full"))
+    return nn.Sequential(*enc)
+
+# ------------------------------------------------------------------
 class BirdJEPA(nn.Module):
     """
     • Conv stem → flatten freq → encoder (local/global)  
@@ -33,14 +53,7 @@ class BirdJEPA(nn.Module):
         self.cfg = cfg
         self.stem = ConvStem(cfg)
 
-        enc = []
-        for i in range(cfg.layers):
-            global_flag = (i % cfg.global_every) == cfg.global_every - 1
-            enc.append(GLBlock(cfg.d_model, cfg.n_heads, cfg.ff_mult,
-                               "global" if global_flag else "local",
-                               radius=4,
-                               stride=max(1, cfg.n_global)))
-        self.encoder = nn.Sequential(*enc)
+        self.encoder = _make_encoder(cfg, cfg.pattern)
 
         self.ema_encoder = copy.deepcopy(self.encoder)
         for p in self.ema_encoder.parameters():

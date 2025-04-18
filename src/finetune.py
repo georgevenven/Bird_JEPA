@@ -109,7 +109,7 @@ class Trainer:
                                                     shuffle=False, num_workers=0)
 
         # ── model ──────────────────────────────────────────────
-        cfg = BJConfig(d_model=args.enc_width)
+        cfg = BJConfig(d_model=args.enc_width, pattern=args.attn_pattern)
         self.net = Net(args.pretrained_model_path, cfg,
                        len(self.classes), args.pool_type)
         self.dev = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
@@ -233,7 +233,7 @@ class Infer:
         ckpt = sorted((Path(args.output_dir)/"weights").glob("best_*.pt"))[-1]
         state=torch.load(ckpt,map_location="cpu")
 
-        cfg=BJConfig(d_model=args.enc_width)
+        cfg=BJConfig(d_model=args.enc_width, pattern=args.attn_pattern)
         self.net=Net(args.pretrained_model_path,cfg,len(self.classes),args.pool_type)
         self.net.load_state_dict(state["model"]); self.net.eval()
 
@@ -304,7 +304,7 @@ def main():
     p.add_argument("--onnx_model_path")
     p.add_argument("--log_dir")
     p.add_argument("--context_length",type=int,default=1000)
-    p.add_argument("--batch_size",type=int,default=4)
+    p.add_argument("--batch_size",type=int,default=2)
     p.add_argument("--learning_rate",type=float,default=5e-4)
     p.add_argument("--max_steps",type=int,default=1000)
     p.add_argument("--eval_interval",type=int,default=100)
@@ -313,7 +313,8 @@ def main():
     p.add_argument("--pool_type",choices=["mean","max"],default="mean")
     p.add_argument("--freeze_encoder",action="store_true")
     p.add_argument("--num_workers",type=int,default=4)
-    p.add_argument("--enc_width",type=int,default=48,help="JEPA hidden size d_model")
+    p.add_argument("--enc_width",type=int,default=24,help="JEPA hidden size d_model")
+    p.add_argument("--attn_pattern", default="local50,global100,local50,global100")
     args=p.parse_args()
 
     run_root = Path(args.output_dir)

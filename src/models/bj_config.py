@@ -8,7 +8,7 @@ class BJConfig:
     conv_str:  list[tuple] = field(default_factory=lambda: [(2, 1), (2, 2), (2, 2)])
 
     # ------- encoder -------------------------------
-    layers:       int = 4        # GL blocks total
+    layers:       int = 2        # GL blocks total
     d_model:      int = 48
     n_heads:      int = 4
     ff_mult:      int = 4
@@ -20,6 +20,9 @@ class BJConfig:
     pred_dim:    int = 48
 
     # ------- masking (pre‑train only) --------------
-    mask_t:  int   = 50          # 50 frames = 250 ms if 5 ms hop
+    mask_t:  int   = 50          # 50 frames = 250 ms if 5 ms hop
     mask_f:  int   = 4
     keep_p:  float = 0.25
+
+    # ------- encoder pattern -----------------------------
+    pattern: str = "local50,global100,local50,global100"

@@ -63,3 +63,61 @@ class GLBlock(nn.Module):
 
     def forward(self, x):
         return self.core(x, self._mask(x.size(1), x.device))
+
+# ──────────────────────────────────────────────
+# sparse‑friendly blocks (no eye(), no fill_diagonal_)
+# ──────────────────────────────────────────────
+class _MHA(nn.Module):
+    """thin wrapper so we don't repeat norm→attn→ffn boilerplate"""
+    def __init__(self, d, h, ff_mult):
+        super().__init__()
+        self.norm1 = nn.LayerNorm(d)
+        self.attn  = nn.MultiheadAttention(d, h, batch_first=True)
+        self.ff    = nn.Sequential(nn.LayerNorm(d),
+                                   nn.Linear(d, d*ff_mult),
+                                   nn.GELU(),
+                                   nn.Linear(d*ff_mult, d))
+
+    def forward(self, x, mask=None):
+        h,_ = self.attn(self.norm1(x), self.norm1(x), self.norm1(x),
+                        attn_mask=mask)
+        return x + self.ff(x + h)
+
+# ------- helpers -------------------------------------------------
+def _sliding_mask(T, w, device):
+    i = torch.arange(T, device=device)[:,None]
+    j = torch.arange(T, device=device)[None,:]
+    return ((j - i).abs() > w)          # False inside window
+
+def _stripe_mask(T, stride, device):
+    g = torch.arange(0, T, stride, device=device)
+    mask = torch.ones(T, T, dtype=torch.bool, device=device)
+    mask[g,:] = mask[:,g] = False
+    return mask
+
+# ------- blocks --------------------------------------------------
+class LocalBlock(nn.Module):
+    def __init__(self, d, h, ff_mult=4, window=64):
+        super().__init__()
+        self.core = _MHA(d, h, ff_mult)
+        self.window = window
+        self.register_buffer("mask", torch.empty(0), persistent=False)
+
+    def forward(self, x):
+        T = x.size(1)
+        if self.mask.size(0) < T:                 # lazily grow mask
+            self.mask = _sliding_mask(T, self.window, x.device)
+        return self.core(x, self.mask[:T,:T])
+
+class GlobalBlock(nn.Module):
+    def __init__(self, d, h, ff_mult=4, stride=128):
+        super().__init__()
+        self.core = _MHA(d, h, ff_mult)
+        self.stride = stride
+        self.register_buffer("mask", torch.empty(0), persistent=False)
+
+    def forward(self, x):
+        T = x.size(1)
+        if self.mask.size(0) < T:
+            self.mask = _stripe_mask(T, self.stride, x.device)
+        return self.core(x, self.mask[:T,:T])

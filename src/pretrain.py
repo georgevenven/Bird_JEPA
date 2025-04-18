@@ -52,7 +52,7 @@ def jepa_loss(ctx, pred, tgt, mask):
 # ------------- pre‑train ----------------------------------------------------
 def pretrain(args):
     dev = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-    cfg = BJConfig()
+    cfg = BJConfig(pattern=args.attn_pattern)
     model = BirdJEPA(cfg).to(dev)
     opt   = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=1e-2)
     scaler= GradScaler()
@@ -312,6 +312,7 @@ if __name__ == "__main__":
     p.add_argument("--lr",    type=float, default=1e-4)
     p.add_argument("--nw",    type=int, default=4)
     p.add_argument("--log_every", type=int, default=150)
+    p.add_argument("--attn_pattern", default="local64,global128,local64,global128")
     args = p.parse_args()
 
     # Ensure train_dir and run_dir exist
