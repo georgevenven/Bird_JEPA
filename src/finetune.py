@@ -174,7 +174,7 @@ class Trainer:
     def train(self):
         ema_train=None; ema_val=None; α=.1
         step = 0
-        while step < self.args.max_steps and step < 100:
+        while step < self.args.max_steps:
             for batch in self.train_dl:
                 step += 1
                 l = self.step(batch)
@@ -325,7 +325,7 @@ def main():
     p.add_argument("--train_spec_dir"); p.add_argument("--val_spec_dir")
     p.add_argument("--output_dir",default="runs/finetuned")
     p.add_argument("--train_csv", required=True)
-    p.add_argument("--pretrained_model_path")
+    p.add_argument("--pretrained_model_path", default="")
     p.add_argument("--onnx_model_path")
     p.add_argument("--log_dir")
     p.add_argument("--submission_csv", default="submission.csv")

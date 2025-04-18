@@ -109,15 +109,14 @@ def build_label_map(csv_path: str):
     return fname2lab, classes
 
 def load_pretrained_encoder(cfg: BJConfig, ckpt_path: str | None):
-    if ckpt_path is None:
-        return BirdJEPA(cfg)
+    # if no checkpoint → random init
+    if not ckpt_path or str(ckpt_path).lower() in {"none", "null"}:
+        return nn.Sequential(
+            BirdJEPA(cfg).stem,          # conv stem
+            BirdJEPA(cfg).encoder        # transformer encoder (fresh weights)
+        )
+
     sd = torch.load(ckpt_path, map_location="cpu")
-    if "encoder.stem.0.weight" in sd:
-        model = BirdJEPA(cfg)
-        model.load_state_dict(sd, strict=False)
-        return model
-    else:
-        model = BirdJEPA(cfg)
-        enc = nn.Sequential(model.stem, model.encoder)
-        enc.load_state_dict(sd, strict=False)
-        return enc
+    model = BirdJEPA(cfg)
+    model.load_state_dict(sd, strict=False)
+    return nn.Sequential(model.stem, model.encoder)
