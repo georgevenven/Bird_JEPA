@@ -99,41 +99,32 @@ class BirdJEPA(nn.Module):
         super().__init__()
         self.cfg = cfg
 
-        # ───── conv stem ─────────────────────────────────────────────
-        layers = []
-        in_ch  = 1
-        for k, s, ch in zip(cfg.conv_k, cfg.conv_str, cfg.conv_ch):
-            layers += [nn.Conv2d(in_ch, ch, k, s, padding=(k//2, k//2)),
-                       nn.GELU()]
-            in_ch = ch
-        self.stem = nn.Sequential(*layers)        # (B , C , F′ , T′)
+        # ----- conv stem: (B,1,F,T) -> (B,C,F',T') ------------------------
+        self.stem = nn.Sequential(
+            *[nn.Conv2d(in_ch, out_ch, k, stride=s, padding=k//2)
+              for in_ch, out_ch, k, s in zip(
+                    [1]+cfg.conv_ch[:-1], cfg.conv_ch,
+                    cfg.conv_k,           cfg.conv_str)]
+        )
 
-        # ───── work out TRUE (C·F′) by a dummy pass ─────────────────
-        import torch
+        # ----- figure out flattened dim dynamically -----------------------
         with torch.no_grad():
-            dummy = torch.zeros(1, 1, cfg.n_mels, 8)     # 8 frames is enough
-            z     = self.stem(dummy)                     # (1 , C , F′ , T′)
-            C_out, F_out = z.shape[1], z.shape[2]
-        self.proj = nn.Linear(C_out * F_out, cfg.d_model)
+            dummy = torch.zeros(1, 1, cfg.n_mels, 10)   # 10 frames are enough
+            z     = self.stem(dummy)                    # (1,C,F',T')
+            C, Fp = z.shape[1], z.shape[2]              # <- real freq bins
+            flat  = C * Fp
 
-        # ───── transformer core (unchanged) ──────────
-        self.encoder = build_encoder(cfg)
+        self.proj = nn.Linear(flat, cfg.d_model, bias=False)
 
-    def forward(self, spec):             # spec (B , 1 , F , T)
-        """
-        stem: (B , C , F′ , T′)
-        flatten C×F′ → feature dim, keep time T′ as the sequence len,
-        then project to d_model before sending to the Transformer encoder.
-        """
-        z = self.stem(spec)              # (B , C , F′ , T′)
+        # ----- transformer encoder (unchanged) ----------------------------
+        self.core = build_encoder(cfg)
+        self.encoder = self.core  # <‑‑ keep the legacy handle
+        # ------------------------------------------------------------------
 
-        # ---------- flatten freq‑axis completely ------------------------
-        B, C, Fp, Tp = z.shape
-        z = z.permute(0, 3, 1, 2).contiguous()   # (B , T′ , C , F′)
-        z = z.view(B, Tp, C * Fp)                # (B , T′ , C·F′)
-        # ----------------------------------------------------------------
-
-        x = self.proj(z)               # (B , T′ , d_model)
-        x = self.encoder(x, attn_mask=None)      # local+global blocks
-
-        return x                        # (B , T′ , d_model)
+    def forward(self, spec):                 # spec (B,1,F,T)
+        z = self.stem(spec)                  # (B,C,F',T')
+        z = z.permute(0, 3, 1, 2)            # (B,T',C,F')
+        z = z.flatten(2)                     # (B,T',C*F')
+        x = self.proj(z)                     # (B,T',d_model)
+        print('DEBUG BirdJEPA.forward x.shape:', x.shape)
+        return self.core(x)                  # (B,T',d_model)

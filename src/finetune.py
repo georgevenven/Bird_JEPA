@@ -85,7 +85,7 @@ class Net(nn.Module):
         self.encoder = load_pretrained_encoder(cfg, enc_ckpt)     # freeze later
         self.clf     = BetterHead(cfg.d_model, n_cls)
     def forward(self, spec):                                      # (B,F,T)
-        spec = spec.unsqueeze(1).transpose(2,3)                   # (B,1,T,F)
+        spec = spec.unsqueeze(1)                   # (B,1,F,T)
         if hasattr(self.encoder, "inference_forward"):
             emb, _ = self.encoder.inference_forward(spec)   # full BirdJEPA case
         else:
