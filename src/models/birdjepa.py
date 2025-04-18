@@ -6,6 +6,8 @@ import math, torch, torch.nn as nn
 import torch.nn.functional as F
 from dataclasses import dataclass, field
 
+print(">> birdjepa loaded from", __file__)
+
 # ──────────────────────────────────────
 #  config
 # ──────────────────────────────────────
@@ -117,15 +119,21 @@ class BirdJEPA(nn.Module):
         # ───── transformer core (unchanged) ──────────
         self.encoder = build_encoder(cfg)
 
-    def forward(self, spec):                   # spec: (B , 1 , F , T)
-        # ─── conv stem ───────────────────────────────────────────
-        z = self.stem(spec)                  # (B , C , F′ , T′)
+    def forward(self, spec):             # spec (B , 1 , F , T)
+        """
+        stem: (B , C , F′ , T′)
+        flatten C×F′ → feature dim, keep time T′ as the sequence len,
+        then project to d_model before sending to the Transformer encoder.
+        """
+        z = self.stem(spec)              # (B , C , F′ , T′)
 
-        # ★ reshape to (B , T′ , C·F′)  — one token per time‑step
+        # ---------- flatten freq‑axis completely ------------------------
         B, C, Fp, Tp = z.shape
-        z = z.permute(0, 3, 1, 2).contiguous()      # (B , T′ , C , F′)
-        z = z.view(B, Tp, C * Fp)                   # (B , T′ , C·F′)
+        z = z.permute(0, 3, 1, 2).contiguous()   # (B , T′ , C , F′)
+        z = z.view(B, Tp, C * Fp)                # (B , T′ , C·F′)
+        # ----------------------------------------------------------------
 
-        x = self.proj(z)                 # (B , T′ , d_model)
-        x = self.encoder(x)
-        return x
+        x = self.proj(z)               # (B , T′ , d_model)
+        x = self.encoder(x, attn_mask=None)      # local+global blocks
+
+        return x                        # (B , T′ , d_model)
