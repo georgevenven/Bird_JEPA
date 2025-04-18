@@ -1,2 +1,3 @@
-from .jepa import BirdJEPA, BJConfig
+from .birdjepa import BirdJEPA, BJConfig
+from .rope import rope
 __all__ = ["BirdJEPA", "BJConfig"]

@@ -1,6 +1,6 @@
 import torch.nn as nn, torch
 from .bj_config import BJConfig
-from .layers import GLBlock
+from .layers import LGBlock
 
 # ------------------------------------------------------------------
 class ConvStem(nn.Module):
@@ -35,15 +35,14 @@ class BirdJEPA(nn.Module):
         enc = []
         for i in range(cfg.layers):
             global_flag = (i % cfg.global_every) == cfg.global_every - 1
-            enc.append(GLBlock(cfg.d_model, cfg.n_heads, cfg.ff_mult,
-                               "global" if global_flag else "local",
-                               radius=4,
-                               stride=max(1, cfg.n_global)))
+            if global_flag:
+                enc.append(LGBlock(cfg.d_model, cfg.n_heads, window=4, g_stride=max(1, cfg.n_global), ff_mult=cfg.ff_mult))
+            else:
+                enc.append(LGBlock(cfg.d_model, cfg.n_heads, window=4, g_stride=cfg.layers*10000, ff_mult=cfg.ff_mult))  # disables global tokens
         self.encoder = nn.Sequential(*enc)
 
         self.predictor = nn.Sequential(
-            *[GLBlock(cfg.pred_dim, cfg.n_heads, cfg.ff_mult,
-                      "local", radius=4) for _ in range(cfg.pred_layers)],
+            *[LGBlock(cfg.pred_dim, cfg.n_heads, window=4, g_stride=cfg.layers*10000, ff_mult=cfg.ff_mult) for _ in range(cfg.pred_layers)],
             nn.LayerNorm(cfg.pred_dim),
             nn.Linear(cfg.pred_dim, cfg.pred_dim))
 

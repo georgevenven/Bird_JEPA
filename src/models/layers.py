@@ -1,23 +1,7 @@
 import torch, math, torch.nn as nn
-
-# ------------------------------------------------------------------
-class _SA(nn.Module):
-    """self‑attention + FFN block (pre‑norm)"""
-    def __init__(self, d_model, n_heads, ff_mult):
-        super().__init__()
-        self.attn = nn.MultiheadAttention(d_model, n_heads, batch_first=True)
-        self.ff   = nn.Sequential(
-            nn.Linear(d_model, d_model * ff_mult),
-            nn.GELU(),
-            nn.Linear(d_model * ff_mult, d_model))
-        self.n1 = nn.LayerNorm(d_model)
-        self.n2 = nn.LayerNorm(d_model)
-
-    def forward(self, x, mask=None):
-        h, _ = self.attn(self.n1(x), self.n1(x), self.n1(x), attn_mask=mask)
-        x = x + h
-        x = x + self.ff(self.n2(x))
-        return x
+import torch.nn.functional as F
+from transformers.models.longformer.modeling_longformer import LongformerSelfAttention
+from .rope import rope
 
 # ------------------------------------------------------------------
 def local_mask(T: int, radius: int, device):
@@ -38,31 +22,45 @@ def global_mask(T: int, stride: int, device):
     return m
 
 # ------------------------------------------------------------------
-class GLBlock(nn.Module):
+class LGBlock(nn.Module):
     """
-    local or global attention block depending on `mode`
-    mode ∊ {'local','global','full'}
+    windowed (local) attention + optional global tokens every `g`.
+    HuggingFace LongformerSelfAttention exports to ONNX as
+    com.microsoft.EfficientAttention (= sparse CUDA kernel in ORT).
     """
-    def __init__(self, d_model, n_heads, ff_mult,
-                 mode: str = "local",
-                 radius: int | None = None,
-                 stride: int | None = None):
+    def __init__(self, d_model=96, n_heads=4, window=50, g_stride=100, ff_mult=4):
         super().__init__()
-        self.mode, self.radius, self.stride = mode, radius, stride
-        self.core = _SA(d_model, n_heads, ff_mult)
-
-    def _mask(self, T: int, device):
-        # during torch.onnx.export we're inside a tracing context; bail to full attention
-        if torch.jit.is_tracing():
-            return None
-        if self.mode == "local":
-            return local_mask(T, self.radius or 4, device)
-        if self.mode == "global":
-            return global_mask(T, self.stride or 16, device)
-        return None                        # full attention
+        self.n_heads = n_heads
+        self.d_model = d_model
+        self.d_head = d_model // n_heads
+        self.q_proj = nn.Linear(d_model, d_model)
+        self.k_proj = nn.Linear(d_model, d_model)
+        self.v_proj = nn.Linear(d_model, d_model)
+        self.out_proj = nn.Linear(d_model, d_model)
+        self.window = window
+        self.g_stride = g_stride
+        self.ff = nn.Sequential(
+            nn.LayerNorm(d_model),
+            nn.Linear(d_model, d_model*ff_mult), nn.GELU(),
+            nn.Linear(d_model*ff_mult, d_model)
+        )
+        self.ln = nn.LayerNorm(d_model)
 
     def forward(self, x):
-        return self.core(x, self._mask(x.size(1), x.device))
+        B, T, D = x.size()
+        qkv = self.ln(x)
+        qkv = rope(qkv)
+        q = self.q_proj(qkv).view(B, T, self.n_heads, self.d_head).transpose(1, 2)
+        k = self.k_proj(qkv).view(B, T, self.n_heads, self.d_head).transpose(1, 2)
+        v = self.v_proj(qkv).view(B, T, self.n_heads, self.d_head).transpose(1, 2)
+        # Build band mask inline
+        mask = local_mask(T, self.window, x.device)  # (T, T), bool
+        h = F.scaled_dot_product_attention(q, k, v, attn_mask=mask, dropout_p=0.0, is_causal=False)
+        h = h.transpose(1, 2).contiguous().view(B, T, D)
+        h = self.out_proj(h)
+        x = x + h
+        x = x + self.ff(self.ln(x))
+        return x
 
 # ──────────────────────────────────────────────
 # sparse‑friendly blocks (no eye(), no fill_diagonal_)
@@ -72,16 +70,36 @@ class _MHA(nn.Module):
     def __init__(self, d, h, ff_mult):
         super().__init__()
         self.norm1 = nn.LayerNorm(d)
-        self.attn  = nn.MultiheadAttention(d, h, batch_first=True)
+        self.n_heads = h
+        self.d_head = d // h
+        self.q_proj = nn.Linear(d, d)
+        self.k_proj = nn.Linear(d, d)
+        self.v_proj = nn.Linear(d, d)
+        self.out_proj = nn.Linear(d, d)
         self.ff    = nn.Sequential(nn.LayerNorm(d),
                                    nn.Linear(d, d*ff_mult),
                                    nn.GELU(),
                                    nn.Linear(d*ff_mult, d))
 
     def forward(self, x, mask=None):
-        h,_ = self.attn(self.norm1(x), self.norm1(x), self.norm1(x),
-                        attn_mask=mask)
-        return x + self.ff(x + h)
+        B, T, D = x.shape
+        x_norm = self.norm1(x)
+        x_norm = rope(x_norm)
+        q = self.q_proj(x_norm).view(B, T, self.n_heads, self.d_head).transpose(1, 2)
+        k = self.k_proj(x_norm).view(B, T, self.n_heads, self.d_head).transpose(1, 2)
+        v = self.v_proj(x_norm).view(B, T, self.n_heads, self.d_head).transpose(1, 2)
+        if mask is not None:
+            # mask: (T, T) or (B, T, T) → (B, 1, T, T)
+            if mask.dim() == 2:
+                mask = mask.unsqueeze(0).unsqueeze(1)
+            elif mask.dim() == 3:
+                mask = mask.unsqueeze(1)
+        h = F.scaled_dot_product_attention(q, k, v, attn_mask=mask, dropout_p=0.0, is_causal=False)
+        h = h.transpose(1, 2).contiguous().view(B, T, D)
+        h = self.out_proj(h)
+        x = x + h
+        x = x + self.ff(x + h)
+        return x
 
 # ------- helpers -------------------------------------------------
 def _sliding_mask(T, w, device):

@@ -58,27 +58,32 @@ def grad_norm(model: nn.Module) -> float:
 # ╭──────────────────────────────────────────────────────────────────────────╮
 # │  classifier head                                                        │
 # ╰──────────────────────────────────────────────────────────────────────────╯
-class Classifier(nn.Module):
-    def __init__(self, d_model:int, n_cls:int, pool:str="mean"):
+class BetterHead(nn.Module):
+    def __init__(self, d_model, n_cls, hid=256):
         super().__init__()
-        self.pool = pool
-        self.head = nn.Sequential(nn.Linear(d_model,128),
-                                  nn.ReLU(),
-                                  nn.Dropout(0.3),
-                                  nn.Linear(128,n_cls))
-    def forward(self, x):                    # x (B,T,d)
-        x = x.mean(1) if self.pool=="mean" else x.max(1).values
-        return self.head(x)
+        self.attn_pool = nn.Sequential(
+            nn.Linear(d_model, 1),
+            nn.Softmax(dim=1))
+        self.mlp = nn.Sequential(
+            nn.LayerNorm(d_model),
+            nn.Linear(d_model, hid),
+            nn.GELU(),
+            nn.Dropout(0.2),
+            nn.Linear(hid, n_cls))
+    def forward(self, x):          # x (B,T,d)
+        w = self.attn_pool(x)      # (B,T,1)
+        x = (w * x).sum(1)         # weighted sum
+        return self.mlp(x)
 
 # ╭──────────────────────────────────────────────────────────────────────────╮
 # │  Net = frozen (or not) encoder + head                                    │
 # ╰──────────────────────────────────────────────────────────────────────────╯
 class Net(nn.Module):
     def __init__(self, enc_ckpt:str|None, cfg:BJConfig,
-                 n_cls:int, pool:str):
+                 n_cls:int):
         super().__init__()
         self.encoder = load_pretrained_encoder(cfg, enc_ckpt)     # freeze later
-        self.clf     = Classifier(cfg.d_model, n_cls, pool)
+        self.clf     = BetterHead(cfg.d_model, n_cls)
     def forward(self, spec):                                      # (B,F,T)
         spec = spec.unsqueeze(1).transpose(2,3)                   # (B,1,T,F)
         if hasattr(self.encoder, "inference_forward"):
@@ -112,7 +117,7 @@ class Trainer:
         # ── model ──────────────────────────────────────────────
         cfg = BJConfig(d_model=args.enc_width, pattern=args.attn_pattern)
         self.net = Net(args.pretrained_model_path, cfg,
-                       len(self.classes), args.pool_type)
+                       len(self.classes))
         self.dev = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
         self.net.to(self.dev)
 
@@ -169,7 +174,7 @@ class Trainer:
     def train(self):
         ema_train=None; ema_val=None; α=.1
         step = 0
-        while step < self.args.max_steps:
+        while step < self.args.max_steps and step < 100:
             for batch in self.train_dl:
                 step += 1
                 l = self.step(batch)
@@ -240,7 +245,7 @@ class Infer:
         state=torch.load(ckpt,map_location="cpu")
 
         cfg=BJConfig(d_model=args.enc_width, pattern=args.attn_pattern)
-        self.net=Net(args.pretrained_model_path,cfg,len(self.classes),args.pool_type)
+        self.net=Net(args.pretrained_model_path,cfg,len(self.classes))
         self.net.load_state_dict(state["model"]); self.net.eval()
 
         # ---- ONNX export (once) ---------------------------------
@@ -325,13 +330,12 @@ def main():
     p.add_argument("--log_dir")
     p.add_argument("--submission_csv", default="submission.csv")
     p.add_argument("--context_length",type=int,default=1000)
-    p.add_argument("--batch_size",type=int,default=64)
+    p.add_argument("--batch_size",type=int,default=1)
     p.add_argument("--learning_rate",type=float,default=5e-4)
     p.add_argument("--max_steps",type=int,default=100000)
     p.add_argument("--eval_interval",type=int,default=100)
     p.add_argument("--save_interval",type=int,default=1000)
     p.add_argument("--early_stopping_patience",type=int,default=100)
-    p.add_argument("--pool_type",choices=["mean","max"],default="mean")
     p.add_argument("--freeze_encoder",action="store_true")
     p.add_argument("--num_workers",type=int,default=4)
     p.add_argument("--enc_width",type=int,default=96,help="JEPA hidden size d_model")

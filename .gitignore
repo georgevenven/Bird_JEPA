@@ -17,3 +17,10 @@
 /llb3_specs
 /runs
 *.log
+*.json
+*.pt
+*.zip
+*.wav
+*.mp3
+*.png
+*.jpg
