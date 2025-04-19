@@ -51,6 +51,7 @@ class WavToSpec:
         single_threaded: bool = True,
         min_len_ms: int = 25,
         min_timebins: int = 25,
+        fmt: str = "pt",
     ) -> None:
         self.src_dir = Path(src_dir) if src_dir is not None else None
         self.dst_dir = Path(dst_dir)
@@ -64,6 +65,7 @@ class WavToSpec:
         self.single = single_threaded
         self.min_len_ms = min_len_ms
         self.min_timebins = min_timebins
+        self.fmt = fmt
 
         self._setup_logging()
         mgr = mp.Manager()
@@ -189,8 +191,14 @@ class WavToSpec:
 
         labels = np.zeros(S.shape[1], dtype=np.int32)
 
-        out_name = fp.stem + ".npz"
-        np.savez(self.dst_dir / out_name, s=S, labels=labels)
+        if self.fmt == "pt":
+            import torch
+            out = self.dst_dir / (fp.stem + ".pt")
+            torch.save({"s": torch.as_tensor(S).to(torch.float16),
+                        "labels": torch.as_tensor(labels)}, out)
+        else:  # npz (uncompressed)
+            out = self.dst_dir / (fp.stem + ".npz")
+            np.savez(out, s=S.astype(np.float32), labels=labels)
 
         # free memory fast in workers
         del wav, S, labels
@@ -209,7 +217,9 @@ def cli() -> None:
     grp.add_argument("--file_list", type=str,
                      help="Text file with absolute/relative paths, one per line.")
     p.add_argument("--dst_dir",  type=str, required=True,
-                   help="Where .npz outputs go.")
+                   help="Where outputs go.")
+    p.add_argument("--format", choices=["pt","npz"], default="pt",
+                   help="output format (default: pt, fp16)")
 
     p.add_argument("--step_size", type=int, default=160,
                    help="STFT hop length (samples at 32 kHz).")
@@ -232,7 +242,8 @@ def cli() -> None:
         step_size=args.step_size,
         n_fft=args.nfft,
         take_n_random=args.take_n_random,
-        single_threaded=single
+        single_threaded=single,
+        fmt=args.format,
     )
     converter.run()
 

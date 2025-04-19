@@ -1,5 +1,24 @@
 import torch, math
 
+class Rope(torch.nn.Module):
+    def __init__(self, max_t=1024, d_half=48, device='cuda'):
+        super().__init__()
+        theta = 10000 ** (-torch.arange(0, d_half, dtype=torch.float32) / d_half)
+        pos = torch.arange(max_t, dtype=torch.float32)[:, None]
+        ang = pos * theta                      # (T, d/2)
+        self.register_buffer("sin", ang.sin())  # (T, d/2)
+        self.register_buffer("cos", ang.cos())  # (T, d/2)
+
+    def forward(self, x):                       # x (B,T,D)
+        B, T, D = x.shape
+        d2 = D // 2
+        sin, cos = self.sin[:T], self.cos[:T]   # slice
+        x1, x2 = x[..., :d2], x[..., d2:]
+        return torch.cat([
+            x1 * cos - x2 * sin,
+            x1 * sin + x2 * cos
+        ], dim=-1)
+
 def rope(x):
     """
     x : (B, T, d)   with d even

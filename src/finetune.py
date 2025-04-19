@@ -10,16 +10,25 @@ import zipfile
 import numpy as np, pandas as pd, torch, torch.nn as nn, torch.nn.functional as F
 import matplotlib.pyplot as plt
 import onnx, onnxruntime as ort
+import os
+import torch.multiprocessing
 
 # local imports (unchanged public interface)
 from models  import BJConfig                            # encoder
 from models.birdjepa import BirdJEPA
 from utils   import load_pretrained_encoder                       # simple helper
-from data.bird_datasets import BirdSpectrogramDataset
+from data.bird_datasets import BirdSpectrogramDataset, TorchSpecDataset
 # ╭──────────────────────────────────────────────────────────────────────────╮
 # │  Kaggle‑style macro ROC‑AUC – self‑contained, no external dependency     │
 # ╰──────────────────────────────────────────────────────────────────────────╯
 from sklearn.metrics import roc_auc_score
+# --- AMP setup ---
+from contextlib import nullcontext
+AMP = torch.cuda.is_available()
+if AMP:
+    torch.backends.cuda.matmul.allow_tf32 = True
+    torch.backends.cudnn.allow_tf32 = True
+
 def kaggle_roc_auc(solution: pd.DataFrame, submission: pd.DataFrame,
                    row_id: str = "row_id") -> float:
     sol = solution.drop(columns=[row_id])
@@ -49,17 +58,17 @@ class Tee:
 
 @torch.no_grad()
 def grad_norm(model: nn.Module) -> float:
-    g2=0.0
+    g2 = 0.0
     for p in model.parameters():
         if p.grad is not None:
-            g2 += p.grad.norm()**2
+            g2 += p.grad.float().norm()**2      # fp32
     return float(g2**0.5)
 
 # ╭──────────────────────────────────────────────────────────────────────────╮
 # │  classifier head                                                        │
 # ╰──────────────────────────────────────────────────────────────────────────╯
 class BetterHead(nn.Module):
-    def __init__(self, d_model, n_cls, hid=256):
+    def __init__(self, d_model, n_cls, hid=512):
         super().__init__()
         self.attn_pool = nn.Sequential(
             nn.Linear(d_model, 1),
@@ -97,20 +106,24 @@ class Net(nn.Module):
 # ╰──────────────────────────────────────────────────────────────────────────╯
 class Trainer:
     def __init__(self, args):
+        torch.multiprocessing.set_sharing_strategy("file_system")
         self.args = args
         # ── data ───────────────────────────────────────────────
-        self.train_ds = BirdSpectrogramDataset(args.train_spec_dir,
+        self.train_ds = TorchSpecDataset(args.train_spec_dir,
                                                segment_len=args.context_length,
                                                csv_path=args.train_csv)
-        self.val_ds   = BirdSpectrogramDataset(args.val_spec_dir,
+        self.val_ds   = TorchSpecDataset(args.val_spec_dir,
                                                segment_len=args.context_length,
                                                infinite=False,
                                                csv_path=args.train_csv)
         self.classes  = self.train_ds.classes
         self.train_dl = torch.utils.data.DataLoader(self.train_ds,
-                                                    args.batch_size, shuffle=True,
-                                                    num_workers=args.num_workers,
-                                                    pin_memory=True, drop_last=True)
+                                                    batch_size=self.args.batch_size, shuffle=True,
+                                                    num_workers=4,
+                                                    pin_memory=True,
+                                                    persistent_workers=True,
+                                                    prefetch_factor=2,
+                                                    drop_last=True)
         self.val_dl   = torch.utils.data.DataLoader(self.val_ds, 1,
                                                     shuffle=False, num_workers=0)
 
@@ -120,13 +133,27 @@ class Trainer:
                        len(self.classes))
         self.dev = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
         self.net.to(self.dev)
+        torch._dynamo.config.suppress_errors = True        # auto‑fallback to eager
+        os.environ["TORCH_COMPILE_DISABLE"] = "1"
 
-        # freeze encoder if requested
-        if args.freeze_encoder:
-            for p in self.net.encoder.parameters(): p.requires_grad=False
+        # --- head-only warm-up ---
+        self.warmup_steps = 1000
+        self.enc_frozen = True
+        for p in self.net.encoder.parameters():
+            p.requires_grad = False
 
-        self.opt = torch.optim.Adam(self.net.parameters(), lr=args.learning_rate)
+        enc_lr  = 1e-4
+        head_lr = 3e-3
+        self.opt = torch.optim.AdamW([
+            {"params": self.net.encoder.parameters(), "lr": enc_lr},
+            {"params": self.net.clf.parameters(),     "lr": head_lr},
+        ], weight_decay=0)
+        self.scaler = torch.cuda.amp.GradScaler(enabled=AMP)
         self.crit = nn.BCEWithLogitsLoss()
+
+        # optional: cosine to 1e‑5
+        self.sched = torch.optim.lr_scheduler.CosineAnnealingLR(
+            self.opt, T_max=args.max_steps - self.warmup_steps, eta_min=1e-5)
 
         # ── dirs / logging ─────────────────────────────────────
         self.run_dir = Path(args.output_dir); self.run_dir.mkdir(parents=True,exist_ok=True)
@@ -139,6 +166,10 @@ class Trainer:
 
         # stats history
         self.hist = {"step":[], "train":[], "val":[], "grad":[]}
+
+        self.alpha = 0.1              # EMA smoothing factor
+        self.train_ema = None
+        self.val_ema   = None
 
         # --- new for AUC EMA tracking ---
         self.ema_alpha = 0.1
@@ -155,100 +186,136 @@ class Trainer:
 
     # ----------------------------------------------------------
     def step(self, batch):
-        spec, _, fn = batch                     # dataset returns (spec, lab, fn)
+        spec, _, fn = batch
         spec = spec.to(self.dev)
         y    = self._label_tensor(fn)
+
+        with torch.cuda.amp.autocast():
+            loss = self.crit(self.net(spec), y)
+
         self.opt.zero_grad()
-        loss = self.crit(self.net(spec), y)
-        loss.backward(); self.opt.step()
+        self.scaler.scale(loss).backward()
+        self.scaler.unscale_(self.opt)              # for true gnorm
+        torch.nn.utils.clip_grad_norm_(self.net.parameters(), 5.0)
+        self.scaler.step(self.opt)
+        self.scaler.update()
         return float(loss.item())
 
     # ----------------------------------------------------------
-    @torch.no_grad()
-    def eval_loss(self, n=64):
-        self.net.eval(); tot=0; cnt=0
-        for spec,_,fn in self.val_dl:
-            spec=spec.to(self.dev)
-            y=self._label_tensor(fn)
-            tot += self.crit(self.net(spec),y).item(); cnt+=1
-            if cnt>=n: break
-        self.net.train()
-        return tot/cnt
-
-    # ----------------------------------------------------------
-    def _validate(self, step):
-        # from sklearn.metrics import roc_auc_score
+    def _validate(self, step, max_batches=64):
+        """
+        quick val: at most `max_batches` × batch_size samples
+        returns scalar loss and macro ROC‑AUC (skips zero‑positive classes)
+        """
         self.net.eval()
-        all_probs, all_labels = [], []
+        tot_loss = 0.0; n_seen = 0
+        y_all, p_all = [], []
+
         with torch.no_grad():
-            for spec, _, fnames in self.val_dl:   # <- rename for clarity
-                spec = spec.to(self.dev)
-                y    = self._label_tensor(fnames)          # pass the tuple/list directly
-                p = torch.sigmoid(self.net(spec))
-                all_probs.append(p.cpu())
-                all_labels.append(y.cpu())
-        # auc = roc_auc_score(torch.cat(all_labels),
-        #                     torch.cat(all_probs), average="macro")
+            for b, (spec, _, fnames) in enumerate(self.val_dl):
+                spec = spec.to(self.dev, dtype=torch.float32, non_blocking=True)
+                y    = self._label_tensor(fnames)
+                logit = self.net(spec)
+                loss  = self.crit(logit, y)
 
-        # ---- EMA --------------------------------------------------
-        # if self.ema_auc is None:
-        #     self.ema_auc = auc
-        # else:
-        #     self.ema_auc = self.ema_alpha*auc + (1-self.ema_alpha)*self.ema_auc
+                tot_loss += loss.item() * len(spec)
+                n_seen   += len(spec)
 
-        # print(f"[val] step {step:06d}  auc {auc:.4f}  ema {self.ema_auc:.4f}")
+                p_all.append(torch.sigmoid(logit).cpu())
+                y_all.append(y.cpu())
 
-        # keep for later plotting
-        # self.hist_auc.append({"step": step, "val_auc": auc, "val_auc_ema": self.ema_auc})
+                if b + 1 >= max_batches:
+                    break
 
+        val_loss = tot_loss / n_seen
+
+        # --- macro ROC‑AUC (skip classes with no positives) -------------
+        y_cat = torch.cat(y_all)
+        p_cat = torch.cat(p_all)
+        aucs  = []
+        for c in range(y_cat.shape[1]):
+            if y_cat[:, c].sum() == 0:
+                continue
+            try:
+                aucs.append(roc_auc_score(y_cat[:, c], p_cat[:, c]))
+            except ValueError:        # constant prediction
+                pass
+        val_auc = float(np.mean(aucs)) if aucs else float("nan")
+
+        # print(f"[val] step {step:06d}  loss {val_loss:.4f}  AUC {val_auc:.4f}")
+        pass
         self.net.train()
-        # return auc
-        return None
+        return val_loss, val_auc
 
     # ----------------------------------------------------------
     def train(self):
-        ema_train=None; ema_val=None; α=.1
-        step = 0
+        step      = 0
+        dl_iter   = iter(self.train_dl)
         while step < self.args.max_steps:
-            for batch in self.train_dl:
-                step += 1
-                l = self.step(batch)
-                ema_train = l if ema_train is None else α*l+(1-α)*ema_train
+            try:
+                batch = next(dl_iter)
+            except StopIteration:
+                dl_iter = iter(self.train_dl)
+                continue
 
-                if step%self.args.eval_interval: continue
-                v = self._validate(step)
-                if v is None:
-                    v = self.eval_loss()
-                    ema_val = None
-                else:
-                    ema_val = v if ema_val is None else α*v+(1-α)*ema_val
+            step += 1
+            l = self.step(batch)                       # back‑prop
+            if self.sched is not None:                 # only if scheduler
+                self.sched.step()
+            self.train_ema = l if self.train_ema is None else \
+                             self.alpha*l + (1-self.alpha)*self.train_ema
+
+            # ────────────────────────────────────────────────
+            # validate + log **only every eval_interval steps**
+            # ────────────────────────────────────────────────
+            if step % self.args.eval_interval == 0:
+                v_loss, v_auc = self._validate(step, max_batches=16)
+                self.val_ema = (v_loss if self.val_ema is None
+                                else self.alpha*v_loss + (1-self.alpha)*self.val_ema)
+                self.ema_auc = (v_auc  if self.ema_auc is None
+                                else self.alpha*v_auc  + (1-self.alpha)*self.ema_auc)
 
                 gnorm = grad_norm(self.net)
-                self.log(f"step {step:06d} | loss {ema_train:.4f} | "
-                         f"val {ema_val if ema_val is not None else 'NA'} | gnorm {gnorm:.2f}")
+                lrs   = [pg["lr"] for pg in self.opt.param_groups]
+                lr_txt = " ".join(f"lr{i}:{lr:.2e}" for i, lr in enumerate(lrs))
+                scale = self.scaler.get_scale()
 
-                # record
+                self.log(f"step {step:06d} | train {self.train_ema:.4f} | "
+                         f"val {self.val_ema:.4f} | AUC {self.ema_auc:.3f} "
+                         f"| gnorm {gnorm:.4e} | scale {scale:.1f} | {lr_txt}")
+
+                # record history
                 self.hist["step"].append(step)
-                self.hist["train"].append(ema_train)
-                self.hist["val"].append(ema_val)
+                self.hist["train"].append(self.train_ema)
+                self.hist["val"].append(self.val_ema)
+                self.hist.setdefault("auc", []).append(self.ema_auc)
                 self.hist["grad"].append(gnorm)
 
-                # early‑stop bookkeeping
-                if v is not None:
-                    improved = v < self.best_val - 1e-5
-                    if improved:
-                        self.best_val = v; self.bad_evals=0
-                        self._save(step,'best')
-                    else:
-                        self.bad_evals += 1
+                # early‑stopping bookkeeping, ckpt save, etc.
+                improved = v_loss < self.best_val - 1e-5
+                if improved:
+                    self.best_val = v_loss; self.bad_evals = 0
+                    self._save(step, 'best')
+                else:
+                    self.bad_evals += 1
 
-                if step%self.args.save_interval==0: self._save(step,'ckpt')
-                if self.bad_evals>=self.args.early_stopping_patience:
+                if step % self.args.save_interval == 0:
+                    self._save(step, 'ckpt')
+
+                if self.bad_evals >= self.args.early_stopping_patience:
                     self.log(f"early stop (no improve for {self.bad_evals} evals)")
                     break
-                if step>=self.args.max_steps: break
-            if step>=self.args.max_steps or self.bad_evals>=self.args.early_stopping_patience:
-                break
+
+            if step>=self.args.max_steps: break
+
+            # --------------------------------------------------
+            # staged‑unfreeze: flip encoder gradients on *once*
+            # --------------------------------------------------
+            if self.enc_frozen and step >= self.warmup_steps:
+                for p in self.net.encoder.parameters():
+                    p.requires_grad = True
+                self.enc_frozen = False
+                self.log(f"step {step}: encoder unfrozen (lr={self.opt.param_groups[0]['lr']:.2e})")
 
         # --- after training loop: dump metrics and plots ---
         df = pd.DataFrame(self.hist)
@@ -282,7 +349,7 @@ class Infer:
         self.classes=self.ds.classes
 
         ckpt = sorted((Path(args.output_dir)/"weights").glob("best_*.pt"))[-1]
-        state=torch.load(ckpt,map_location="cpu")
+        state=torch.load(ckpt,map_location="cpu", weights_only=True)
 
         cfg=BJConfig(d_model=args.enc_width, pattern=args.attn_pattern)
         self.net=Net(args.pretrained_model_path,cfg,len(self.classes))
@@ -318,20 +385,27 @@ class Infer:
 
     # ----------------------------------------------------------
     def run(self):
+        if len(self.ds) == 0:
+            print("empty spec dir – nothing to score"); return
+
+        val_loader = torch.utils.data.DataLoader(
+            self.ds, batch_size=1, shuffle=False, num_workers=2, pin_memory=True)
+
         rows=[]; y_true=[]
         times=[]
         profile_path = None
         # drop explicit start; ORT starts auto‑profiling when enabled
-        for i, (spec, _, fn) in enumerate(self.ds):
-            # if i >= 100:
-            #     break
+        for i, (spec, _, fn) in enumerate(val_loader):
             t0=time.time()
             try:
-                segs = self._segment(spec)
+                # ── hard‑trim to 60 s (12 000 frames) ────────────────
+                spec = spec[..., :12_000]          # if already shorter, noop
+
+                segs = self._segment(spec)         # now 1‑to‑12 chunks, never 13
                 probs = [self._predict(s) for s in segs]
 
-                base = re.sub(r'_segment_\d+$', '', Path(fn).stem)
-                lab = np.zeros(len(self.classes)); lab[self.ds.label_idx(fn)] = 1
+                base = re.sub(r'_segment_\d+$', '', Path(fn[0]).stem)
+                lab = np.zeros(len(self.classes)); lab[self.ds.label_idx(fn[0])] = 1
                 for i, p in enumerate(probs):
                     row_id = f"{base}_{(i+1)*5}"
                     rows.append({"row_id": row_id, **{c: float(p[j]) for j, c in enumerate(self.classes)}})
@@ -342,13 +416,25 @@ class Infer:
             times.append(time.time()-t0)
         profile_path = self.sess.end_profiling()   # returns file path
 
-        out_csv=Path(self.args.log_dir or self.args.output_dir)/self.args.submission_csv
-        sub=pd.DataFrame(rows); sub.to_csv(out_csv,index=False,float_format="%.8f")
-        sol=pd.DataFrame(y_true,columns=self.classes); sol.insert(0,"row_id",sub["row_id"])
-        auc=kaggle_roc_auc(sol,sub)
-        print(f"wrote {out_csv} | ROC‑AUC {auc:.4f}")
-        if profile_path:
-            self.log(f"onnx profile saved → {profile_path}")
+        # -----------------------------------------------------------
+        # build dataframe with all classes, even if rows / some cols missing
+        cols = ["row_id"] + list(self.classes)
+        if rows:
+            sub = pd.DataFrame(rows)
+            sub = sub.reindex(columns=cols, fill_value=0.0)
+        else:                                 # no clips found → header‑only file
+            sub = pd.DataFrame(columns=cols)
+
+        out_csv = Path(self.args.log_dir or self.args.output_dir) / self.args.submission_csv
+        sub.to_csv(out_csv, index=False, float_format="%.8f")
+
+        if y_true:                           # if we actually had ground‑truth
+            sol = pd.DataFrame(y_true, columns=self.classes)
+            sol.insert(0, "row_id", sub["row_id"])
+            auc = kaggle_roc_auc(sol, sub)
+            print(f"wrote {out_csv} | ROC‑AUC {auc:.4f}")
+        else:
+            print(f"wrote {out_csv} | no validation clips found – skipped AUC")
 
         # ── timing summary ─────────────────────────────────────
         if times:
@@ -370,15 +456,15 @@ def main():
     p.add_argument("--log_dir")
     p.add_argument("--submission_csv", default="submission.csv")
     p.add_argument("--context_length",type=int,default=1000)
-    p.add_argument("--batch_size",type=int,default=128)
-    p.add_argument("--learning_rate",type=float,default=1e-3)
-    p.add_argument("--max_steps",type=int,default=1000)
+    p.add_argument("--batch_size",type=int,default=320)
+    p.add_argument("--learning_rate",type=float,default=5e-3)
+    p.add_argument("--max_steps",type=int,default=100000)
     p.add_argument("--eval_interval",type=int,default=100)
     p.add_argument("--save_interval",type=int,default=1000)
     p.add_argument("--early_stopping_patience",type=int,default=100)
     p.add_argument("--freeze_encoder",action="store_true")
     p.add_argument("--num_workers",type=int,default=4)
-    p.add_argument("--enc_width",type=int,default=96,help="JEPA hidden size d_model")
+    p.add_argument("--enc_width",type=int,default=192,help="JEPA hidden size d_model")
     p.add_argument("--attn_pattern", default="local50,global100,local50,global100")
     args=p.parse_args()
 

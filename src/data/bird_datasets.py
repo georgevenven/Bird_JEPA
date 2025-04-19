@@ -25,7 +25,7 @@ class BirdSpectrogramDataset(Dataset):
                  csv_path: str | None = None):
         self.paths: List[str] = [
             e.path for e in os.scandir(data_dir)
-            if e.is_file() and e.name.lower().endswith(".npz")
+            if e.is_file() and (e.name.lower().endswith(".npz") or e.name.lower().endswith(".pt"))
         ]
         if not self.paths:
             # Gracefully handle empty directory: create empty CSV with just column labels
@@ -79,17 +79,48 @@ class BirdSpectrogramDataset(Dataset):
         if self.infinite:
             idx = random.randint(0, len(self.paths) - 1)
         path = self.paths[idx]
-        try:
-            npz = load_np(path)
-        except (zipfile.BadZipFile, ValueError, OSError) as exc:
-            if getattr(self, 'verbose', False):
-                print(f"[dataset] skip {path}: {exc}")
-            if self.infinite:
-                return self.__getitem__(random.randint(0, len(self.paths) - 1))
+        path_obj = Path(path)
+        if path_obj.suffix == ".pt":
+            obj = torch.load(path, mmap=True, map_location="cpu", weights_only=True)
+
+            # ----- unwrap ----------------------------------------------------
+            if isinstance(obj, dict):          # new .pt format {"s": tensor}
+                spec_t   = obj["s"]
+                labels_t = obj.get("labels")    # may be None
+            else:                              # legacy raw tensor
+                spec_t, labels_t = obj, None
+
+            # ----- always hand back numpy ------------------------------------
+            if isinstance(spec_t, torch.Tensor):
+                spec = spec_t.half().cpu().numpy()
             else:
-                raise IndexError("corrupt file skipped")
-        spec = npz['s'][:, :-1]              # drop final STFT frame
-        labels = npz['labels']
+                spec = spec_t.astype(np.float32)
+
+            if labels_t is None:
+                labels = np.zeros(spec.shape[1], dtype=np.int32)
+            elif isinstance(labels_t, torch.Tensor):
+                labels = labels_t.cpu().numpy()
+            else:
+                labels = labels_t
+
+            # ── slice random segment for training ─────────────────────────
+            if self.segment_len is not None:                 # training mode
+                spec, labels = self._pull_segment(spec, labels)
+
+            fname = Path(path).name
+            return spec, labels, fname
+        else:  # .npz
+            try:
+                npz = load_np(path)
+            except (zipfile.BadZipFile, ValueError, OSError) as exc:
+                if getattr(self, 'verbose', False):
+                    print(f"[dataset] skip {path}: {exc}")
+                if self.infinite:
+                    return self.__getitem__(random.randint(0, len(self.paths) - 1))
+                else:
+                    raise IndexError("corrupt file skipped")
+            spec = npz['s'][:, :-1]              # drop final STFT frame
+            labels = npz['labels']
 
         # --- align label length to spectrogram length -----------------
         T = spec.shape[1]
@@ -105,9 +136,10 @@ class BirdSpectrogramDataset(Dataset):
         # global z‑score
         seg = (seg - seg.mean()) / (seg.std() + 1e-8)
 
+        fname = Path(path).name        # robust whether path is str or Path
         return (torch.from_numpy(seg).float(),
                 torch.from_numpy(seg_lab).long(),
-                os.path.basename(path))
+                fname)
 
     def label_idx(self, npz_name: str):
         """
@@ -115,3 +147,7 @@ class BirdSpectrogramDataset(Dataset):
         """
         key = Path(npz_name).with_suffix('.ogg').name
         return self.label_to_idx.get(self.fname2lab.get(key, ''), -1)
+
+class TorchSpecDataset(BirdSpectrogramDataset):
+    def _load(self, path):
+        return torch.load(path, mmap=True)["s"]

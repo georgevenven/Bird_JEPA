@@ -128,5 +128,5 @@ class BirdJEPA(nn.Module):
         z = z.permute(0, 3, 1, 2)            # (B,T',C,F')
         z = z.flatten(2)                     # (B,T',C*F')
         x = self.proj(z)                     # (B,T',d_model)
-        print('DEBUG BirdJEPA.forward x.shape:', x.shape)
+        # print('DEBUG BirdJEPA.forward x.shape:', x.shape)
         return self.core(x)                  # (B,T',d_model)
