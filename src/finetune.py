@@ -145,9 +145,9 @@ class Trainer:
         enc_lr  = 1e-4
         head_lr = 3e-3
         self.opt = torch.optim.AdamW([
-            {"params": self.net.encoder.parameters(), "lr": enc_lr},
-            {"params": self.net.clf.parameters(),     "lr": head_lr},
-        ], weight_decay=0)
+            {"params": self.net.encoder.parameters(), "lr": enc_lr, "weight_decay": 1e-2},
+            {"params": self.net.clf.parameters(),     "lr": head_lr, "weight_decay": 0.0},
+        ])
         self.scaler = torch.cuda.amp.GradScaler(enabled=AMP)
         self.crit = nn.BCEWithLogitsLoss()
 
@@ -348,7 +348,8 @@ class Infer:
                                           csv_path=args.train_csv)
         self.classes=self.ds.classes
 
-        ckpt = sorted((Path(args.output_dir)/"weights").glob("best_*.pt"))[-1]
+        ckpt = Path(args.ckpt) if getattr(args, "ckpt", None) else \
+               sorted((Path(args.output_dir)/"weights").glob("best_*.pt"))[-1]
         state=torch.load(ckpt,map_location="cpu", weights_only=True)
 
         cfg=BJConfig(d_model=args.enc_width, pattern=args.attn_pattern)
@@ -461,11 +462,12 @@ def main():
     p.add_argument("--max_steps",type=int,default=100000)
     p.add_argument("--eval_interval",type=int,default=100)
     p.add_argument("--save_interval",type=int,default=1000)
-    p.add_argument("--early_stopping_patience",type=int,default=100)
+    p.add_argument("--early_stopping_patience", default=300, type=int)
     p.add_argument("--freeze_encoder",action="store_true")
     p.add_argument("--num_workers",type=int,default=4)
     p.add_argument("--enc_width",type=int,default=192,help="JEPA hidden size d_model")
     p.add_argument("--attn_pattern", default="local50,global100,local50,global100")
+    p.add_argument("--ckpt", help="explicit path to .pt checkpoint")
     args=p.parse_args()
 
     run_root = Path(args.output_dir)
