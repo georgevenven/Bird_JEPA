@@ -77,7 +77,7 @@ class BetterHead(nn.Module):
             nn.LayerNorm(d_model),
             nn.Linear(d_model, hid),
             nn.GELU(),
-            nn.Dropout(0.2),
+            nn.Dropout(0.3),       # stronger regularisation
             nn.Linear(hid, n_cls))
     def forward(self, x):          # x (B,T,d)
         w = self.attn_pool(x)      # (B,T,1)
@@ -137,7 +137,7 @@ class Trainer:
         os.environ["TORCH_COMPILE_DISABLE"] = "1"
 
         # --- head-only warm-up ---
-        self.warmup_steps = 1000
+        self.warmup_steps = 2000
         self.enc_frozen = True
         for p in self.net.encoder.parameters():
             p.requires_grad = False
@@ -146,7 +146,7 @@ class Trainer:
         head_lr = 3e-3
         self.opt = torch.optim.AdamW([
             {"params": self.net.encoder.parameters(), "lr": enc_lr, "weight_decay": 1e-2},
-            {"params": self.net.clf.parameters(),     "lr": head_lr, "weight_decay": 0.0},
+            {"params": self.net.clf.parameters(),     "lr": head_lr, "weight_decay": 5e-3},
         ])
         self.scaler = torch.cuda.amp.GradScaler(enabled=AMP)
         self.crit = nn.BCEWithLogitsLoss()
@@ -165,7 +165,11 @@ class Trainer:
         self.best_val = 9e9; self.bad_evals = 0
 
         # stats history
-        self.hist = {"step":[], "train":[], "val":[], "grad":[]}
+        self.hist = {"step":[],            # global step
+                     "train":[],           # EMA train‑loss
+                     "val":[],             # EMA val‑loss
+                     "auc":[],             # EMA val‑AUC
+                     "grad":[]}            # grad‑norm
 
         self.alpha = 0.1              # EMA smoothing factor
         self.train_ema = None
@@ -177,11 +181,14 @@ class Trainer:
         self.hist_auc  = []  # list of dicts for csv/plot
 
     # ----------------------------------------------------------
-    def _label_tensor(self, fnames):
+    def _label_tensor(self, fnames, eps: float = 0.05):  # label‑smoothing ε
         y = torch.zeros(len(fnames), len(self.classes), device=self.dev)
-        for i,f in enumerate(fnames):
+        for i, f in enumerate(fnames):
             idx = self.train_ds.label_idx(f)
-            if idx>=0: y[i,idx]=1
+            if idx >= 0:
+                y[i, idx] = 1.0
+        # smooth:   y ← (1‑ε)·y  +  ε/C
+        y = y * (1 - eps) + eps / y.size(1)
         return y
 
     # ----------------------------------------------------------
@@ -196,7 +203,7 @@ class Trainer:
         self.opt.zero_grad()
         self.scaler.scale(loss).backward()
         self.scaler.unscale_(self.opt)              # for true gnorm
-        torch.nn.utils.clip_grad_norm_(self.net.parameters(), 5.0)
+        torch.nn.utils.clip_grad_norm_(self.net.parameters(), 1.0)
         self.scaler.step(self.opt)
         self.scaler.update()
         return float(loss.item())
@@ -214,7 +221,7 @@ class Trainer:
         with torch.no_grad():
             for b, (spec, _, fnames) in enumerate(self.val_dl):
                 spec = spec.to(self.dev, dtype=torch.float32, non_blocking=True)
-                y    = self._label_tensor(fnames)
+                y    = self._label_tensor(fnames, eps=0.0)
                 logit = self.net(spec)
                 loss  = self.crit(logit, y)
 
@@ -270,10 +277,11 @@ class Trainer:
             # ────────────────────────────────────────────────
             if step % self.args.eval_interval == 0:
                 v_loss, v_auc = self._validate(step, max_batches=16)
-                self.val_ema = (v_loss if self.val_ema is None
-                                else self.alpha*v_loss + (1-self.alpha)*self.val_ema)
-                self.ema_auc = (v_auc  if self.ema_auc is None
-                                else self.alpha*v_auc  + (1-self.alpha)*self.ema_auc)
+                # --- EMAs ---------------------------------------------------
+                self.val_ema = v_loss if self.val_ema is None else \
+                               self.alpha*v_loss + (1-self.alpha)*self.val_ema
+                self.auc_ema = v_auc  if getattr(self, 'auc_ema', None) is None else \
+                               self.alpha*v_auc  + (1-self.alpha)*self.auc_ema
 
                 gnorm = grad_norm(self.net)
                 lrs   = [pg["lr"] for pg in self.opt.param_groups]
@@ -281,14 +289,14 @@ class Trainer:
                 scale = self.scaler.get_scale()
 
                 self.log(f"step {step:06d} | train {self.train_ema:.4f} | "
-                         f"val {self.val_ema:.4f} | AUC {self.ema_auc:.3f} "
+                         f"val {self.val_ema:.4f} | AUC {self.auc_ema:.3f} "
                          f"| gnorm {gnorm:.4e} | scale {scale:.1f} | {lr_txt}")
 
                 # record history
                 self.hist["step"].append(step)
                 self.hist["train"].append(self.train_ema)
                 self.hist["val"].append(self.val_ema)
-                self.hist.setdefault("auc", []).append(self.ema_auc)
+                self.hist["auc"].append(self.auc_ema)
                 self.hist["grad"].append(gnorm)
 
                 # early‑stopping bookkeeping, ckpt save, etc.
@@ -327,9 +335,12 @@ class Trainer:
         plt.xlabel('step'); plt.ylabel('loss'); plt.legend()
         plt.tight_layout(); plt.savefig(self.run_dir/'loss_curve.png', dpi=150); plt.close()
 
-        plt.figure(figsize=(5,4))
-        plt.plot(df.step, df.grad); plt.xlabel('step'); plt.ylabel('grad‑norm')
-        plt.tight_layout(); plt.savefig(self.run_dir/'grad_norm.png', dpi=150); plt.close()
+        # ---------- AUC curve -------------------------------------------
+        if df.auc.notna().any():
+            plt.figure(figsize=(5,4))
+            plt.plot(df.step, df.auc)
+            plt.xlabel('step'); plt.ylabel('val AUC (EMA)')
+            plt.tight_layout(); plt.savefig(self.run_dir/'auc_curve.png', dpi=150); plt.close()
 
     # ----------------------------------------------------------
     def _save(self,step,tag):
