@@ -1,350 +1,200 @@
-"""
-self‑supervised pre‑training for BirdJEPA
- * JEPA loss = MSE on masked time bins
- * EMA target encoder
- * logs to terminal and <run_dir>/train_log.txt
-"""
-
-import argparse, json, time, math, os
+# ──────────────────────────────────────────────────────────────────────────────
+# src/pretrain.py      • BirdJEPA encoder self‑supervised training (rect‑mask)
+# ──────────────────────────────────────────────────────────────────────────────
+import argparse, json, time, os, shutil, uuid, datetime as dt
 from pathlib import Path
-import torch, torch.nn as nn
-from torch.cuda.amp import GradScaler, autocast
-from torch.utils.data import DataLoader
-from models.birdjepa import BirdJEPA, BJConfig
-from data.bird_datasets import BirdSpectrogramDataset
-from data.collate import masking_collate, rect_mask_collate
-from functools import partial
+
+import numpy as np, pandas as pd, torch, torch.nn as nn, torch.nn.functional as F
 import matplotlib.pyplot as plt
-import numpy as np
-from collections import deque
-import dataclasses
-import torch.profiler
-from torch.profiler import ProfilerAction
+import torch.multiprocessing
 
-def make_collate(cfg):
-    if cfg.rect_mask:
-        return partial(rect_mask_collate,
-                       mask_vol = 1 - cfg.keep_p,
-                       min_t    = cfg.rect_min_t,
-                       max_t    = cfg.rect_max_t,
-                       min_f    = cfg.rect_min_f,
-                       max_f    = cfg.rect_max_f)
-    else:                                  # legacy time‑stripe mask
-        return partial(masking_collate,
-                       mask_p   = 1 - cfg.keep_p,
-                       max_block= 50)
+from models          import BJConfig
+from utils           import load_pretrained_encoder
+from data.bird_datasets import TorchSpecDataset
 
-# ------------- utils --------------------------------------------------------
-class Tee:
-    def __init__(self, fn):
-        self.file = open(fn, "a", buffering=1)
-    def __call__(self, *msg):
-        txt = " ".join(str(m) for m in msg)
-        print(txt); self.file.write(txt+"\n")
-    def close(self): self.file.close()
+# ---------------------------------------------------------------
+AMP = torch.cuda.is_available()
+if AMP:
+    torch.backends.cuda.matmul.allow_tf32 = True
+    torch.backends.cudnn.allow_tf32  = True
 
-# ------------- JEPA loss ----------------------------------------------------
-def jepa_loss(ctx, pred, tgt, mask):
-    # ctx not used but returned for monitoring
-    # mask comes in as (B,F,T). After conv‑stem + flatten we lost F
-    # → just squeeze it away:
-    mask2d = mask.any(dim=1)                        # (B,T)
-    # ---------- make sure all three share an identical T --------------
-    T = min(pred.size(1), tgt.size(1), mask2d.size(1))
-    pred    = pred[:, :T]           # (B,T,d)
-    tgt     = tgt[:,  :T]           # (B,T,d)
-    mask2d  = mask2d[:, :T]         # (B,T)
+# ╭───────────────────────────────────────────────────────────────╮
+# │ small predictor g(·) → d‑model                               │
+# ╰───────────────────────────────────────────────────────────────╯
+class Predictor(nn.Module):
+    def __init__(self, d):
+        super().__init__()
+        self.g = nn.Sequential(
+            nn.LayerNorm(d),
+            nn.Linear(d, 2*d),
+            nn.GELU(),
+            nn.Linear(2*d, d))
+    def forward(self, x): return self.g(x)
 
-    diff = (pred - tgt) ** 2 * mask2d.unsqueeze(-1)   # (B,T,d)
-    loss = diff.sum() / (mask2d.sum() * pred.size(-1) + 1e-8)
-    return loss
+# ╭───────────────────────────────────────────────────────────────╮
+# │ Trainer                                                     │
+# ╰───────────────────────────────────────────────────────────────╯
+class Trainer:
+    def __init__(self, args):
+        self.args = args
+        torch.multiprocessing.set_sharing_strategy("file_system")
 
-# ------------- pre‑train ----------------------------------------------------
-def pretrain(args):
-    dev = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-    cfg = BJConfig(pattern=args.attn_pattern)
+        # ── data ────────────────────────────────────────────────
+        self.ds  = TorchSpecDataset(args.train_dir, segment_len=args.context_length)
+        self.val = TorchSpecDataset(args.val_dir  or args.train_dir,
+                                    segment_len=args.context_length,
+                                    infinite=False)
+        self.train_dl = torch.utils.data.DataLoader(self.ds,  batch_size=args.bs,
+                                                    shuffle=True,  num_workers=4,
+                                                    pin_memory=True,  drop_last=True)
+        self.val_dl   = torch.utils.data.DataLoader(self.val, batch_size=args.bs,
+                                                    shuffle=False, num_workers=0)
 
-    # legacy field needed by the data loader ─ use the context length
-    cfg.mask_t = getattr(args, "context_length", 1000)   # default 1\u00a0000 frames
-    cfg.keep_p    = args.keep_p
-    cfg.rect_mask = args.rect_mask
+        # ── model  (encoder + predictor) ────────────────────────
+        cfg   = BJConfig(d_model=args.d_model, pattern=args.attn_pattern)
+        self.enc = load_pretrained_encoder(cfg, None)          # start from scratch
+        self.pred = Predictor(cfg.d_model)
+        self.dev = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+        self.enc.to(self.dev); self.pred.to(self.dev)
 
-    model = BirdJEPA(cfg).to(dev)
-    opt   = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=1e-2)
-    scaler= GradScaler()
+        # ── opt / sched ────────────────────────────────────────
+        self.opt   = torch.optim.AdamW(list(self.enc.parameters())+
+                                       list(self.pred.parameters()),
+                                       lr=args.lr, weight_decay=1e-2)
+        self.sched = torch.optim.lr_scheduler.CosineAnnealingLR(
+                        self.opt, T_max=args.steps, eta_min=1e-5)
+        self.scaler = torch.cuda.amp.GradScaler(enabled=AMP)
+        self.crit   = nn.MSELoss()
 
-    ds   = BirdSpectrogramDataset(args.train_dir, segment_len=cfg.mask_t, infinite=True)
-    collate = make_collate(cfg)
-    dl   = DataLoader(ds, batch_size=args.bs, shuffle=True,
-                      collate_fn=collate,
-                      num_workers=args.nw, pin_memory=True, drop_last=True)
+        # ── run dir / logging ──────────────────────────────────
+        self.run_dir = Path(args.run_dir); self.run_dir.mkdir(parents=True, exist_ok=True)
+        (self.run_dir/'weights').mkdir(exist_ok=True)
+        (self.run_dir/'config.json').write_text(json.dumps(vars(args), indent=2))
 
-    run = Path(args.run_dir)
-    weights_dir = run / "weights"
-    imgs_dir    = run / "imgs"
-    cfg_path    = run / "config.json"
-    for d in (run, weights_dir, imgs_dir):
-        d.mkdir(parents=True, exist_ok=True)
+        # track
+        self.best_val = 9e9; self.bad_evals = 0
+        self.hist = {'step':[], 'train':[], 'val':[]}
 
-    log = Tee(run / "train_log.txt")
+    # -----------------------------------------------------------------
+    def _mask(self, B, T, device):
+        """
+        Rectangle‑style masking on the token timeline (B,T).
+        We create random ⌈mask_ratio·T⌉ token indices per sample.
+        """
+        n_mask = int(T * self.args.mask_ratio)
+        idx = torch.rand(B, T, device=device).argsort(dim=-1)[:, :n_mask]
+        m   = torch.zeros(B, T, dtype=torch.bool, device=device)
+        m.scatter_(1, idx, True)
+        return m                                  # (B,T) True = masked
 
-    prof_steps = (1 + 1 + 3) * 2  # schedule length = 10
-    step = 0; best = 9e9
-    losses, ema_losses = [], []
-    alpha = 0.1              # smoothing factor (0.1 ⇒ ~10‑step window)
-    t0 = time.time()
+    # -----------------------------------------------------------------
+    def _step(self, spec):
+        spec = spec.to(self.dev)
+        with torch.cuda.amp.autocast(enabled=AMP):
+            spec = spec.unsqueeze(1)                                # (B,1,F,T)
+            if hasattr(self.enc, "inference_forward"):
+                z, _ = self.enc.inference_forward(spec)             # full BirdJEPA
+            else:
+                z = self.enc(spec)                                  # plain Sequential
+            B, T, D = z.shape
+            mask = self._mask(B, T, z.device)                      # (B,T)
 
-    # --- Profiled steps ---
-    with torch.profiler.profile(
-        activities=[torch.profiler.ProfilerActivity.CPU, torch.profiler.ProfilerActivity.CUDA],
-        schedule=torch.profiler.schedule(wait=1, warmup=1, active=3, repeat=2),
-        on_trace_ready=torch.profiler.tensorboard_trace_handler(run / "tb_prof"),
-        record_shapes=True,
-        profile_memory=True,
-        with_stack=True
-    ) as prof:
-        for batch in dl:
-            full, tgt, ctx, _, mask, _ = batch     # ignore the dummy "labels" tensor
-            full, tgt, ctx, mask = [x.to(dev) for x in (full, tgt, ctx, mask)]
-            # ------------------------------------------------------------
-            # ctx , tgt : (B ,F ,T)  from masking_collate
-            ctx_spec = ctx.unsqueeze(1)             # (B ,1 ,F ,T)
-            tgt_spec = tgt.unsqueeze(1)
+            z_ctx = z.clone()
+            z_ctx[mask] = 0                                         # stop‑grad on masked
+            pred = self.pred(z_ctx)                                 # (B,T,d)
 
-            ctx_seq = model.stem(ctx_spec)
-            tgt_seq = model.stem(tgt_spec)
-            assert ctx_seq.size(-1) == model.cfg.d_model
-            assert tgt_seq.size(-1) == model.cfg.d_model
+            loss = self.crit(pred[mask], z[mask])
 
-            ctx_repr = model.encoder(ctx_seq)
-            tgt_repr = model.encoder(tgt_seq)
+        self.opt.zero_grad()
+        self.scaler.scale(loss).backward()
+        self.scaler.unscale_(self.opt)
+        torch.nn.utils.clip_grad_norm_(list(self.enc.parameters())+
+                                       list(self.pred.parameters()), 1.0)
+        self.scaler.step(self.opt); self.scaler.update()
+        self.sched.step()
+        return float(loss.item())
 
-            pred = model.predictor(ctx_repr)               # (B,T,H)
+    # -----------------------------------------------------------------
+    @torch.no_grad()
+    def _eval(self):
+        self.enc.eval(); self.pred.eval()
+        tot = 0.0; n = 0
+        for spec, *_ in self.val_dl:
+            spec = spec.to(self.dev)
+            with torch.cuda.amp.autocast(enabled=AMP):
+                z, _ = self.enc.inference_forward(spec.unsqueeze(1))
+                B,T,D = z.shape
+                mask = self._mask(B,T,z.device)
+                z_ctx = z.clone(); z_ctx[mask] = 0
+                pred = self.pred(z_ctx)
+                tot += self.crit(pred[mask], z[mask]).item()*B
+                n   += B
+        self.enc.train(); self.pred.train()
+        return tot/n
 
-            loss = jepa_loss(ctx_repr, pred, tgt_repr, mask)
-            if step % 200 == 0:
-                if prof.current_action == ProfilerAction.NONE:
-                    debug_plot(step, full.cpu(), ctx.cpu(), mask.cpu(),
-                               pred.detach().cpu(), tgt_repr.detach().cpu(),
-                               imgs_dir)
-            # ------------------------------------------------------------
+    # -----------------------------------------------------------------
+    def train(self):
+        dl_iter = iter(self.train_dl); step = 0
+        while step < self.args.steps:
+            try:       spec, *_ = next(dl_iter)
+            except StopIteration:
+                dl_iter = iter(self.train_dl); continue
 
-            opt.zero_grad(set_to_none=True)
-            scaler.scale(loss).backward()
-            scaler.step(opt); scaler.update()
-            _update_ema(model)
-
-            if step % args.log_every == 0:
-                fps = args.log_every*args.bs / (time.time()-t0); t0=time.time()
-                log(f"step {step:06d}  loss {loss.item():.4f}  {fps:.1f} samp/s")
-
-                # ---- loss tracking ----
-                losses.append(loss.item())
-                ema_prev = ema_losses[-1] if ema_losses else loss.item()
-                ema_losses.append(alpha * loss.item() + (1 - alpha) * ema_prev)
-
-                if step % (args.log_every*10) == 0:
-                    if prof.current_action == ProfilerAction.NONE:
-                        plt.figure(figsize=(4,3))
-                        plt.plot(losses, lw=.7)
-                        plt.title('train loss')
-                        plt.tight_layout()
-                        plt.savefig(imgs_dir / 'loss_final.png', dpi=150)
-                        plt.close()
-
-                # ------------------------------------------------------
-                # 1) save *every* checkpoint
-                # ------------------------------------------------------
-                ckpt_path = weights_dir / f"step_{step:06d}.pt"
-                torch.save(model.state_dict(), ckpt_path)
-
-                # keep track of the best loss for convenience
-                if loss.item() < best:
-                    best = loss.item()
-                    torch.save(model.state_dict(), weights_dir / "best.pt")
-
-                # ------------------------------------------------------
-                # 2) visual diag → <run_dir>/imgs/
-                # ------------------------------------------------------
-                if prof.current_action == ProfilerAction.NONE:
-                    with torch.no_grad():
-                        debug_plot(step,
-                                   full.cpu(), ctx.cpu(), mask.cpu(),
-                                   pred.detach().cpu(), tgt_repr.detach().cpu(),
-                                   imgs_dir)
-
-            if prof.current_action == ProfilerAction.RECORD:
-                prof.step()
             step += 1
-            if step >= prof_steps or step >= args.steps:
-                break
+            tr_loss = self._step(spec)
 
-    # --- Regular training (no profiler) ---
-    for epoch in range(999999):
-        for batch in dl:
-            full, tgt, ctx, _, mask, _ = batch     # ignore the dummy "labels" tensor
-            if step >= args.steps:
-                break
-            full, tgt, ctx, mask = [x.to(dev) for x in (full, tgt, ctx, mask)]
-            # ------------------------------------------------------------
-            # ctx , tgt : (B ,F ,T)
-            ctx_spec = ctx.unsqueeze(1)             # (B ,1 ,F ,T)
-            tgt_spec = tgt.unsqueeze(1)
+            if step % self.args.log_every == 0:
+                val_loss = self._eval()
+                print(f"step {step:07d}  train {tr_loss:.4f}  val {val_loss:.4f}")
+                self.hist['step'].append(step)
+                self.hist['train'].append(tr_loss)
+                self.hist['val'].append(val_loss)
 
-            ctx_seq = model.stem(ctx_spec)
-            tgt_seq = model.stem(tgt_spec)
-            assert ctx_seq.size(-1) == model.cfg.d_model
-            assert tgt_seq.size(-1) == model.cfg.d_model
+                if val_loss < self.best_val - 1e-4:
+                    self.best_val = val_loss; self.bad_evals = 0
+                    torch.save({'enc': self.enc.state_dict(),
+                                'pred': self.pred.state_dict()},
+                               self.run_dir/'weights/best.pt')
+                else:
+                    self.bad_evals += 1
+                if self.bad_evals >= self.args.early_stop:
+                    print("early stop")
+                    break
 
-            ctx_repr = model.encoder(ctx_seq)
-            tgt_repr = model.encoder(tgt_seq)
+        # plots ---------------------------------------------------
+        df = pd.DataFrame(self.hist); df.to_csv(self.run_dir/'metrics.csv', index=False)
+        plt.figure(); plt.plot(df.step, df.train, label='train'); plt.plot(df.step, df.val, label='val')
+        plt.legend(); plt.xlabel('step'); plt.ylabel('loss')
+        plt.tight_layout(); plt.savefig(self.run_dir/'loss_curve.png', dpi=150)
 
-            pred = model.predictor(ctx_repr)               # (B,T,H)
 
-            loss = jepa_loss(ctx_repr, pred, tgt_repr, mask)
-            if step % 200 == 0:
-                debug_plot(step, full.cpu(), ctx.cpu(), mask.cpu(),
-                           pred.detach().cpu(), tgt_repr.detach().cpu(),
-                           imgs_dir)
-            # ------------------------------------------------------------
-
-            opt.zero_grad(set_to_none=True)
-            scaler.scale(loss).backward()
-            scaler.step(opt); scaler.update()
-            _update_ema(model)
-
-            if step % args.log_every == 0:
-                fps = args.log_every*args.bs / (time.time()-t0); t0=time.time()
-                log(f"step {step:06d}  loss {loss.item():.4f}  {fps:.1f} samp/s")
-
-                # ---- loss tracking ----
-                losses.append(loss.item())
-                ema_prev = ema_losses[-1] if ema_losses else loss.item()
-                ema_losses.append(alpha * loss.item() + (1 - alpha) * ema_prev)
-
-                if step % (args.log_every*10) == 0:     # draw every ~10 logs
-                    plt.figure(figsize=(4,3))
-                    plt.plot(losses, lw=.7)
-                    plt.title('train loss')
-                    plt.tight_layout()
-                    plt.savefig(imgs_dir / 'loss_final.png', dpi=150)
-                    plt.close()
-
-                # ------------------------------------------------------
-                # 1) save *every* checkpoint
-                # ------------------------------------------------------
-                ckpt_path = weights_dir / f"step_{step:06d}.pt"
-                torch.save(model.state_dict(), ckpt_path)
-
-                # keep track of the best loss for convenience
-                if loss.item() < best:
-                    best = loss.item()
-                    torch.save(model.state_dict(), weights_dir / "best.pt")
-
-                # ------------------------------------------------------
-                # 2) visual diag → <run_dir>/imgs/
-                # ------------------------------------------------------
-                with torch.no_grad():
-                    debug_plot(step,
-                               full.cpu(), ctx.cpu(), mask.cpu(),
-                               pred.detach().cpu(), tgt_repr.detach().cpu(),
-                               imgs_dir)
-            step += 1
-        if step >= args.steps:
-            break
-
-    # ---------- final loss curve ----------
-    plt.figure(figsize=(5,4))
-    plt.plot(losses,      lw=.7, label='raw')
-    plt.plot(ema_losses,  lw=1.2, ls='--', label=f'ema α={alpha}')
-    plt.xlabel('step'); plt.ylabel('loss'); plt.legend()
-    plt.tight_layout()
-    plt.savefig(run / 'loss_curve.png', dpi=150)
-    plt.close()
-
-    # ---------------- dump config --------------------------
-    cfg_dict = dataclasses.asdict(cfg)           # BJConfig → dict
-    meta = {
-        "best_ckpt": str(weights_dir / "best.pt"),
-        "bjconfig":  cfg_dict,
-        "train_args": vars(args)                  # cli flags
-    }
-    with open(cfg_path, "w") as f:
-        json.dump(meta, f, indent=2)
-
-    log("done. best={:.4f}".format(best)); log.close()
-
-def _update_ema(model):
-    with torch.no_grad():
-        for p_online, p_ema in zip(model.encoder.parameters(),
-                                   model.ema_encoder.parameters()):
-            p_ema.data.lerp_(p_online.data, 1 - model._ema_tau)
-
-def unwrap_seq(h, F_orig):
-    """
-    (seq,d)  ->  (F',T') by:
-      1) pick a divisor of seq that's closest to F_orig/8
-      2) reshape using that divisor
-    """
-    S = h.size(0)
-    target = max(1, F_orig // 8)          # ≈ what we expect
-    # scan outward until we find a divisor
-    for off in range(0, target):          # enough wiggle room
-        for cand in (target - off, target + off):
-            if cand > 0 and S % cand == 0:
-                Fp = cand
-                Tp = S // cand
-                return h.mean(-1)[:S].reshape(Fp, Tp)
-    raise ValueError(f"can't factor seq={S}")
-
-@torch.no_grad()
-def debug_plot(step, full, ctx, mask, pred, tgt, run_dir):
-    """run_dir is now the imgs folder we pass in"""
-    raw   = full[0].cpu().numpy()        # (F,T)
-    mctx  = ctx[0].cpu().numpy()         # (F,T)
-    lossm = mask[0].any(0).cpu().numpy() # (T,) → for overlay dots
-    F = raw.shape[0]
-    p_img = unwrap_seq(pred[0], F)      # just the first sample
-    t_img = unwrap_seq(tgt[0],  F)
-    diff  = (p_img - t_img) ** 2
-
-    fig, ax = plt.subplots(2,2, figsize=(10,8))
-    ax = ax.ravel()
-    ax[0].imshow(raw,  aspect='auto', origin='lower'); ax[0].set_title('orig')
-    # --- overlay mask as alpha-blended red on masked ctx ---
-    ax[1].imshow(mctx, aspect='auto', origin='lower'); ax[1].set_title('masked ctx')
-    mask_overlay = mask[0].cpu().numpy().astype(float)  # (F,T), 1 where masked
-    red = np.zeros((*mask_overlay.shape, 4), dtype=float)
-    red[..., 0] = 1.0  # Red channel
-    red[..., 3] = 0.4 * mask_overlay  # Alpha channel, 0.4 where masked
-    ax[1].imshow(red, aspect='auto', origin='lower')
-    # ------------------------------------------------------
-    ax[2].imshow(p_img,aspect='auto', origin='lower'); ax[2].set_title('pred')
-    ax[3].imshow(diff, aspect='auto', origin='lower'); ax[3].set_title('sq-error')
-    for a in ax: a.axis('off')
-    plt.tight_layout()
-    fig.savefig(run_dir / f"viz_{step:06d}.png")
-    plt.close(fig)
-
-# ------------- cli ----------------------------------------------------------
-if __name__ == "__main__":
+# ╭───────────────────────────────────────────────────────────────╮
+# │ CLI                                                          │
+# ╰───────────────────────────────────────────────────────────────╯
+def main():
     p = argparse.ArgumentParser()
-    p.add_argument("--train_dir", required=True)
-    p.add_argument("--run_dir",   default="runs/pretrain")
-    p.add_argument("--steps", type=int, default=100_000)
-    p.add_argument("--bs",    type=int, default=64)
-    p.add_argument("--lr",    type=float, default=1e-4)
-    p.add_argument("--nw",    type=int, default=4)
-    p.add_argument("--log_every", type=int, default=150)
-    p.add_argument("--attn_pattern", default="local64,global128,local64,global128")
-    p.add_argument("--keep_p",      type=float, default=0.20,
-                  help="visible volume fraction (1‑keep_p is masked)")
-    p.add_argument("--rect_mask",   action="store_true",
-                  help="use rectangle masking instead of time stripes")
+    p.add_argument('--train_dir', required=True)
+    p.add_argument('--val_dir')
+    p.add_argument('--run_dir',  default='runs/pretrain')
+    p.add_argument('--steps',    type=int, default=100_000)
+    p.add_argument('--bs',       type=int, default=64)
+    p.add_argument('--lr',       type=float, default=3e-4)
+    p.add_argument('--context_length', type=int, default=1000)
+    p.add_argument('--d_model',  type=int, default=192)
+    p.add_argument('--attn_pattern', default='local50,global100,local50,global100')
+    p.add_argument('--mask_ratio', type=float, default=0.4)
+    p.add_argument('--early_stop', type=int, default=30)
+    p.add_argument('--log_every',  type=int, default=200)
     args = p.parse_args()
 
-    # Ensure train_dir and run_dir exist
-    os.makedirs(args.train_dir, exist_ok=True)
-    os.makedirs(args.run_dir, exist_ok=True)
+    # rotate previous run
+    rd = Path(args.run_dir)
+    if rd.exists():
+        stamp = dt.datetime.now().strftime('%Y%m%d_%H%M%S')+'_'+uuid.uuid4().hex[:6]
+        shutil.move(rd, Path('runs/archive')/f'{rd.name}_{stamp}')
+    rd.mkdir(parents=True, exist_ok=True)
 
-    pretrain(args)
+    Trainer(args).train()
+
+if __name__ == '__main__':
+    main()
