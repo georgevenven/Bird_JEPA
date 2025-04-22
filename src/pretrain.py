@@ -12,7 +12,7 @@ from torch.cuda.amp import GradScaler, autocast
 from torch.utils.data import DataLoader
 from models.birdjepa import BirdJEPA, BJConfig
 from data.bird_datasets import BirdSpectrogramDataset
-from data.collate import masking_collate
+from data.collate import masking_collate, rect_mask_collate
 from functools import partial
 import matplotlib.pyplot as plt
 import numpy as np
@@ -21,8 +21,18 @@ import dataclasses
 import torch.profiler
 from torch.profiler import ProfilerAction
 
-def make_collate(mask_p, max_block=50):
-    return partial(masking_collate, mask_p=mask_p, max_block=max_block)
+def make_collate(cfg):
+    if cfg.rect_mask:
+        return partial(rect_mask_collate,
+                       mask_vol = 1 - cfg.keep_p,
+                       min_t    = cfg.rect_min_t,
+                       max_t    = cfg.rect_max_t,
+                       min_f    = cfg.rect_min_f,
+                       max_f    = cfg.rect_max_f)
+    else:                                  # legacy time‑stripe mask
+        return partial(masking_collate,
+                       mask_p   = 1 - cfg.keep_p,
+                       max_block= 50)
 
 # ------------- utils --------------------------------------------------------
 class Tee:
@@ -53,12 +63,18 @@ def jepa_loss(ctx, pred, tgt, mask):
 def pretrain(args):
     dev = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     cfg = BJConfig(pattern=args.attn_pattern)
+
+    # legacy field needed by the data loader ─ use the context length
+    cfg.mask_t = getattr(args, "context_length", 1000)   # default 1\u00a0000 frames
+    cfg.keep_p    = args.keep_p
+    cfg.rect_mask = args.rect_mask
+
     model = BirdJEPA(cfg).to(dev)
     opt   = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=1e-2)
     scaler= GradScaler()
 
     ds   = BirdSpectrogramDataset(args.train_dir, segment_len=cfg.mask_t, infinite=True)
-    collate = make_collate(1-cfg.keep_p)
+    collate = make_collate(cfg)
     dl   = DataLoader(ds, batch_size=args.bs, shuffle=True,
                       collate_fn=collate,
                       num_workers=args.nw, pin_memory=True, drop_last=True)
@@ -87,17 +103,20 @@ def pretrain(args):
         profile_memory=True,
         with_stack=True
     ) as prof:
-        for full, tgt, ctx, _, mask, _ in dl:
+        for batch in dl:
+            full, tgt, ctx, _, mask, _ = batch     # ignore the dummy "labels" tensor
             full, tgt, ctx, mask = [x.to(dev) for x in (full, tgt, ctx, mask)]
             # ------------------------------------------------------------
-            # encode context and target
-            ctx_spec = ctx.unsqueeze(1).transpose(2, 3)  # (B,1,F,T)
-            tgt_spec = tgt.unsqueeze(1).transpose(2, 3)  # (B,1,F,T)
-            ctx_seq = model.stem(ctx_spec)               # (B,seq,192)
-            tgt_seq = model.stem(tgt_spec)               # (B,seq,192)
-            ctx_repr = model.encoder(ctx_seq)
-            with torch.no_grad():
-                tgt_repr = model.ema_encoder(tgt_seq)
+            # ctx , tgt : (B ,F ,T)  from masking_collate
+            ctx_spec = ctx.unsqueeze(1)             # (B ,1 ,F ,T)
+            tgt_spec = tgt.unsqueeze(1)
+
+            if hasattr(model.encoder, "inference_forward"):          # BirdJEPA
+                ctx_repr, _ = model.encoder.inference_forward(ctx_spec)  # (B ,Ttok ,192)
+                tgt_repr, _ = model.encoder.inference_forward(tgt_spec)
+            else:                                                    # raw Sequential ckpt
+                ctx_repr = model.encoder(ctx_spec)
+                tgt_repr = model.encoder(tgt_spec)
 
             pred = model.predictor(ctx_repr)               # (B,T,H)
 
@@ -161,19 +180,22 @@ def pretrain(args):
 
     # --- Regular training (no profiler) ---
     for epoch in range(999999):
-        for full, tgt, ctx, _, mask, _ in dl:
+        for batch in dl:
+            full, tgt, ctx, _, mask, _ = batch     # ignore the dummy "labels" tensor
             if step >= args.steps:
                 break
             full, tgt, ctx, mask = [x.to(dev) for x in (full, tgt, ctx, mask)]
             # ------------------------------------------------------------
-            # encode context and target
-            ctx_spec = ctx.unsqueeze(1).transpose(2, 3)  # (B,1,F,T)
-            tgt_spec = tgt.unsqueeze(1).transpose(2, 3)  # (B,1,F,T)
-            ctx_seq = model.stem(ctx_spec)               # (B,seq,192)
-            tgt_seq = model.stem(tgt_spec)               # (B,seq,192)
-            ctx_repr = model.encoder(ctx_seq)
-            with torch.no_grad():
-                tgt_repr = model.ema_encoder(tgt_seq)
+            # ctx , tgt : (B ,F ,T)
+            ctx_spec = ctx.unsqueeze(1)             # (B ,1 ,F ,T)
+            tgt_spec = tgt.unsqueeze(1)
+
+            if hasattr(model.encoder, "inference_forward"):          # BirdJEPA
+                ctx_repr, _ = model.encoder.inference_forward(ctx_spec)  # (B ,Ttok ,192)
+                tgt_repr, _ = model.encoder.inference_forward(tgt_spec)
+            else:                                                    # raw Sequential ckpt
+                ctx_repr = model.encoder(ctx_spec)
+                tgt_repr = model.encoder(tgt_spec)
 
             pred = model.predictor(ctx_repr)               # (B,T,H)
 
@@ -313,6 +335,10 @@ if __name__ == "__main__":
     p.add_argument("--nw",    type=int, default=4)
     p.add_argument("--log_every", type=int, default=150)
     p.add_argument("--attn_pattern", default="local64,global128,local64,global128")
+    p.add_argument("--keep_p",      type=float, default=0.20,
+                  help="visible volume fraction (1‑keep_p is masked)")
+    p.add_argument("--rect_mask",   action="store_true",
+                  help="use rectangle masking instead of time stripes")
     args = p.parse_args()
 
     # Ensure train_dir and run_dir exist

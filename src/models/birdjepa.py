@@ -31,6 +31,15 @@ class BJConfig:
     pred_dim: int = 96
     pred_layers:int=1
 
+    # ---------- self‑sup. masking -------------------------------------
+    mask_t:      int   = 1000   # training segment length (time frames)
+    keep_p:      float = 0.20   # *visible* volume fraction  (1‑keep_p is masked)
+    rect_mask:   bool  = True   # use rectangle masking (else old time‑strip)
+    rect_min_t:  int   = 10
+    rect_max_t:  int   = 250
+    rect_min_f:  int   = 8
+    rect_max_f:  int   = 128
+
     def __post_init__(self):
         if self.pattern is None:
             self.pattern = ','.join(['local50,global100'] * (self.layers // 2))
