@@ -139,3 +139,7 @@ class BirdJEPA(nn.Module):
         x = self.proj(z)                     # (B,T',d_model)
         # print('DEBUG BirdJEPA.forward x.shape:', x.shape)
         return self.core(x)                  # (B,T',d_model)
+    
+# ──────────────────────────────────────
+#  Predictor
+# ──────────────────────────────────────

@@ -8,7 +8,7 @@ import numpy as np, pandas as pd, torch, torch.nn as nn, torch.nn.functional as 
 import matplotlib.pyplot as plt
 import torch.multiprocessing
 
-from models          import BJConfig
+from models          import BJConfig, Predictor
 from utils           import load_pretrained_encoder
 from data.bird_datasets import TorchSpecDataset
 
@@ -17,19 +17,6 @@ AMP = torch.cuda.is_available()
 if AMP:
     torch.backends.cuda.matmul.allow_tf32 = True
     torch.backends.cudnn.allow_tf32  = True
-
-# ╭───────────────────────────────────────────────────────────────╮
-# │ small predictor g(·) → d‑model                               │
-# ╰───────────────────────────────────────────────────────────────╯
-class Predictor(nn.Module):
-    def __init__(self, d):
-        super().__init__()
-        self.g = nn.Sequential(
-            nn.LayerNorm(d),
-            nn.Linear(d, 2*d),
-            nn.GELU(),
-            nn.Linear(2*d, d))
-    def forward(self, x): return self.g(x)
 
 # ╭───────────────────────────────────────────────────────────────╮
 # │ Trainer                                                     │
