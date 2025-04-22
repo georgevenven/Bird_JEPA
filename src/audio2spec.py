@@ -17,13 +17,38 @@ def compute_spectrogram(
     wav: np.ndarray,
     sr: int,
     n_fft: int,
-    hop: int
+    hop: int,
+    *,
+    mel: bool,
+    n_mels: int
 ) -> np.ndarray:
     """
-    Returns a (freq, time) float32 log‑magnitude spectrogram in dB.
+    Returns log‑magnitude spectrogram in **dB**.
+    • linear STFT  → shape (n_fft//2 + 1, T)   (default 513 × T for n_fft=1024)  
+    • mel filter‑bank → shape (n_mels, T)
     """
-    S = librosa.stft(wav.astype(float), n_fft=n_fft, hop_length=hop, window="hann")
-    S_db = librosa.amplitude_to_db(np.abs(S), ref=np.max).astype(np.float32)
+    if mel:
+        S = librosa.feature.melspectrogram(
+            y=wav.astype(float),
+            sr=sr,
+            n_fft=n_fft,
+            hop_length=hop,
+            power=2.0,         # power‑spectrogram
+            n_mels=n_mels,
+            fmin=20,
+            fmax=sr // 2,
+        )
+    else:
+        S = np.abs(
+            librosa.stft(
+                wav.astype(float),
+                n_fft=n_fft,
+                hop_length=hop,
+                window="hann",
+            )
+        ) ** 2
+
+    S_db = librosa.power_to_db(S, ref=np.max).astype(np.float32)
     return S_db
 
 
@@ -52,6 +77,8 @@ class WavToSpec:
         min_len_ms: int = 25,
         min_timebins: int = 25,
         fmt: str = "pt",
+        mel: bool = True,
+        n_mels: int = 128,
     ) -> None:
         self.src_dir = Path(src_dir) if src_dir is not None else None
         self.dst_dir = Path(dst_dir)
@@ -66,6 +93,8 @@ class WavToSpec:
         self.min_len_ms = min_len_ms
         self.min_timebins = min_timebins
         self.fmt = fmt
+        self.use_mel = mel
+        self.n_mels = n_mels
 
         self._setup_logging()
         mgr = mp.Manager()
@@ -142,7 +171,7 @@ class WavToSpec:
 
                 for fp in self.audio_files:
                     # simple memory guard
-                    while psutil.virtual_memory().available < 1.2 * 1024**3:  # 1.2 GB
+                    while psutil.virtual_memory().available < 1.2 * 1024**3:  # 1.2 GB
                         time.sleep(1)
 
                     pool.apply_async(
@@ -183,7 +212,9 @@ class WavToSpec:
             return
 
         # ─── spectrogram ─────────────────────────────────────────────
-        S = compute_spectrogram(wav, self.sr, self.n_fft, self.step)
+        S = compute_spectrogram(
+                wav, self.sr, self.n_fft, self.step,
+                mel=self.use_mel, n_mels=self.n_mels)
 
         if S.shape[1] < self.min_timebins:
             self.skipped.value += 1
@@ -222,7 +253,7 @@ def cli() -> None:
                    help="output format (default: pt, fp16)")
 
     p.add_argument("--step_size", type=int, default=160,
-                   help="STFT hop length (samples at 32 kHz).")
+                   help="STFT hop length (samples at 32 kHz).")
     p.add_argument("--nfft",      type=int, default=1024,
                    help="FFT size.")
     p.add_argument("--take_n_random", type=int, default=None,
@@ -231,6 +262,13 @@ def cli() -> None:
                    choices=["true", "false", "1", "0", "yes", "no"],
                    default="true",
                    help="Force single‑thread. Default true.")
+    mel_grp = p.add_mutually_exclusive_group()
+    mel_grp.add_argument("--mel", action="store_true",
+                         help="Output log‑mel (default).")
+    mel_grp.add_argument("--linear", action="store_true",
+                         help="Output linear‑frequency STFT bins.")
+    p.add_argument("--n_mels", type=int, default=128,
+                   help="Number of mel bands (default: 128)")
     args = p.parse_args()
 
     single = args.single_threaded.lower() in {"true", "1", "yes"}
@@ -244,6 +282,8 @@ def cli() -> None:
         take_n_random=args.take_n_random,
         single_threaded=single,
         fmt=args.format,
+        mel=not args.linear,
+        n_mels=args.n_mels,
     )
     converter.run()
 

@@ -143,3 +143,24 @@ class BirdJEPA(nn.Module):
 # ──────────────────────────────────────
 #  Predictor
 # ──────────────────────────────────────
+class Predictor(nn.Module):
+    """
+    shallow MLP g(·) with rotary PE baked in.
+    optionally consumes the boolean time‑mask so you can
+    condition on "which tokens were hidden" later.
+    """
+    def __init__(self, d_model: int):
+        super().__init__()
+        self.norm = nn.LayerNorm(d_model)
+        self.mlp  = nn.Sequential(
+            nn.Linear(d_model, 2 * d_model),
+            nn.GELU(),
+            nn.Linear(2 * d_model, d_model)
+        )
+
+    def forward(self, x, mask: torch.Tensor | None = None):
+        # x : (B, T, d)
+        x = rope(self.norm(x))                     # rotary ‑> better extrap
+        if mask is not None:                       # (B,T) True = masked
+            x = x.masked_fill(~mask.unsqueeze(-1), 0.0)
+        return self.mlp(x)
