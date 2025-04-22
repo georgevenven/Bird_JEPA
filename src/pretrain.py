@@ -111,12 +111,13 @@ def pretrain(args):
             ctx_spec = ctx.unsqueeze(1)             # (B ,1 ,F ,T)
             tgt_spec = tgt.unsqueeze(1)
 
-            if hasattr(model.encoder, "inference_forward"):          # BirdJEPA
-                ctx_repr, _ = model.encoder.inference_forward(ctx_spec)  # (B ,Ttok ,192)
-                tgt_repr, _ = model.encoder.inference_forward(tgt_spec)
-            else:                                                    # raw Sequential ckpt
-                ctx_repr = model.encoder(ctx_spec)
-                tgt_repr = model.encoder(tgt_spec)
+            ctx_seq = model.stem(ctx_spec)
+            tgt_seq = model.stem(tgt_spec)
+            assert ctx_seq.size(-1) == model.cfg.d_model
+            assert tgt_seq.size(-1) == model.cfg.d_model
+
+            ctx_repr = model.encoder(ctx_seq)
+            tgt_repr = model.encoder(tgt_seq)
 
             pred = model.predictor(ctx_repr)               # (B,T,H)
 
@@ -190,12 +191,13 @@ def pretrain(args):
             ctx_spec = ctx.unsqueeze(1)             # (B ,1 ,F ,T)
             tgt_spec = tgt.unsqueeze(1)
 
-            if hasattr(model.encoder, "inference_forward"):          # BirdJEPA
-                ctx_repr, _ = model.encoder.inference_forward(ctx_spec)  # (B ,Ttok ,192)
-                tgt_repr, _ = model.encoder.inference_forward(tgt_spec)
-            else:                                                    # raw Sequential ckpt
-                ctx_repr = model.encoder(ctx_spec)
-                tgt_repr = model.encoder(tgt_spec)
+            ctx_seq = model.stem(ctx_spec)
+            tgt_seq = model.stem(tgt_spec)
+            assert ctx_seq.size(-1) == model.cfg.d_model
+            assert tgt_seq.size(-1) == model.cfg.d_model
+
+            ctx_repr = model.encoder(ctx_seq)
+            tgt_repr = model.encoder(tgt_seq)
 
             pred = model.predictor(ctx_repr)               # (B,T,H)
 
