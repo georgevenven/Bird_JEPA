@@ -59,7 +59,8 @@ class Trainer:
                                                     shuffle=False, num_workers=0)
 
         # ── model  (encoder + predictor) ────────────────────────
-        cfg   = BJConfig(d_model=args.d_model, pattern=args.attn_pattern)
+        cfg   = BJConfig(d_model=args.d_model, n_mels=args.n_mels,
+                         pattern=args.attn_pattern)
         self.enc = load_pretrained_encoder(cfg, None)          # start from scratch
         self.pred = Predictor(cfg.d_model)
         self.dev = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
@@ -96,6 +97,11 @@ class Trainer:
         # track
         self.best_val = 9e9; self.bad_evals = 0
         self.hist = {'step':[], 'train':[], 'val':[], 'grad':[]}
+        self.alpha = 0.1
+
+        # init EMA placeholders so .train() can update them
+        self.train_ema = None
+        self.val_ema   = None
 
         self._eval_counter = 0
 
@@ -201,22 +207,31 @@ class Trainer:
         self.enc.eval(); self.pred.eval()
         tot = 0.0; n = 0
         for spec, *_ in self.val_dl:
-            spec = spec.to(self.dev)
+            spec = spec.to(self.dev)                       # (B,F,T)
+            B,F_bins,T_bins = spec.shape
+
+            base = self._rect_mask(F_bins, T_bins, self.args.mask_ratio,
+                                   device=spec.device)    # (F,T)
+            mask3 = base.unsqueeze(0).repeat(B,1,1)        # (B,F,T)
+
             with torch.cuda.amp.autocast(enabled=AMP):
-                s = spec.unsqueeze(1)                 # (B,1,F,T)
-                if hasattr(self.enc, "inference_forward"):
-                    z, _ = self.enc.inference_forward(s)
-                else:                                 # vanilla Sequential
-                    z = self.enc(s)
-                B,T,D = z.shape
-                mask = self._rect_mask(D, T, self.args.mask_ratio, device=z.device)
-                z_ctx = z.clone(); z_ctx[mask] = 0
+                s = spec.unsqueeze(1)
+                z, _ = self.enc.inference_forward(s) if hasattr(self.enc,"inference_forward") \
+                          else (self.enc(s), None)        # (B,T_tok,D)
+
+                # pool the 3‑D mask to token timeline
+                time_mask = mask3.any(1).float().unsqueeze(1)         # (B,1,T_bins)
+                mask_tok = F.max_pool1d(time_mask, 4, 4).squeeze(1).bool()  # (B,T_tok)
+
+                z_ctx = z.clone(); z_ctx[mask_tok] = 0
                 pred = self.pred(z_ctx)
-                tot += self.crit(pred[mask], z[mask]).item()*B
+                tot += self.crit(pred[mask_tok], z[mask_tok]).item()*B
                 n   += B
+
             if self.args.viz_every and (self._eval_counter % self.args.viz_every == 0):
-                _viz_triptych(self.run_dir/'imgs', self._eval_counter, spec[0,0].cpu(),
-                              mask[0].cpu(), pred[0].cpu(), z[0].cpu())
+                _viz_triptych(self.run_dir/'imgs', self._eval_counter,
+                              spec[0].cpu(), mask3[0].cpu(),
+                              pred[0].cpu(), z[0].cpu())
             self._eval_counter += 1
         self.enc.train(); self.pred.train()
         return tot/n
@@ -326,13 +341,15 @@ def main():
     p.add_argument('--train_dir', required=True)
     p.add_argument('--val_dir')
     p.add_argument('--run_dir',  default='runs/pretrain')
-    p.add_argument('--steps',    type=int, default=100_000)
+    p.add_argument('--steps',    type=int, default=300000)
     p.add_argument('--bs',       type=int, default=64)
     p.add_argument('--lr',       type=float, default=3e-4)
     p.add_argument('--context_length', type=int, default=1000)
     p.add_argument('--d_model',  type=int, default=192)
     p.add_argument('--attn_pattern', default='local50,global100,local50,global100')
     p.add_argument('--mask_ratio', type=float, default=0.4)
+    p.add_argument('--n_mels', type=int, default=128,
+                   help='input spectrogram height (mel bins)')
     # visualisation
     p.add_argument('--viz_every', type=int, default=10,
                   help=">0 ⇒ dump a triptych every N evals")

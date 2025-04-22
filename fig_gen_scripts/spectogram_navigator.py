@@ -4,13 +4,14 @@ import glob
 import os
 from matplotlib.widgets import Button
 from matplotlib.backend_bases import KeyEvent
+import torch
 
 # ===== MODIFY THESE PARAMETERS =====
-NPZ_DIR = '/Users/georgev/Documents/codebases/BirdJEPA/xeno_specs'
-PATTERN = '*.npz'        # File pattern to match
+NPZ_DIR = '/media/george-vengrovski/Desk SSD/BirdJEPA/train_soundscapes_test'
+PATTERN = '*.pt'        # File pattern to match
 SPEC_KEY = 's'           # Key for the spectrogram in the NPZ file
 CROP_TOP = 0            # Crop from the top
-CROP_BOTTOM = 513        # Crop to the bottom
+CROP_BOTTOM = 128        # Crop to the bottom
 # ==================================
 
 class SpectogramNavigator:
@@ -18,7 +19,7 @@ class SpectogramNavigator:
         self.npz_files = sorted(glob.glob(os.path.join(npz_dir, pattern)))
         
         if not self.npz_files:
-            raise ValueError(f"No NPZ files found in {npz_dir} with pattern {pattern}")
+            raise ValueError(f"No NPZ or PT files found in {npz_dir} with pattern {pattern}")
         
         self.current_index = 0
         self.spectrogram_key = spectrogram_key
@@ -32,13 +33,17 @@ class SpectogramNavigator:
         """Load the current spectrogram from the list"""
         current_file = self.npz_files[self.current_index]
         try:
-            data = np.load(current_file)
-            spectrogram = data[self.spectrogram_key]
-            
+            if current_file.endswith('.npz'):
+                data = np.load(current_file)
+                spectrogram = data[self.spectrogram_key]
+            elif current_file.endswith('.pt'):
+                data = torch.load(current_file)
+                spectrogram = data[self.spectrogram_key]
+            else:
+                raise ValueError(f"Unsupported file type: {current_file}")
             # Crop the spectrogram
             if self.crop_bottom > 0 and self.crop_bottom > self.crop_top:
                 spectrogram = spectrogram[self.crop_top:self.crop_bottom, :]
-            
             return spectrogram, os.path.basename(current_file)
         except Exception as e:
             print(f"Error loading {current_file}: {e}")

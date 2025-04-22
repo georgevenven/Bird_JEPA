@@ -15,7 +15,7 @@ print(">> birdjepa loaded from", __file__)
 @dataclass
 class BJConfig:
     # stem
-    n_mels:  int       = 513
+    n_mels:  int       = 128
     conv_ch: list[int] = field(default_factory=lambda: [32, 32, 32])
     conv_k:  list[int] = field(default_factory=lambda: [5, 3, 3])
     conv_str:list[tuple]=field(default_factory=lambda: [(2,1),(2,2),(2,2)])

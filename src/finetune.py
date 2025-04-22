@@ -477,7 +477,6 @@ def main():
     p.add_argument("--freeze_encoder",action="store_true")
     p.add_argument("--num_workers",type=int,default=4)
     p.add_argument("--enc_width",type=int,default=192,help="JEPA hidden size d_model")
-    p.add_argument("--attn_pattern", default="local50,global100,local50,global100")
     p.add_argument("--ckpt", help="explicit path to .pt checkpoint")
     args=p.parse_args()
 
