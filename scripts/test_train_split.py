@@ -57,10 +57,10 @@ def main():
     ensure_dir(args.train_dir)
     ensure_dir(args.test_dir)
 
-    # collect .npz files
-    all_files = [f for f in os.listdir(args.src_dir) if f.lower().endswith(".npz")]
+    # collect .npz and .pt files
+    all_files = [f for f in os.listdir(args.src_dir) if f.lower().endswith(".npz") or f.lower().endswith(".pt")]
     if not all_files:
-        print("no .npz files found in source directory.", file=sys.stderr)
+        print("no .npz or .pt files found in source directory.", file=sys.stderr)
         sys.exit(1)
 
     # shuffle and split

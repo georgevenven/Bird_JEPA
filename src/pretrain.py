@@ -1,18 +1,37 @@
 # ──────────────────────────────────────────────────────────────────────────────
 # src/pretrain.py      • BirdJEPA encoder self‑supervised training (rect‑mask)
 # ──────────────────────────────────────────────────────────────────────────────
-import argparse, json, time, os, shutil, uuid, datetime as dt
+import argparse, json, time, os, shutil, uuid, datetime as dt, math
 from pathlib import Path
 
 import numpy as np, pandas as pd, torch, torch.nn as nn, torch.nn.functional as F
 import matplotlib.pyplot as plt
 import torch.multiprocessing
 import torch.nn.functional as tF        # avoid name clash
-import random
+import random, copy
 
 from models          import BJConfig, Predictor
 from utils           import load_pretrained_encoder
 from data.bird_datasets import TorchSpecDataset
+from sklearn.metrics import roc_auc_score          # future‑proof (unused now)
+
+# ── logging helpers (must appear before Trainer uses them) ─────────────
+class Tee:
+    def __init__(self, fn: Path):
+        fn.parent.mkdir(parents=True, exist_ok=True)
+        self.f = open(fn, "a", buffering=1)
+    def __call__(self,*msg):
+        txt = " ".join(str(m) for m in msg)
+        print(txt); self.f.write(txt+"\n")
+    def close(self): self.f.close()
+
+@torch.no_grad()
+def grad_norm(model: nn.Module)->float:
+    g2=0.0
+    for p in model.parameters():
+        if p.grad is not None:
+            g2+=p.grad.float().norm()**2
+    return math.sqrt(g2)
 
 # ---------------------------------------------------------------
 AMP = torch.cuda.is_available()
@@ -50,25 +69,42 @@ class Trainer:
         if not hasattr(self.enc, "inference_forward"):
             self.enc.inference_forward = lambda x: (self.enc(x), None)
 
-        # ── opt / sched ────────────────────────────────────────
-        self.opt   = torch.optim.AdamW(list(self.enc.parameters())+
-                                       list(self.pred.parameters()),
-                                       lr=args.lr, weight_decay=1e-2)
+        # ── opt / sched ───────────────────────────────────────
+        self.warmup_steps = 2000
+        self.enc_frozen   = True
+        for p in self.enc.parameters():
+            p.requires_grad = False
+
+        enc_lr  = args.lr
+        pred_lr = args.lr * 3
+        self.opt = torch.optim.AdamW(
+            [{"params": self.enc.parameters(),  "lr": enc_lr,  "weight_decay":1e-2},
+             {"params": self.pred.parameters(), "lr": pred_lr, "weight_decay":5e-3}]
+        )
         self.sched = torch.optim.lr_scheduler.CosineAnnealingLR(
-                        self.opt, T_max=args.steps, eta_min=1e-5)
+                        self.opt, T_max=max(1,args.steps-self.warmup_steps),
+                        eta_min=1e-5)
         self.scaler = torch.cuda.amp.GradScaler(enabled=AMP)
         self.crit   = nn.MSELoss()
 
         # ── run dir / logging ──────────────────────────────────
         self.run_dir = Path(args.run_dir); self.run_dir.mkdir(parents=True, exist_ok=True)
         (self.run_dir/'weights').mkdir(exist_ok=True)
-        (self.run_dir/'config.json').write_text(json.dumps(vars(args), indent=2))
+        (self.run_dir/'imgs').mkdir(exist_ok=True)
+        self.log = Tee(self.run_dir/'train_log.txt')
 
         # track
         self.best_val = 9e9; self.bad_evals = 0
-        self.hist = {'step':[], 'train':[], 'val':[]}
+        self.hist = {'step':[], 'train':[], 'val':[], 'grad':[]}
 
         self._eval_counter = 0
+
+        # ── EMA teacher (frozen) ───────────────────────────────
+        self.teacher = copy.deepcopy(self.enc).eval()
+        for p in self.teacher.parameters(): p.requires_grad = False
+        self.mu_base   = 0.995
+        self.mu_final  = 1.0
+        self.mu_ramp   = 30_000            # linear ramp steps
 
     # -----------------------------------------------------------------
     # ──────────────────────────────────────────────────────────────
@@ -122,11 +158,17 @@ class Trainer:
             pooled = F.max_pool1d(time_mask, kernel_size=4, stride=4)
             mask_tok = pooled.squeeze(1).bool()                     # (B,T_tok)
 
-            z_ctx = z.clone()
-            z_ctx[mask_tok] = 0
-            pred = self.pred(z_ctx)                                 # (B,T,d)
+            # -------- teacher targets (full spec, no masking) ------------
+            with torch.no_grad():
+                full = spec.unsqueeze(1)
+                z_tgt, _ = self.teacher.inference_forward(full) \
+                           if hasattr(self.teacher, "inference_forward") \
+                           else self.teacher(full)
 
-            loss = self.crit(pred[mask_tok], z[mask_tok])
+            # -------- student prediction ----------------------------------
+            z_ctx = z.clone(); z_ctx[mask_tok] = 0
+            pred = self.pred(z_ctx)
+            loss = self.crit(pred[mask_tok], z_tgt[mask_tok])
 
         self.opt.zero_grad()
         self.scaler.scale(loss).backward()
@@ -134,6 +176,15 @@ class Trainer:
         torch.nn.utils.clip_grad_norm_(list(self.enc.parameters())+
                                        list(self.pred.parameters()), 1.0)
         self.scaler.step(self.opt); self.scaler.update()
+
+        # ── EMA update ----------------------------------------------------
+        mu = self.mu_final if self.step >= self.mu_ramp else \
+             self.mu_final - (self.mu_final - self.mu_base) * \
+             (1 - self.step / self.mu_ramp)
+        with torch.no_grad():
+            for pt, ps in zip(self.teacher.parameters(), self.enc.parameters()):
+                pt.mul_(mu).add_(ps.data, alpha=1-mu)
+
         # ── optional viz ───────────────────────────────────
         if self.args.viz_every and (self.args.viz_every > 0) and (hasattr(self, 'step') and (self.step % self.args.viz_every == 0)):
             with torch.no_grad():
@@ -141,8 +192,8 @@ class Trainer:
                 m0 = mask3[0].cpu()              # (F,T)
                 p0 = pred[0].cpu()              # (T,D)
                 z0 = z[0].cpu()                 # (T,D)
-            _viz_triptych(self.run_dir, self.step, s0, m0, p0, z0)
-        return float(loss.item())
+            _viz_triptych(self.run_dir/'imgs', self.step, s0, m0, p0, z_tgt[0].cpu())
+        return float(loss.item()), mask_tok
 
     # -----------------------------------------------------------------
     @torch.no_grad()
@@ -164,7 +215,7 @@ class Trainer:
                 tot += self.crit(pred[mask], z[mask]).item()*B
                 n   += B
             if self.args.viz_every and (self._eval_counter % self.args.viz_every == 0):
-                _viz_triptych(self.run_dir, self._eval_counter, spec[0,0].cpu(),
+                _viz_triptych(self.run_dir/'imgs', self._eval_counter, spec[0,0].cpu(),
                               mask[0].cpu(), pred[0].cpu(), z[0].cpu())
             self._eval_counter += 1
         self.enc.train(); self.pred.train()
@@ -181,7 +232,7 @@ class Trainer:
 
             step += 1
             self.step = step
-            tr_loss = self._step(spec)
+            tr_loss, m_tok = self._step(spec)
             if first_step:
                 first_step = False            # scheduler already advanced in _step()
             else:
@@ -190,13 +241,26 @@ class Trainer:
 
             if step % self.args.log_every == 0:
                 val_loss = self._eval()
-                print(f"step {step:07d}  train {tr_loss:.4f}  val {val_loss:.4f}")
-                self.hist['step'].append(step)
-                self.hist['train'].append(tr_loss)
-                self.hist['val'].append(val_loss)
 
-                if val_loss < self.best_val - 1e-4:
-                    self.best_val = val_loss; self.bad_evals = 0
+                # EMA
+                self.train_ema = tr_loss if self.train_ema is None else \
+                                 self.alpha*tr_loss + (1-self.alpha)*self.train_ema
+                self.val_ema   = val_loss if self.val_ema is None else \
+                                 self.alpha*val_loss + (1-self.alpha)*self.val_ema
+
+                gnorm = grad_norm(self.enc)+grad_norm(self.pred)
+                lrs   = " ".join(f"lr{i}:{pg['lr']:.2e}"
+                                 for i,pg in enumerate(self.opt.param_groups))
+                self.log(f"step {step:07d} | train {self.train_ema:.4f} "
+                         f"| val {self.val_ema:.4f} | gnorm {gnorm:.3e} | {lrs}")
+
+                self.hist['step'].append(step)
+                self.hist['train'].append(self.train_ema)
+                self.hist['val'].append(self.val_ema)
+                self.hist['grad'].append(gnorm)
+
+                if self.val_ema < self.best_val - 1e-4:
+                    self.best_val = self.val_ema; self.bad_evals = 0
                     torch.save({'enc': self.enc.state_dict(),
                                 'pred': self.pred.state_dict()},
                                self.run_dir/'weights/best.pt')
@@ -205,6 +269,13 @@ class Trainer:
                 if self.bad_evals >= self.args.early_stop:
                     print("early stop")
                     break
+
+            # ---- staged unfreeze -------------------------------
+            if self.enc_frozen and step >= self.warmup_steps:
+                for p in self.enc.parameters():
+                    p.requires_grad = True
+                self.enc_frozen = False
+                self.log(f"step {step}: encoder unfrozen")
 
         # plots ---------------------------------------------------
         df = pd.DataFrame(self.hist); df.to_csv(self.run_dir/'metrics.csv', index=False)
@@ -244,7 +315,7 @@ def _viz_triptych(run_dir, step, spec, mask, pred, target):
     ax[2].imshow(err_img, **kw);       ax[2].set_title("|pred‑ctx|")
 
     for a in ax: a.axis('off')
-    out = run_dir / f"viz_{step:07d}.png"
+    out = Path(run_dir) / f"viz_{step:07d}.png"
     fig.tight_layout(); fig.savefig(out); plt.close(fig)
 
 # ╭───────────────────────────────────────────────────────────────╮
