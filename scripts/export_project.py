@@ -3,7 +3,7 @@ import argparse, zipfile, datetime as dt
 from pathlib import Path
 
 # tweak these or pass via CLI
-RUN_DIR = Path("/home/george-vengrovski/Documents/projects/Bird_JEPA/runs/finetuned")
+RUN_DIR = Path("/home/george-vengrovski/Documents/projects/Bird_JEPA/runs/ft_run1")
 SRC_DIR = Path("/home/george-vengrovski/Documents/projects/Bird_JEPA/src")
 OUT_DIR = Path("/home/george-vengrovski/Documents/projects/Bird_JEPA/zips")
 

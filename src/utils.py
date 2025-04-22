@@ -129,4 +129,5 @@ def load_pretrained_encoder(cfg: BJConfig, ckpt_path: str | None):
     sd = torch.load(ckpt_path, map_location="cpu")
     model = BirdJEPA(cfg)
     model.load_state_dict(sd, strict=False)
-    return nn.Sequential(model.stem, model.encoder)
+    # keep the projector even when we load weights
+    return nn.Sequential(_StemSeq(model.stem, model.proj), model.encoder)

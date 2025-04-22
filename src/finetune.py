@@ -70,18 +70,14 @@ def grad_norm(model: nn.Module) -> float:
 class BetterHead(nn.Module):
     def __init__(self, d_model, n_cls, hid=512):
         super().__init__()
-        self.attn_pool = nn.Sequential(
-            nn.Linear(d_model, 1),
-            nn.Softmax(dim=1))
         self.mlp = nn.Sequential(
             nn.LayerNorm(d_model),
             nn.Linear(d_model, hid),
             nn.GELU(),
-            nn.Dropout(0.3),       # stronger regularisation
+            nn.Dropout(0.3),
             nn.Linear(hid, n_cls))
     def forward(self, x):          # x (B,T,d)
-        w = self.attn_pool(x)      # (B,T,1)
-        x = (w * x).sum(1)         # weighted sum
+        x = x.mean(dim=1)          # simple average over time
         return self.mlp(x)
 
 # ╭──────────────────────────────────────────────────────────────────────────╮
@@ -138,6 +134,7 @@ class Trainer:
 
         # --- head-only warm-up ---
         self.warmup_steps = 2000
+        self.perma_frozen = args.freeze_encoder  # new switch
         self.enc_frozen = True
         for p in self.net.encoder.parameters():
             p.requires_grad = False
@@ -319,7 +316,7 @@ class Trainer:
             # --------------------------------------------------
             # staged‑unfreeze: flip encoder gradients on *once*
             # --------------------------------------------------
-            if self.enc_frozen and step >= self.warmup_steps:
+            if (not self.perma_frozen) and self.enc_frozen and step >= self.warmup_steps:
                 for p in self.net.encoder.parameters():
                     p.requires_grad = True
                 self.enc_frozen = False
@@ -370,7 +367,7 @@ class Infer:
         # ---- ONNX export (once) ---------------------------------
         self.onnx_path = Path(args.onnx_model_path or args.output_dir)/"model.onnx"
         if not self.onnx_path.exists():
-            dummy=torch.randn(1,513,args.context_length)
+            dummy=torch.randn(1,128,args.context_length)
             torch.onnx.export(self.net,dummy,self.onnx_path,
                               input_names=['input'],output_names=['out'],
                               dynamic_axes={'input':{0:'b'},'out':{0:'b'}},
@@ -463,7 +460,8 @@ def main():
     p.add_argument("--train_spec_dir"); p.add_argument("--val_spec_dir")
     p.add_argument("--output_dir",default="runs/finetuned")
     p.add_argument("--train_csv", required=True)
-    p.add_argument("--pretrained_model_path", default="")
+    p.add_argument("--pretrained_model_path", type=str,
+                   help='path to encoder‐only .pt from pre‑train (expects keys enc/)')
     p.add_argument("--onnx_model_path")
     p.add_argument("--log_dir")
     p.add_argument("--submission_csv", default="submission.csv")
@@ -471,10 +469,12 @@ def main():
     p.add_argument("--batch_size",type=int,default=320)
     p.add_argument("--learning_rate",type=float,default=5e-3)
     p.add_argument("--max_steps",type=int,default=100000)
+    p.add_argument("--attn_pattern", default="local50,global100,local50,global100")
     p.add_argument("--eval_interval",type=int,default=100)
     p.add_argument("--save_interval",type=int,default=1000)
     p.add_argument("--early_stopping_patience", default=300, type=int)
-    p.add_argument("--freeze_encoder",action="store_true")
+    p.add_argument("--freeze_encoder", action='store_true',
+                   help='freeze encoder for the *entire* fine‑tune run')
     p.add_argument("--num_workers",type=int,default=4)
     p.add_argument("--enc_width",type=int,default=192,help="JEPA hidden size d_model")
     p.add_argument("--ckpt", help="explicit path to .pt checkpoint")

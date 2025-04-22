@@ -7,7 +7,7 @@ from matplotlib.backend_bases import KeyEvent
 import torch
 
 # ===== MODIFY THESE PARAMETERS =====
-NPZ_DIR = '/media/george-vengrovski/Desk SSD/BirdJEPA/train_soundscapes_test'
+NPZ_DIR = '/home/george-vengrovski/Documents/projects/Bird_JEPA/BirdCLEF/finetune_val'
 PATTERN = '*.pt'        # File pattern to match
 SPEC_KEY = 's'           # Key for the spectrogram in the NPZ file
 CROP_TOP = 0            # Crop from the top
@@ -26,8 +26,8 @@ class SpectogramNavigator:
         self.fig = None
         self.ax = None
         self.img = None
-        self.crop_top = 10
-        self.crop_bottom = 216
+        self.crop_top = 0
+        self.crop_bottom = 100000
         
     def load_current_spectrogram(self):
         """Load the current spectrogram from the list"""
@@ -41,6 +41,8 @@ class SpectogramNavigator:
                 spectrogram = data[self.spectrogram_key]
             else:
                 raise ValueError(f"Unsupported file type: {current_file}")
+            # Z-score normalization per spectrogram
+            spectrogram = (spectrogram - spectrogram.mean()) / (spectrogram.std() + 1e-8)
             # Crop the spectrogram
             if self.crop_bottom > 0 and self.crop_bottom > self.crop_top:
                 spectrogram = spectrogram[self.crop_top:self.crop_bottom, :]
