@@ -159,10 +159,12 @@ class Trainer:
                 z = self.enc(spec_masked)
             B, T_tok, D = z.shape        # T_tok = T_bins//4 (conv stride)
 
-            # max‑pool mask3 over freq, then over 4‑frame time windows
-            time_mask = mask3.any(1).float().unsqueeze(1)           # (B,1,T_bins)
-            pooled = F.max_pool1d(time_mask, kernel_size=4, stride=4)
-            mask_tok = pooled.squeeze(1).bool()                     # (B,T_tok)
+            # pool mask to encoder grid (8×64)
+            PF = getattr(self.enc[0].proj, "pool_F", 8)
+            PT = getattr(self.enc[0].proj, "pool_T", 64)
+            pooled2d = F.adaptive_max_pool2d(
+                           mask3.float().unsqueeze(1), (PF, PT))    # (B,1,PF,PT)
+            mask_tok = pooled2d.flatten(2).squeeze(1).bool()        # (B,512)
 
             # -------- teacher targets (full spec, no masking) ------------
             with torch.no_grad():
@@ -219,9 +221,12 @@ class Trainer:
                 z, _ = self.enc.inference_forward(s) if hasattr(self.enc,"inference_forward") \
                           else (self.enc(s), None)        # (B,T_tok,D)
 
-                # pool the 3‑D mask to token timeline
-                time_mask = mask3.any(1).float().unsqueeze(1)         # (B,1,T_bins)
-                mask_tok = F.max_pool1d(time_mask, 4, 4).squeeze(1).bool()  # (B,T_tok)
+                # pool mask to encoder grid (8×64)
+                PF = getattr(self.enc[0].proj, "pool_F", 8)
+                PT = getattr(self.enc[0].proj, "pool_T", 64)
+                pooled2d = F.adaptive_max_pool2d(
+                               mask3.float().unsqueeze(1), (PF, PT))
+                mask_tok = pooled2d.flatten(2).squeeze(1).bool()
 
                 z_ctx = z.clone(); z_ctx[mask_tok] = 0
                 pred = self.pred(z_ctx)
@@ -320,16 +325,40 @@ def _viz_triptych(run_dir, step, spec, mask, pred, target):
     spec_masked = spec_ds.clone()
     spec_masked[mask] = 0.0          # zero wherever mask == True (2‑D)
 
-    err = (pred - target).abs().mean(-1).cpu().numpy()   # (T,)
-    err_img = np.tile(err, (F_bins, 1))                  # broadcast → F,T′
+    # ---------- token grid helpers -------------------------------
+    PF = getattr(pred, "pool_F", 8)
+    PT = getattr(pred, "pool_T", 64)
 
-    fig,ax = plt.subplots(1,3,figsize=(9,3),dpi=120)
+    # 1) error heat-map ------------------------------------------
+    err = (pred - target).abs().mean(-1).cpu().numpy()        # (512,)
+    err_grid = err.reshape(PF, PT)
+    err_img = tF.interpolate(torch.from_numpy(err_grid)[None,None],
+                             size=spec_ds.shape, mode="nearest"
+               ).squeeze().numpy()
+
+    # 2) teacher / student token norms ---------------------------
+    teach = target.norm(dim=-1).cpu().numpy().reshape(PF,PT)
+    stud  =  pred .norm(dim=-1).cpu().numpy().reshape(PF,PT)
+    teach = (teach - teach.min()) / (teach.ptp()+1e-6)
+    stud  = (stud  - stud .min()) / (stud .ptp()+1e-6)
+
+    # 3) grid-downsampled input ----------------------------------
+    spec_grid = tF.adaptive_avg_pool2d(
+                    spec_ds.unsqueeze(0).unsqueeze(0), (PF,PT)
+                ).squeeze().numpy()
+
+    fig,ax = plt.subplots(2,3,figsize=(9,6),dpi=120)
     kw = dict(aspect='auto',origin='lower',cmap='magma')
-    ax[0].imshow(spec, **kw);          ax[0].set_title("input")
-    ax[1].imshow(spec_masked, **kw);   ax[1].set_title("masked")
-    ax[2].imshow(err_img, **kw);       ax[2].set_title("|pred‑ctx|")
+    # top row ------------------------------------------------------
+    ax[0,0].imshow(spec, **kw);           ax[0,0].set_title("input")
+    ax[0,1].imshow(spec_masked, **kw);    ax[0,1].set_title("masked")
+    ax[0,2].imshow(err_img,   **kw);      ax[0,2].set_title("|pred-ctx|")
+    # bottom row ---------------------------------------------------
+    ax[1,0].imshow(spec_grid, **kw);      ax[1,0].set_title("grid")
+    ax[1,1].imshow(teach, cmap='viridis');ax[1,1].set_title("teacher |z|")
+    ax[1,2].imshow(stud,  cmap='viridis');ax[1,2].set_title("student |z|")
 
-    for a in ax: a.axis('off')
+    for a in ax.ravel(): a.axis('off')
     out = Path(run_dir) / f"viz_{step:07d}.png"
     fig.tight_layout(); fig.savefig(out); plt.close(fig)
 

@@ -1,9 +1,6 @@
 # src/models/birdjepa.py
-# full rewrite – stem collapses freq, encoder pattern string builds
-# local / global sparse‑aware blocks.  < 300 LoC
-
-import math, torch, torch.nn as nn
-import torch.nn.functional as F
+# minimalist BirdJEPA encoder with 8×64 patch grid and plain 1-D rotary PE
+import torch, torch.nn as nn, torch.nn.functional as F
 from dataclasses import dataclass, field
 from .rope import rope
 
@@ -14,153 +11,99 @@ print(">> birdjepa loaded from", __file__)
 # ──────────────────────────────────────
 @dataclass
 class BJConfig:
-    # stem
-    n_mels:  int       = 128
-    conv_ch: list[int] = field(default_factory=lambda: [32, 32, 32])
-    conv_k:  list[int] = field(default_factory=lambda: [5, 3, 3])
-    conv_str:list[tuple]=field(default_factory=lambda: [(2,1),(2,2),(2,2)])
+    # input
+    n_mels: int = 128
 
-    # encoder
-    layers: int = 16
+    # four (freq, time) strided conv layers → F:128→8,  T:1000→64
+    conv_ch:  list[int]      = field(default_factory=lambda: [32, 32, 32, 32])
+    conv_k:   list[int]      = field(default_factory=lambda: [5, 3, 3, 3])
+    conv_str: list[tuple[int,int]] = field(
+        default_factory=lambda: [(2,1), (2,1), (2,2), (2,2)]
+    )
+
+    # fixed token grid after adaptive pool
+    pool_F: int = 8      # freq patches
+    pool_T: int = 64     # time patches  → 8·64 = 512 tokens
+
+    # transformer
+    layers:  int = 16
     d_model: int = 192
     n_heads: int = 6
-    ff_mult: int = 4
-    pattern: str = None
-
-    # predictor (unused here)
-    pred_dim: int = 96
-    pred_layers:int=1
-
-    # ---------- self‑sup. masking -------------------------------------
-    mask_t:      int   = 1000   # training segment length (time frames)
-    keep_p:      float = 0.20   # *visible* volume fraction  (1‑keep_p is masked)
-    rect_mask:   bool  = True   # use rectangle masking (else old time‑strip)
-    rect_min_t:  int   = 10
-    rect_max_t:  int   = 250
-    rect_min_f:  int   = 8
-    rect_max_f:  int   = 128
-
-    def __post_init__(self):
-        if self.pattern is None:
-            self.pattern = ','.join(['local50,global100'] * (self.layers // 2))
+    ff_mult: int = 4     # MLP expansion
 
 # ──────────────────────────────────────
-#  stem: conv stack, tracks Fp
+#  stem: conv stack
 # ──────────────────────────────────────
 class Stem(nn.Sequential):
     def __init__(self, cfg: BJConfig):
-        layers = []
-        C_in = 1
-        Fp = cfg.n_mels
-        for ch, k, (s_f, s_t) in zip(cfg.conv_ch, cfg.conv_k, cfg.conv_str):
-            layers += [nn.Conv2d(C_in, ch, k, stride=(s_f, s_t), padding=k//2), nn.GELU()]
-            C_in = ch
-            Fp //= s_f
+        layers, c_in = [], 1
+        for c_out, k, (s_f, s_t) in zip(cfg.conv_ch, cfg.conv_k, cfg.conv_str):
+            layers += [nn.Conv2d(c_in, c_out, k, stride=(s_f, s_t),
+                                 padding=k // 2), nn.GELU()]
+            c_in = c_out
         super().__init__(*layers)
-        cfg.Fp = Fp  # remember final freq bins
 
 # ──────────────────────────────────────
-#  SDPA-based attention blocks
+#  transformer block (full attention)
 # ──────────────────────────────────────
 class SDPABlock(nn.Module):
-    def __init__(self, d, h, ff_mult):
+    def __init__(self, d_model: int, n_heads: int, ff_mult: int):
         super().__init__()
-        self.n_heads = h
-        self.d_head = d // h
-        self.q_proj = nn.Linear(d, d)
-        self.k_proj = nn.Linear(d, d)
-        self.v_proj = nn.Linear(d, d)
-        self.out_proj = nn.Linear(d, d)
-        self.norm1 = nn.LayerNorm(d)
-        self.norm2 = nn.LayerNorm(d)
-        self.ff = nn.Sequential(
-            nn.Linear(d, d*ff_mult),
+        self.nh   = n_heads
+        self.dh   = d_model // n_heads
+        self.qkv  = nn.Linear(d_model, 3 * d_model, bias=False)
+        self.out  = nn.Linear(d_model, d_model)
+        self.norm = nn.LayerNorm(d_model)
+        self.ff   = nn.Sequential(
+            nn.LayerNorm(d_model),
+            nn.Linear(d_model, ff_mult * d_model),
             nn.GELU(),
-            nn.Linear(d*ff_mult, d)
+            nn.Linear(ff_mult * d_model, d_model),
         )
 
-    def forward(self, x):
-        B, T, D = x.shape
-        x_norm = self.norm1(x)
-        x_norm = rope(x_norm)
-        q = self.q_proj(x_norm).view(B, T, self.n_heads, self.d_head).transpose(1, 2)
-        k = self.k_proj(x_norm).view(B, T, self.n_heads, self.d_head).transpose(1, 2)
-        v = self.v_proj(x_norm).view(B, T, self.n_heads, self.d_head).transpose(1, 2)
-        h = F.scaled_dot_product_attention(q, k, v, attn_mask=None, dropout_p=0.0, is_causal=False)
-        h = h.transpose(1, 2).contiguous().view(B, T, D)
-        h = self.out_proj(h)
-        x = x + h
-        x = x + self.ff(self.norm2(x))
-        return x
+    def forward(self, x):                     # (B, N, d)
+        B, N, D = x.shape
+        h = self.nh
+        x = self.norm(x)
+        x = rope(x)                           # 1-D rotary
+        qkv = self.qkv(x).view(B, N, h, 3 * self.dh).chunk(3, dim=-1)
+        q, k, v = (t.permute(0, 2, 1, 3) for t in qkv)  # (B,h,N,d_h)
+        a = F.scaled_dot_product_attention(q, k, v, dropout_p=0.0)
+        a = a.permute(0, 2, 1, 3).contiguous().view(B, N, D)
+        x = x + self.out(a)
+        return x + self.ff(x)
 
 # ──────────────────────────────────────
-#  encoder builder from pattern string
-# ──────────────────────────────────────
-def build_encoder(cfg: BJConfig):
-    blocks=[]
-    for _ in range(cfg.layers):
-        blocks.append(SDPABlock(cfg.d_model, cfg.n_heads, cfg.ff_mult))
-    return nn.Sequential(*blocks)
-
-# ──────────────────────────────────────
-#  BirdJEPA (encoder‑only for finetune)
+#  BirdJEPA encoder
 # ──────────────────────────────────────
 class BirdJEPA(nn.Module):
+    """
+    (B, 1, 128, 1000) log-mel → 512 tokens × d_model.
+    """
     def __init__(self, cfg: BJConfig):
         super().__init__()
-        self.cfg = cfg
+        self.cfg  = cfg
+        self.stem = Stem(cfg)
 
-        # ----- conv stem: (B,1,F,T) -> (B,C,F',T') ------------------------
-        self.stem = nn.Sequential(
-            *[nn.Conv2d(in_ch, out_ch, k, stride=s, padding=k//2)
-              for in_ch, out_ch, k, s in zip(
-                    [1]+cfg.conv_ch[:-1], cfg.conv_ch,
-                    cfg.conv_k,           cfg.conv_str)]
-        )
-
-        # ----- figure out flattened dim dynamically -----------------------
+        # channel dim after stem (computed once)
         with torch.no_grad():
-            dummy = torch.zeros(1, 1, cfg.n_mels, 10)   # 10 frames are enough
-            z     = self.stem(dummy)                    # (1,C,F',T')
-            C, Fp = z.shape[1], z.shape[2]              # <- real freq bins
-            flat  = C * Fp
+            C = self.stem(torch.zeros(1, 1, cfg.n_mels, 1000)).shape[1]
 
-        self.proj = nn.Linear(flat, cfg.d_model, bias=False)
+        self.proj = nn.Linear(C, cfg.d_model, bias=False)
+        self.proj.pool_F = cfg.pool_F    # expose grid dims for mask logic
+        self.proj.pool_T = cfg.pool_T
 
-        # ----- transformer encoder (unchanged) ----------------------------
-        self.core = build_encoder(cfg)
-        self.encoder = self.core  # <‑‑ keep the legacy handle
-        # ------------------------------------------------------------------
-
-    def forward(self, spec):                 # spec (B,1,F,T)
-        z = self.stem(spec)                  # (B,C,F',T')
-        z = z.permute(0, 3, 1, 2)            # (B,T',C,F')
-        z = z.flatten(2)                     # (B,T',C*F')
-        x = self.proj(z)                     # (B,T',d_model)
-        # print('DEBUG BirdJEPA.forward x.shape:', x.shape)
-        return self.core(x)                  # (B,T',d_model)
-    
-# ──────────────────────────────────────
-#  Predictor
-# ──────────────────────────────────────
-class Predictor(nn.Module):
-    """
-    shallow MLP g(·) with rotary PE baked in.
-    optionally consumes the boolean time‑mask so you can
-    condition on "which tokens were hidden" later.
-    """
-    def __init__(self, d_model: int):
-        super().__init__()
-        self.norm = nn.LayerNorm(d_model)
-        self.mlp  = nn.Sequential(
-            nn.Linear(d_model, 2 * d_model),
-            nn.GELU(),
-            nn.Linear(2 * d_model, d_model)
+        # transformer encoder
+        self.encoder = nn.Sequential(
+            *[SDPABlock(cfg.d_model, cfg.n_heads, cfg.ff_mult)
+              for _ in range(cfg.layers)]
         )
 
-    def forward(self, x, mask: torch.Tensor | None = None):
-        # x : (B, T, d)
-        x = rope(self.norm(x))                     # rotary ‑> better extrap
-        if mask is not None:                       # (B,T) True = masked
-            x = x.masked_fill(~mask.unsqueeze(-1), 0.0)
-        return self.mlp(x)
+    # ----------------------------------------------------------
+    def forward(self, spec):                       # spec (B,1,F,T)
+        z = self.stem(spec)                        # (B,C,F',T')
+        z = F.adaptive_avg_pool2d(
+                z, (self.cfg.pool_F, self.cfg.pool_T))      # (B,C,8,64)
+        B, C, Fg, Tg = z.shape
+        z = z.permute(0, 2, 3, 1).reshape(B, Fg * Tg, C)    # (B,512,C)
+        return self.encoder(self.proj(z))                   # (B,512,d)

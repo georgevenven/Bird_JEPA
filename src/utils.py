@@ -7,6 +7,7 @@ import pandas as pd
 from pathlib import Path
 from models.birdjepa import BirdJEPA, BJConfig
 import torch.nn as nn
+import torch.nn.functional as F
 
 
 def load_config(config_path):
@@ -113,9 +114,12 @@ class _StemSeq(nn.Module):
         super().__init__()
         self.stem, self.proj = stem, proj
     def forward(self, x):             # x (B,1,F,T)
-        z = self.stem(x)              # (B,C,F',T')
-        z = z.permute(0,3,1,2).flatten(2)  # (B,T',C*F')
-        return self.proj(z)           # (B,T',D)
+        z = self.stem(x)                              # (B,C,F',T')
+        PF, PT = getattr(self.proj, "pool_F", 8), getattr(self.proj, "pool_T", 64)
+        z = F.adaptive_avg_pool2d(z, (PF, PT))        # (B,C,PF,PT)
+        B, C, Fg, Tg = z.shape
+        z = z.permute(0,2,3,1).contiguous().view(B, Fg*Tg, C)  # (B,512,C)
+        return self.proj(z)
 
 def load_pretrained_encoder(cfg: BJConfig, ckpt_path: str | None):
     # if no checkpoint → random init
