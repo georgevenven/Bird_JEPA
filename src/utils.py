@@ -120,16 +120,9 @@ class _StemSeq(nn.Module):
         return self.proj(z)
 
 def load_pretrained_encoder(cfg: BJConfig, ckpt_path: str | None):
-    # if no checkpoint → random init
-    if not ckpt_path or str(ckpt_path).lower() in {"none", "null"}:
-        model = BirdJEPA(cfg)
-        return nn.Sequential(
-            _StemSeq(model.stem, model.proj),
-            model.encoder
-        )
-
-    sd = torch.load(ckpt_path, map_location="cpu")
-    model = BirdJEPA(cfg)
-    model.load_state_dict(sd, strict=False)
-    # keep the projector even when we load weights
-    return nn.Sequential(_StemSeq(model.stem, model.proj), model.encoder)
+    enc = BirdJEPA(cfg)                      # full embedder
+    enc._print_par_count()                   # echoes again after ckpt load if you want
+    if ckpt_path:
+        enc.load_state_dict(torch.load(ckpt_path, map_location='cpu'),
+                           strict=False)
+    return enc                               # no lambda, no Sequential

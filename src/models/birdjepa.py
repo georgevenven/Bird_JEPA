@@ -5,7 +5,8 @@
 import math, torch, torch.nn as nn
 import torch.nn.functional as F
 from dataclasses import dataclass, field
-from .rope import rope
+from .rope import rope, rope_2d
+from .utils_misc import count_params
 
 print(">> birdjepa loaded from", __file__)
 
@@ -20,10 +21,6 @@ class BJConfig:
     conv_ch:  list[int] = field(default_factory=lambda: [32, 32, 32, 32])
     conv_k:   list[int] = field(default_factory=lambda: [5, 3, 3, 3])
     conv_str: list[tuple]=field(default_factory=lambda: [(2,2), (2,2), (2,2), (2,2)])
-
-    # fixed grid after adaptive pool
-    pool_F: int = 8     # freq bins per token-grid
-    pool_T: int = 64    # time bins per token-grid
 
     # encoder
     layers: int = 8
@@ -86,11 +83,12 @@ class SDPABlock(nn.Module):
             nn.GELU(),
             nn.Linear(d*ff_mult, d)
         )
+        self.dropout = nn.Dropout(0.1)
 
-    def forward(self, x):
+    def forward(self, x, grid_shape):
         B, T, D = x.shape
         x_norm = self.norm1(x)
-        x_norm = rope(x_norm)
+        x_norm = rope_2d(x_norm, grid_shape)
         q = self.q_proj(x_norm).view(B, T, self.n_heads, self.d_head).transpose(1, 2)
         k = self.k_proj(x_norm).view(B, T, self.n_heads, self.d_head).transpose(1, 2)
         v = self.v_proj(x_norm).view(B, T, self.n_heads, self.d_head).transpose(1, 2)
@@ -98,17 +96,15 @@ class SDPABlock(nn.Module):
         h = h.transpose(1, 2).contiguous().view(B, T, D)
         h = self.out_proj(h)
         x = x + h
-        x = x + self.ff(self.norm2(x))
+        x = x + self.dropout(self.ff(self.norm2(x)))
         return x
 
 # ──────────────────────────────────────
 #  encoder builder from pattern string
 # ──────────────────────────────────────
 def build_encoder(cfg: BJConfig):
-    blocks=[]
-    for _ in range(cfg.layers):
-        blocks.append(SDPABlock(cfg.d_model, cfg.n_heads, cfg.ff_mult))
-    return nn.Sequential(*blocks)
+    return nn.ModuleList([SDPABlock(cfg.d_model, cfg.n_heads, cfg.ff_mult)
+                         for _ in range(cfg.layers)])
 
 # ──────────────────────────────────────
 #  BirdJEPA (encoder‑only for finetune)
@@ -131,26 +127,27 @@ class BirdJEPA(nn.Module):
             dummy = torch.zeros(1, 1, cfg.n_mels, 256)     # 5 s clip → 256 frames
             C, Fp, Tp = self.stem(dummy).shape[1:]
         self.proj = nn.Linear(C, cfg.d_model, bias=False)  # per-patch linear
-        # stash grid dims so downstream code can grab them
-        self.proj.pool_F = cfg.pool_F
-        self.proj.pool_T = cfg.pool_T
 
         # ----- transformer encoder (unchanged) ----------------------------
-        self.core = build_encoder(cfg)
-        self.encoder = self.core  # <‑‑ keep the legacy handle
+        self.core = build_encoder(cfg)         # ModuleList
+        self.encoder = lambda spec: self(spec) # plain python func, not a sub-module
+        self._print_par_count()
         # ------------------------------------------------------------------
 
     def forward(self, spec):                 # spec (B,1,F,T)
-        print(f"[dbg] spec      {spec.shape}")         # (B,1,128,256)
         z = self.stem(spec)
-        print(f"[dbg] after stem {z.shape}")            # (B,C,8,16) w/ (2,2)^4 stride
         B, C, Fp, Tp = z.shape                 # (32,16)
         z = z.permute(0, 2, 3, 1).reshape(B, Fp * Tp, C)
-        print(f"[dbg] tokens    {(B, Fp*Tp, C)}")       # (B,128,C) in your setup
         x = self.proj(z)
-        print(f"[dbg] after proj {x.shape}")            # (B,128,{d_model})
-        return self.core(x)
+
+        for blk in self.core:                  # ← iterate manually
+            x = blk(x, (Fp, Tp))               # pass (F′,T′) for 2-D RoPE
+        return x
     
+    def _print_par_count(self):
+        m = count_params(self)
+        print(f"[birdjepa] {m:.2f}M parameters")
+
 # ──────────────────────────────────────
 #  Predictor
 # ──────────────────────────────────────
@@ -169,9 +166,9 @@ class Predictor(nn.Module):
             nn.Linear(2 * d_model, d_model)
         )
 
-    def forward(self, x, mask: torch.Tensor | None = None):
+    def forward(self, x, grid_shape, mask: torch.Tensor | None = None):
         # x : (B, T, d)
-        x = rope(self.norm(x))                     # rotary ‑> better extrap
-        if mask is not None:                       # (B,T) True = masked
+        x = rope_2d(self.norm(x), grid_shape)
+        if mask is not None:
             x = x.masked_fill(~mask.unsqueeze(-1), 0.0)
         return self.mlp(x)

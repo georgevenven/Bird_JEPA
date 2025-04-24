@@ -18,6 +18,50 @@ from models  import BJConfig                            # encoder
 from models.birdjepa import BirdJEPA
 from utils   import load_pretrained_encoder                       # simple helper
 from data.bird_datasets import BirdSpectrogramDataset, TorchSpecDataset
+
+# ── tiny wrapper that augments *only* when we call it from fine-tune ──────────
+class AugTorchSpecDataset(TorchSpecDataset):
+    """
+    • Gaussian noise  (σ = noise_std · spec.std())
+    • mel-axis roll   (± max_shift bins)   – a quick 'pitch-shift'
+    Everything happens on-the-fly on the CPU tensor that _load_clip returns.
+    """
+    def __init__(self, *a,
+                 noise_p   =0.5,  noise_std =0.08,
+                 shift_p   =0.5,  max_shift =4,
+                 **kw):
+        super().__init__(*a, **kw)
+        self.noise_p,  self.noise_std  = noise_p,  noise_std
+        self.shift_p,  self.max_shift  = shift_p,  max_shift
+
+    # ------------------------------------------------------------------
+    def _augment(self, spec):
+        # make sure it's a torch Tensor on CPU, float32
+        if not torch.is_tensor(spec):
+            spec = torch.from_numpy(spec)
+        spec = spec.to(dtype=torch.float32, device="cpu")
+
+        if torch.rand(1) < self.noise_p:
+            spec = spec + torch.randn_like(spec) * self.noise_std * spec.std()
+        if torch.rand(1) < self.shift_p:
+            shift = int(torch.randint(-self.max_shift,
+                                       self.max_shift + 1, (1,)))
+            spec  = torch.roll(spec, shifts=shift, dims=0)
+        # --- time-axis random erase (SpecAugment-style) ---
+        if torch.rand(1) < 0.5:
+            T = spec.shape[1]
+            erase_len = int(torch.randint(10, 41, (1,)))
+            start = int(torch.randint(0, max(1, T-erase_len+1), (1,)))
+            spec[:, start:start+erase_len] = 0
+        return spec
+
+    # ------------------------------------------------------------------
+    def __getitem__(self, idx):
+        spec, start, fname = super().__getitem__(idx)
+        # super() already gives (F,T) float32 CPU --> safe to mutate
+        spec = self._augment(spec)
+        return spec, start, fname
+
 # ╭──────────────────────────────────────────────────────────────────────────╮
 # │  Kaggle‑style macro ROC‑AUC – self‑contained, no external dependency     │
 # ╰──────────────────────────────────────────────────────────────────────────╯
@@ -68,7 +112,7 @@ def grad_norm(model: nn.Module) -> float:
 # │  classifier head                                                        │
 # ╰──────────────────────────────────────────────────────────────────────────╯
 class BetterHead(nn.Module):
-    def __init__(self,d,n_cls,hid=512):
+    def __init__(self,d,n_cls,hid=128):
         super().__init__()
         self.w = nn.Linear(d,1,bias=False)           # scalar score
         self.mlp = nn.Sequential(
@@ -91,10 +135,7 @@ class Net(nn.Module):
         self.clf     = BetterHead(cfg.d_model, n_cls)
     def forward(self, spec):                                      # (B,F,T)
         spec = spec.unsqueeze(1)                   # (B,1,F,T)
-        if hasattr(self.encoder, "inference_forward"):
-            emb, _ = self.encoder.inference_forward(spec)   # full BirdJEPA case
-        else:
-            emb = self.encoder(spec)                       # Sequential(stem,enc) case
+        emb = self.encoder(spec)                       # Sequential(stem,enc) case
         return self.clf(emb)
 
 # ╭──────────────────────────────────────────────────────────────────────────╮
@@ -105,9 +146,14 @@ class Trainer:
         torch.multiprocessing.set_sharing_strategy("file_system")
         self.args = args
         # ── data ───────────────────────────────────────────────
-        self.train_ds = TorchSpecDataset(args.train_spec_dir,
-                                               segment_len=args.context_length,
-                                               csv_path=args.train_csv)
+        self.train_ds = AugTorchSpecDataset(
+            args.train_spec_dir,
+            segment_len=args.context_length,
+            csv_path=args.train_csv,
+            # tweak probabilities here if you like
+            noise_p   =0.5,  noise_std =0.15,
+            shift_p   =0.5,  max_shift =8,
+        )
         self.val_ds   = TorchSpecDataset(args.val_spec_dir,
                                                segment_len=args.context_length,
                                                infinite=False,
@@ -133,24 +179,40 @@ class Trainer:
         os.environ["TORCH_COMPILE_DISABLE"] = "1"
 
         # --- head-only warm-up ---
-        self.warmup_steps = 100
+        self.warmup_steps = 0  # just unfreeze from step 0
         self.perma_frozen = args.freeze_encoder  # new switch
-        self.enc_frozen = True
+        self.enc_frozen = False
         for p in self.net.encoder.parameters():
-            p.requires_grad = False
+            p.requires_grad = True  # never freeze
 
-        enc_lr  = 3e-4
-        head_lr = 3e-3
+        enc_lr  = 5e-3  # √10 lower
+        head_lr = 1e-3  # keep
         self.opt = torch.optim.AdamW([
             {"params": self.net.encoder.parameters(), "lr": enc_lr, "weight_decay": 1e-2},
             {"params": self.net.clf.parameters(),     "lr": head_lr, "weight_decay": 5e-3},
-        ])
+        ], eps=1e-8, betas=(0.9, 0.98))
         self.scaler = torch.cuda.amp.GradScaler(enabled=AMP)
-        self.crit = nn.BCEWithLogitsLoss()
-
+        # --- pos_weight balancing for BCE ---
+        # build a SMALL, finite view only for freq calc
+        static_ds = TorchSpecDataset(
+            args.train_spec_dir,
+            segment_len=args.context_length,
+            csv_path=args.train_csv,
+            infinite=False
+        )
+        counts = torch.zeros(len(self.classes))
+        for _, _, f in static_ds:
+            idx = self.train_ds.label_idx(f)
+            if idx >= 0:
+                counts[idx] += 1
+        pos_freq = counts / len(static_ds)
+        pw = 1 / torch.clamp(pos_freq, 1e-3)
+        self.crit = nn.BCEWithLogitsLoss(pos_weight=pw.to(self.dev))
+        print("Positive frequency for each class:", pos_freq)
+        print("Positive weight for each class:", pw)
         # optional: cosine to 1e‑5
         self.sched = torch.optim.lr_scheduler.CosineAnnealingLR(
-            self.opt, T_max=args.max_steps - self.warmup_steps, eta_min=1e-5)
+            self.opt, T_max=args.max_steps, eta_min=1e-5)
 
         # ── dirs / logging ─────────────────────────────────────
         self.run_dir = Path(args.output_dir); self.run_dir.mkdir(parents=True,exist_ok=True)
@@ -168,7 +230,7 @@ class Trainer:
                      "auc":[],             # EMA val‑AUC
                      "grad":[]}            # grad‑norm
 
-        self.alpha = 0.1              # EMA smoothing factor
+        self.alpha = 0.05              # EMA smoothing factor
         self.train_ema = None
         self.val_ema   = None
 
@@ -307,7 +369,7 @@ class Trainer:
                 if step % self.args.save_interval == 0:
                     self._save(step, 'ckpt')
 
-                if self.bad_evals >= self.args.early_stopping_patience:
+                if self.bad_evals >= 200:
                     self.log(f"early stop (no improve for {self.bad_evals} evals)")
                     break
 
@@ -405,10 +467,6 @@ class Infer:
         profile_path = None
         # drop explicit start; ORT starts auto‑profiling when enabled
         for i, (spec, _, fn) in enumerate(val_loader):
-            if i > 10:
-                break
-
-
             t0=time.time()
             try:
                 # ── hard‑trim to 60 s (256*12 frames) ────────────────
@@ -472,11 +530,11 @@ def main():
     p.add_argument("--context_length",type=int,default=256)
     p.add_argument("--batch_size",type=int,default=320)
     p.add_argument("--learning_rate",type=float,default=5e-3)
-    p.add_argument("--max_steps",type=int,default=3000)
+    p.add_argument("--max_steps",type=int,default=20000)
     p.add_argument("--attn_pattern", default="local50,global100,local50,global100")
     p.add_argument("--eval_interval",type=int,default=100)
     p.add_argument("--save_interval",type=int,default=1000)
-    p.add_argument("--early_stopping_patience", default=300, type=int)
+    p.add_argument("--early_stopping_patience", default=1000, type=int)
     p.add_argument("--freeze_encoder", action='store_true',
                    help='freeze encoder for the *entire* fine‑tune run')
     p.add_argument("--num_workers",type=int,default=4)
