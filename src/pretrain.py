@@ -116,24 +116,29 @@ class Trainer:
     # ──────────────────────────────────────────────────────────────
     #  rectangle mask on raw (F,T) spectrogram → pooled to tokens
     # ──────────────────────────────────────────────────────────────
-    def _rect_mask(self, F_bins:int, T_bins:int, mask_p:float=.40,
-                   device='cpu'):
-        """returns (F,T) bool mask"""
+    def _rect_mask(self, F_bins, T_bins, mask_p=.30, device="cpu"):
         target = int(mask_p * F_bins * T_bins)
+        remain = target
         m = torch.zeros(F_bins, T_bins, dtype=torch.bool, device=device)
-        covered = 0
-        tries = 0
-        while covered < target and tries < 1000:
-            tries += 1
-            h = random.randint(1, F_bins)
-            w = random.randint(1, T_bins)
+
+        while remain > 0:
+            # choose height no bigger than what's left vertically
+            h = random.randint(1, min(F_bins, remain))
+            # cap width by leftover area / chosen height
+            max_w = min(T_bins, max(1, remain // h))
+            w = random.randint(1, max_w)
+
+            # final safety: ensure area ≤ remain
+            area = min(h * w, remain)
+            # if area shrank, reduce width accordingly
+            w = max(1, area // h)
+
             f0 = random.randint(0, F_bins - h)
             t0 = random.randint(0, T_bins - w)
-            new = (~m[f0:f0+h, t0:t0+w]).sum().item()
-            if new == 0:
-                continue
-            m[f0:f0+h, t0:t0+w] = True
-            covered += new
+
+            m[f0:f0 + h, t0:t0 + w] = True
+            remain -= h * w
+
         return m
 
     # -----------------------------------------------------------------
@@ -141,30 +146,32 @@ class Trainer:
         spec = spec.to(self.dev)                  # (B,F,T)
         B,F_bins,T_bins = spec.shape
 
-        # -------------- draw one batch mask -------------------
-        base = self._rect_mask(F_bins, T_bins,
-                               self.args.mask_ratio,
-                               device=spec.device)        # (F,T)
-        mask3 = base.unsqueeze(0).repeat(B,1,1)            # (B,F,T)
+        # -------------- grid-aware mask on token grid -------------------
+        # get token grid dims from encoder stem
+        with torch.no_grad():
+            dummy = torch.zeros(1, 1, F_bins, T_bins, device=spec.device)
+            _, C, Fp, Tp = self.enc[0].stem(dummy).shape
+        mask_tok = self._rect_mask(Fp, Tp, self.args.mask_ratio, device=spec.device).flatten()  # (Fp*Tp,)
+        mask_tok = mask_tok.unsqueeze(0).repeat(B,1)                                            # (B, Fp*Tp)
 
-        # zero masked bins (stop‑grad) ------------------------
+        # ------- zero entire patches in spec BEFORE the stem ----------
         spec_masked = spec.clone()
-        spec_masked[mask3] = 0.0
+        f_stride = F_bins // Fp
+        t_stride = T_bins // Tp
+        for f in range(Fp):
+            for t in range(Tp):
+                if mask_tok[0, f*Tp + t]:
+                    f0, f1 = f*f_stride, (f+1)*f_stride
+                    t0, t1 = t*t_stride, (t+1)*t_stride
+                    spec_masked[:, f0:f1, t0:t1] = 0.0
 
         with torch.cuda.amp.autocast(enabled=AMP):
-            spec_masked = spec_masked.unsqueeze(1)                  # (B,1,F,T)
+            spec_masked = spec_masked.unsqueeze(1)
             if hasattr(self.enc, "inference_forward"):
                 z, _ = self.enc.inference_forward(spec_masked)
             else:
                 z = self.enc(spec_masked)
-            B, T_tok, D = z.shape        # T_tok = T_bins//4 (conv stride)
-
-            # pool mask to encoder grid (8×64)
-            PF = getattr(self.enc[0].proj, "pool_F", 8)
-            PT = getattr(self.enc[0].proj, "pool_T", 64)
-            pooled2d = F.adaptive_max_pool2d(
-                           mask3.float().unsqueeze(1), (PF, PT))    # (B,1,PF,PT)
-            mask_tok = pooled2d.flatten(2).squeeze(1).bool()        # (B,512)
+            B, T_tok, D = z.shape
 
             # -------- teacher targets (full spec, no masking) ------------
             with torch.no_grad():
@@ -194,10 +201,17 @@ class Trainer:
                 pt.mul_(mu).add_(ps.data, alpha=1-mu)
 
         # ── optional viz ───────────────────────────────────
-        if self.args.viz_every and (self.args.viz_every > 0) and (hasattr(self, 'step') and (self.step % self.args.viz_every == 0)):
+        if self.args.eval_interval and (self.args.eval_interval > 0) and (hasattr(self, 'step') and (self.step % self.args.eval_interval == 0)):
             with torch.no_grad():
                 s0 = spec[0].cpu()              # (F,T)
-                m0 = mask3[0].cpu()              # (F,T)
+                # for viz, reconstruct a (F,T) mask from token mask
+                m0 = torch.zeros(F_bins, T_bins, dtype=torch.bool)
+                for f in range(Fp):
+                    for t in range(Tp):
+                        if mask_tok[0, f*Tp + t]:
+                            f0, f1 = f*f_stride, (f+1)*f_stride
+                            t0, t1 = t*t_stride, (t+1)*t_stride
+                            m0[f0:f1, t0:t1] = True
                 p0 = pred[0].cpu()              # (T,D)
                 z0 = z[0].cpu()                 # (T,D)
             _viz_triptych(self.run_dir/'imgs', self.step, s0, m0, p0, z_tgt[0].cpu())
@@ -221,19 +235,20 @@ class Trainer:
                 z, _ = self.enc.inference_forward(s) if hasattr(self.enc,"inference_forward") \
                           else (self.enc(s), None)        # (B,T_tok,D)
 
-                # pool mask to encoder grid (8×64)
-                PF = getattr(self.enc[0].proj, "pool_F", 8)
-                PT = getattr(self.enc[0].proj, "pool_T", 64)
-                pooled2d = F.adaptive_max_pool2d(
-                               mask3.float().unsqueeze(1), (PF, PT))
-                mask_tok = pooled2d.flatten(2).squeeze(1).bool()
+                # pool mask to encoder grid (match stem output)
+                _, C, Fp, Tp = self.enc[0].stem(s).shape   # <- 8,16 here
+                k_f, k_t = F_bins // Fp, T_bins // Tp                # both ints
+                pooled = F.max_pool2d(mask3.float().unsqueeze(1),
+                                     kernel_size=(k_f, k_t),
+                                     stride=(k_f, k_t))
+                mask_tok = pooled.flatten(2).squeeze(1).bool()       # (B, Fp*Tp) == (B,128)
 
                 z_ctx = z.clone(); z_ctx[mask_tok] = 0
                 pred = self.pred(z_ctx)
                 tot += self.crit(pred[mask_tok], z[mask_tok]).item()*B
                 n   += B
 
-            if self.args.viz_every and (self._eval_counter % self.args.viz_every == 0):
+            if self.args.eval_interval and (self._eval_counter % self.args.eval_interval == 0):
                 _viz_triptych(self.run_dir/'imgs', self._eval_counter,
                               spec[0].cpu(), mask3[0].cpu(),
                               pred[0].cpu(), z[0].cpu())
@@ -259,7 +274,7 @@ class Trainer:
                 if step > 1:           # skip the misleading first tick
                     self.sched.step()
 
-            if step % self.args.log_every == 0:
+            if step % self.args.eval_interval == 0:
                 val_loss = self._eval()
 
                 # EMA
@@ -325,12 +340,12 @@ def _viz_triptych(run_dir, step, spec, mask, pred, target):
     spec_masked = spec_ds.clone()
     spec_masked[mask] = 0.0          # zero wherever mask == True (2‑D)
 
-    # ---------- token grid helpers -------------------------------
-    PF = getattr(pred, "pool_F", 8)
-    PT = getattr(pred, "pool_T", 64)
+    # ---------- infer token grid from pred shape ----------------------
+    PF = 8                                   # freq remains fixed
+    PT = pred.shape[0] // PF                 # time bins = tokens / 8
 
     # 1) error heat-map ------------------------------------------
-    err = (pred - target).abs().mean(-1).cpu().numpy()        # (512,)
+    err = (pred - target).abs().mean(-1).cpu().numpy()        # (tokens,)
     err_grid = err.reshape(PF, PT)
     err_img = tF.interpolate(torch.from_numpy(err_grid)[None,None],
                              size=spec_ds.shape, mode="nearest"
@@ -352,11 +367,13 @@ def _viz_triptych(run_dir, step, spec, mask, pred, target):
     # top row ------------------------------------------------------
     ax[0,0].imshow(spec, **kw);           ax[0,0].set_title("input")
     ax[0,1].imshow(spec_masked, **kw);    ax[0,1].set_title("masked")
-    ax[0,2].imshow(err_img,   **kw);      ax[0,2].set_title("|pred-ctx|")
+    ax[0,2].imshow(err_img, cmap='coolwarm', aspect='auto',
+                   origin='lower', vmin=0, vmax=err_img.max());
+    ax[0,2].set_title("error")
     # bottom row ---------------------------------------------------
     ax[1,0].imshow(spec_grid, **kw);      ax[1,0].set_title("grid")
-    ax[1,1].imshow(teach, cmap='viridis');ax[1,1].set_title("teacher |z|")
-    ax[1,2].imshow(stud,  cmap='viridis');ax[1,2].set_title("student |z|")
+    ax[1,1].imshow(stud.T,  cmap='viridis');ax[1,1].set_title("student |z|")
+    ax[1,2].imshow(teach.T, cmap='viridis');ax[1,2].set_title("teacher |z|")
 
     for a in ax.ravel(): a.axis('off')
     out = Path(run_dir) / f"viz_{step:07d}.png"
@@ -373,17 +390,16 @@ def main():
     p.add_argument('--steps',    type=int, default=300000)
     p.add_argument('--bs',       type=int, default=64)
     p.add_argument('--lr',       type=float, default=3e-4)
-    p.add_argument('--context_length', type=int, default=1000)
+    p.add_argument('--context_length', type=int, default=256)
     p.add_argument('--d_model',  type=int, default=192)
     p.add_argument('--attn_pattern', default='local50,global100,local50,global100')
     p.add_argument('--mask_ratio', type=float, default=0.4)
     p.add_argument('--n_mels', type=int, default=128,
                    help='input spectrogram height (mel bins)')
     # visualisation
-    p.add_argument('--viz_every', type=int, default=10,
-                  help=">0 ⇒ dump a triptych every N evals")
+    p.add_argument('--eval_interval', type=int, default=200,
+                  help="steps between val-loss / console log / viz dump")
     p.add_argument('--early_stop', type=int, default=30)
-    p.add_argument('--log_every',  type=int, default=200)
     args = p.parse_args()
 
     # rotate previous run

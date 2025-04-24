@@ -20,12 +20,12 @@ def parse_args():
     parser = argparse.ArgumentParser(
         description="randomly split .npz files into train and test folders (move by default)"
     )
-    parser.add_argument("src_dir",
+    parser.add_argument("--src_dir",
                         help="source directory containing .npz files")
-    parser.add_argument("train_dir",
+    parser.add_argument("--train_dir",
                         help="destination directory for training files")
-    parser.add_argument("test_dir",
-                        help="destination directory for testing files")
+    parser.add_argument("--val_dir",
+                        help="destination directory for validation files")
     parser.add_argument("--train_frac", "-f",
                         type=float,
                         default=0.8,
@@ -55,7 +55,7 @@ def main():
 
     # ensure destination dirs exist
     ensure_dir(args.train_dir)
-    ensure_dir(args.test_dir)
+    ensure_dir(args.val_dir)
 
     # collect .npz and .pt files
     all_files = [f for f in os.listdir(args.src_dir) if f.lower().endswith(".npz") or f.lower().endswith(".pt")]
@@ -67,7 +67,7 @@ def main():
     random.shuffle(all_files)
     n_train = int(len(all_files) * args.train_frac)
     train_files = all_files[:n_train]
-    test_files = all_files[n_train:]
+    val_files = all_files[n_train:]
 
     op = shutil.copy2 if args.copy else shutil.move
 
@@ -76,15 +76,15 @@ def main():
         src = os.path.join(args.src_dir, fname)
         dst = os.path.join(args.train_dir, fname)
         op(src, dst)
-    for fname in test_files:
+    for fname in val_files:
         src = os.path.join(args.src_dir, fname)
-        dst = os.path.join(args.test_dir, fname)
+        dst = os.path.join(args.val_dir, fname)
         op(src, dst)
 
     # summary
     action = "copied" if args.copy else "moved"
     print(f"{len(train_files)} files {action} to {args.train_dir}")
-    print(f"{len(test_files)} files {action} to {args.test_dir}")
+    print(f"{len(val_files)} files {action} to {args.val_dir}")
 
 if __name__ == "__main__":
     main()

@@ -68,17 +68,17 @@ def grad_norm(model: nn.Module) -> float:
 # │  classifier head                                                        │
 # ╰──────────────────────────────────────────────────────────────────────────╯
 class BetterHead(nn.Module):
-    def __init__(self, d_model, n_cls, hid=512):
+    def __init__(self,d,n_cls,hid=512):
         super().__init__()
+        self.w = nn.Linear(d,1,bias=False)           # scalar score
         self.mlp = nn.Sequential(
-            nn.LayerNorm(d_model),
-            nn.Linear(d_model, hid),
-            nn.GELU(),
-            nn.Dropout(0.3),
-            nn.Linear(hid, n_cls))
-    def forward(self, x):          # x (B,T,d)
-        x = x.mean(dim=1)          # simple average over time
-        return self.mlp(x)
+            nn.LayerNorm(d),
+            nn.Linear(d,hid),nn.GELU(),
+            nn.Dropout(0.3),nn.Linear(hid,n_cls))
+    def forward(self,x):                              # (B,T,d)
+        α = torch.softmax(self.w(x).squeeze(-1), dim=-1).unsqueeze(-1)
+        pooled = (α*x).sum(1)
+        return self.mlp(pooled)
 
 # ╭──────────────────────────────────────────────────────────────────────────╮
 # │  Net = frozen (or not) encoder + head                                    │
@@ -133,13 +133,13 @@ class Trainer:
         os.environ["TORCH_COMPILE_DISABLE"] = "1"
 
         # --- head-only warm-up ---
-        self.warmup_steps = 2000
+        self.warmup_steps = 100
         self.perma_frozen = args.freeze_encoder  # new switch
         self.enc_frozen = True
         for p in self.net.encoder.parameters():
             p.requires_grad = False
 
-        enc_lr  = 1e-4
+        enc_lr  = 3e-4
         head_lr = 3e-3
         self.opt = torch.optim.AdamW([
             {"params": self.net.encoder.parameters(), "lr": enc_lr, "weight_decay": 1e-2},
@@ -381,7 +381,7 @@ class Infer:
         self.log=Tee(Path(args.log_dir or args.output_dir)/"infer_log.txt")
 
     # ----------------------------------------------------------
-    def _segment(self,spec,seg=1000):
+    def _segment(self,spec,seg=256):
         if spec.shape[-1]%seg:
             spec=F.pad(spec,(0,seg-spec.shape[-1]%seg))
         return spec.unfold(-1,seg,seg).squeeze(0).permute(1,0,2)
@@ -405,10 +405,14 @@ class Infer:
         profile_path = None
         # drop explicit start; ORT starts auto‑profiling when enabled
         for i, (spec, _, fn) in enumerate(val_loader):
+            if i > 10:
+                break
+
+
             t0=time.time()
             try:
-                # ── hard‑trim to 60 s (12 000 frames) ────────────────
-                spec = spec[..., :12_000]          # if already shorter, noop
+                # ── hard‑trim to 60 s (256*12 frames) ────────────────
+                spec = spec[..., :self.args.context_length*12]          # if already shorter, noop
 
                 segs = self._segment(spec)         # now 1‑to‑12 chunks, never 13
                 probs = [self._predict(s) for s in segs]
@@ -465,10 +469,10 @@ def main():
     p.add_argument("--onnx_model_path")
     p.add_argument("--log_dir")
     p.add_argument("--submission_csv", default="submission.csv")
-    p.add_argument("--context_length",type=int,default=1000)
+    p.add_argument("--context_length",type=int,default=256)
     p.add_argument("--batch_size",type=int,default=320)
     p.add_argument("--learning_rate",type=float,default=5e-3)
-    p.add_argument("--max_steps",type=int,default=100000)
+    p.add_argument("--max_steps",type=int,default=3000)
     p.add_argument("--attn_pattern", default="local50,global100,local50,global100")
     p.add_argument("--eval_interval",type=int,default=100)
     p.add_argument("--save_interval",type=int,default=1000)

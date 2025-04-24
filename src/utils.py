@@ -114,11 +114,9 @@ class _StemSeq(nn.Module):
         super().__init__()
         self.stem, self.proj = stem, proj
     def forward(self, x):             # x (B,1,F,T)
-        z = self.stem(x)                              # (B,C,F',T')
-        PF, PT = getattr(self.proj, "pool_F", 8), getattr(self.proj, "pool_T", 64)
-        z = F.adaptive_avg_pool2d(z, (PF, PT))        # (B,C,PF,PT)
-        B, C, Fg, Tg = z.shape
-        z = z.permute(0,2,3,1).contiguous().view(B, Fg*Tg, C)  # (B,512,C)
+        z = self.stem(x)                              # (B,C,32,16)
+        B, C, Fp, Tp = z.shape
+        z = z.permute(0,2,3,1).reshape(B, Fp*Tp, C)   # (B,512,C)
         return self.proj(z)
 
 def load_pretrained_encoder(cfg: BJConfig, ckpt_path: str | None):

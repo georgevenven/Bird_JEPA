@@ -252,7 +252,7 @@ def cli() -> None:
     p.add_argument("--format", choices=["pt","npz"], default="pt",
                    help="output format (default: pt, fp16)")
 
-    p.add_argument("--step_size", type=int, default=160,
+    p.add_argument("--step_size", type=int, default=625,
                    help="STFT hop length (samples at 32 kHz).")
     p.add_argument("--nfft",      type=int, default=1024,
                    help="FFT size.")
