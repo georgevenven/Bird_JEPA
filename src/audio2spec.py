@@ -79,6 +79,7 @@ class WavToSpec:
         fmt: str = "pt",
         mel: bool = True,
         n_mels: int = 128,
+        json_path: str | None = None,
     ) -> None:
         self.src_dir = Path(src_dir) if src_dir is not None else None
         self.dst_dir = Path(dst_dir)
@@ -101,6 +102,37 @@ class WavToSpec:
         self.skipped = mgr.Value("i", 0)  # share across workers, manager-backed
 
         self.audio_files = self._gather_files()
+
+        # Build label map if json_path is provided
+        if json_path is not None:
+            self.lab_map = {}
+            p = Path(json_path)
+            json_files = [p] if p.is_file() else list(p.glob("*.json"))
+
+            for jfp in json_files:
+                text = jfp.read_text()
+                # Allow [ {...}, {...} ]    OR    {"filename": ...}    OR   NDJSON
+                to_parse = text.strip()
+                items = []
+                if to_parse.startswith('['):                       # big list
+                    items = json.loads(to_parse)
+                elif to_parse.startswith('{'):                     # single object
+                    items = [json.loads(to_parse)]
+                else:                                              # NDJSON
+                    items = [json.loads(line) for line in to_parse.splitlines() if line.strip()]
+
+                for jo in items:
+                    fname = jo["filename"]
+                    hop_ms = 1e3 * self.step / self.sr
+                    tmp = []
+                    for lab, spans in jo.get("syllable_labels", {}).items():
+                        for on, off in spans:
+                            tb_on  = int(round(on  * 1e3 / hop_ms))
+                            tb_off = int(round(off * 1e3 / hop_ms))
+                            tmp.append((int(lab), tb_on, tb_off))
+                    self.lab_map[Path(fname).stem] = tmp            # key on *stem*
+        else:
+            self.lab_map = {}
 
     def __getstate__(self):
         st = self.__dict__.copy()
@@ -221,6 +253,8 @@ class WavToSpec:
             return
 
         labels = np.zeros(S.shape[1], dtype=np.int32)
+        for lab, tb_on, tb_off in self.lab_map.get(fp.stem, []):
+            labels[tb_on:tb_off] = lab
 
         if self.fmt == "pt":
             import torch
@@ -269,6 +303,8 @@ def cli() -> None:
                          help="Output linear‑frequency STFT bins.")
     p.add_argument("--n_mels", type=int, default=128,
                    help="Number of mel bands (default: 128)")
+    p.add_argument("--json_path", type=str, default=None,
+                   help="Directory containing label JSON files (optional)")
     args = p.parse_args()
 
     single = args.single_threaded.lower() in {"true", "1", "yes"}
@@ -284,6 +320,7 @@ def cli() -> None:
         fmt=args.format,
         mel=not args.linear,
         n_mels=args.n_mels,
+        json_path=args.json_path,
     )
     converter.run()
 

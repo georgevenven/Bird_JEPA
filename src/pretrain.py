@@ -150,7 +150,7 @@ class Trainer:
         # get token grid dims from encoder stem
         with torch.no_grad():
             dummy = torch.zeros(1, 1, F_bins, T_bins, device=spec.device)
-            _, C, Fp, Tp = self.enc[0].stem(dummy).shape
+            _, C, Fp, Tp = self.enc.stem(dummy).shape
         mask_tok = self._rect_mask(Fp, Tp, self.args.mask_ratio, device=spec.device).flatten()  # (Fp*Tp,)
         mask_tok = mask_tok.unsqueeze(0).repeat(B,1)                                            # (B, Fp*Tp)
 
@@ -182,7 +182,7 @@ class Trainer:
 
             # -------- student prediction ----------------------------------
             z_ctx = z.clone(); z_ctx[mask_tok] = 0
-            pred = self.pred(z_ctx)
+            pred = self.pred(z_ctx, (Fp, Tp))
             loss = self.crit(pred[mask_tok], z_tgt[mask_tok])
 
         self.opt.zero_grad()
@@ -236,7 +236,7 @@ class Trainer:
                           else (self.enc(s), None)        # (B,T_tok,D)
 
                 # pool mask to encoder grid (match stem output)
-                _, C, Fp, Tp = self.enc[0].stem(s).shape   # <- 8,16 here
+                _, C, Fp, Tp = self.enc.stem(s).shape   # <- 8,16 here
                 k_f, k_t = F_bins // Fp, T_bins // Tp                # both ints
                 pooled = F.max_pool2d(mask3.float().unsqueeze(1),
                                      kernel_size=(k_f, k_t),
@@ -244,7 +244,7 @@ class Trainer:
                 mask_tok = pooled.flatten(2).squeeze(1).bool()       # (B, Fp*Tp) == (B,128)
 
                 z_ctx = z.clone(); z_ctx[mask_tok] = 0
-                pred = self.pred(z_ctx)
+                pred = self.pred(z_ctx, (Fp, Tp))
                 tot += self.crit(pred[mask_tok], z[mask_tok]).item()*B
                 n   += B
 
