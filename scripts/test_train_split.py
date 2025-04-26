@@ -57,8 +57,12 @@ def main():
     ensure_dir(args.train_dir)
     ensure_dir(args.val_dir)
 
-    # collect .npz and .pt files
-    all_files = [f for f in os.listdir(args.src_dir) if f.lower().endswith(".npz") or f.lower().endswith(".pt")]
+    # collect .npz and .pt files recursively
+    all_files = []
+    for root, _, files in os.walk(args.src_dir):
+        for f in files:
+            if f.lower().endswith(".npz") or f.lower().endswith(".pt"):
+                all_files.append(os.path.relpath(os.path.join(root, f), args.src_dir))
     if not all_files:
         print("no .npz or .pt files found in source directory.", file=sys.stderr)
         sys.exit(1)
@@ -72,13 +76,15 @@ def main():
     op = shutil.copy2 if args.copy else shutil.move
 
     # perform operation
-    for fname in train_files:
-        src = os.path.join(args.src_dir, fname)
-        dst = os.path.join(args.train_dir, fname)
+    for rel_path in train_files:
+        src = os.path.join(args.src_dir, rel_path)
+        dst = os.path.join(args.train_dir, rel_path)
+        ensure_dir(os.path.dirname(dst))
         op(src, dst)
-    for fname in val_files:
-        src = os.path.join(args.src_dir, fname)
-        dst = os.path.join(args.val_dir, fname)
+    for rel_path in val_files:
+        src = os.path.join(args.src_dir, rel_path)
+        dst = os.path.join(args.val_dir, rel_path)
+        ensure_dir(os.path.dirname(dst))
         op(src, dst)
 
     # summary

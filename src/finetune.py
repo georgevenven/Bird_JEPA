@@ -185,7 +185,7 @@ class Trainer:
         for p in self.net.encoder.parameters():
             p.requires_grad = True  # never freeze
 
-        enc_lr  = 5e-3  # √10 lower
+        enc_lr  = 1e-4  # √10 lower
         head_lr = 1e-3  # keep
         self.opt = torch.optim.AdamW([
             {"params": self.net.encoder.parameters(), "lr": enc_lr, "weight_decay": 1e-2},

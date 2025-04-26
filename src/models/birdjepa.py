@@ -20,7 +20,7 @@ class BJConfig:
     # four convs:  F halved on first two,  T halved on *all* four
     conv_ch:  list[int] = field(default_factory=lambda: [32, 32, 32, 32])
     conv_k:   list[int] = field(default_factory=lambda: [5, 3, 3, 3])
-    conv_str: list[tuple]=field(default_factory=lambda: [(2,2), (2,2), (2,1), (2,1)])
+    conv_str: list[tuple]=field(default_factory=lambda: [(2,1), (2,1), (2,1), (2,1)])
 
     # encoder
     layers: int = 8
