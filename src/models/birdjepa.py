@@ -2,7 +2,7 @@
 # full rewrite – stem collapses freq, encoder pattern string builds
 # local / global sparse‑aware blocks.  < 300 LoC
 
-import math, torch, torch.nn as nn
+import math, torch, torch.nn as nn, warnings, copy
 import torch.nn.functional as F
 from dataclasses import dataclass, field
 from .rope import rope, rope_2d
@@ -18,7 +18,7 @@ class BJConfig:
     # stem
     n_mels:  int       = 128
     # four convs:  F halved on first two,  T halved on *all* four
-    conv_ch:  list[int] = field(default_factory=lambda: [32, 32, 32, 32])
+    conv_ch:  list[int] = field(default_factory=lambda: [32, 64, 128, 256])
     conv_k:   list[int] = field(default_factory=lambda: [5, 3, 3, 3])
     conv_str: list[tuple]=field(default_factory=lambda: [(2,1), (2,1), (2,1), (2,1)])
 
@@ -30,8 +30,7 @@ class BJConfig:
     pattern: str = None
 
     # predictor (unused here)
-    pred_dim: int = 96
-    pred_layers:int=1
+    pred_layers:int=4
 
     # ---------- self‑sup. masking -------------------------------------
     mask_t:      int   = 1000   # training segment length (time frames)
@@ -115,12 +114,15 @@ class BirdJEPA(nn.Module):
         self.cfg = cfg
 
         # ----- conv stem: (B,1,F,T) -> (B,C,F',T') ------------------------
-        self.stem = nn.Sequential(
-            *[nn.Conv2d(in_ch, out_ch, k, stride=s, padding=k//2)
-              for in_ch, out_ch, k, s in zip(
-                    [1]+cfg.conv_ch[:-1], cfg.conv_ch,
-                    cfg.conv_k,           cfg.conv_str)]
-        )
+        stem_layers = []
+        current_channels = 1
+        for out_ch, k, s in zip(cfg.conv_ch, cfg.conv_k, cfg.conv_str):
+            conv = nn.Conv2d(current_channels, out_ch, k, stride=s, padding=k//2)
+            norm = nn.BatchNorm2d(out_ch)
+            act = nn.GELU()
+            stem_layers.extend([conv, norm, act])
+            current_channels = out_ch
+        self.stem = nn.Sequential(*stem_layers)
 
         # ----- figure out flattened dim dynamically -----------------------
         with torch.no_grad():
@@ -152,23 +154,102 @@ class BirdJEPA(nn.Module):
 #  Predictor
 # ──────────────────────────────────────
 class Predictor(nn.Module):
+    # DEPRECATED - Replaced by DecoderPredictor to align with I-JEPA paper
     """
     shallow MLP g(·) with rotary PE baked in.
     optionally consumes the boolean time‑mask so you can
     condition on "which tokens were hidden" later.
     """
     def __init__(self, d_model: int):
+        warnings.warn("MLP Predictor is deprecated; use DecoderPredictor.", DeprecationWarning)
         super().__init__()
         self.norm = nn.LayerNorm(d_model)
         self.mlp  = nn.Sequential(
             nn.Linear(d_model, 2 * d_model),
             nn.GELU(),
-            nn.Linear(2 * d_model, d_model)
+            nn.Linear(2 * d_model, d_model),
         )
 
     def forward(self, x, grid_shape, mask: torch.Tensor | None = None):
         # x : (B, T, d)
-        x = rope_2d(self.norm(x), grid_shape)
-        if mask is not None:
-            x = x.masked_fill(~mask.unsqueeze(-1), 0.0)
+        x = self.norm(x)
         return self.mlp(x)
+
+class DecoderPredictor(nn.Module):
+    """
+    Predicts target representations using context and learnable mask tokens,
+    inspired by I-JEPA paper and Transformer decoders.
+    """
+    def __init__(self, d_model: int, n_heads: int, num_decoder_layers: int = 2, ff_mult: int = 4, dropout: float = 0.1):
+        super().__init__()
+        self.d_model = d_model
+        self.num_decoder_layers = num_decoder_layers
+
+        # Learnable query token for masked positions
+        self.mask_token = nn.Parameter(torch.randn(1, 1, d_model))
+
+        # Positional encoding will be added externally (via RoPE in the blocks)
+
+        # Transformer Decoder Layers
+        decoder_layer = nn.TransformerDecoderLayer(
+            d_model=d_model, nhead=n_heads, dim_feedforward=d_model * ff_mult,
+            dropout=dropout, activation=F.gelu, batch_first=True, norm_first=True # Use norm_first like ViT
+        )
+        self.decoder_layers = nn.ModuleList([copy.deepcopy(decoder_layer) for _ in range(num_decoder_layers)])
+
+        # Final normalization
+        self.norm_out = nn.LayerNorm(d_model)
+
+    def forward(self, context_sequence, target_mask, grid_shape):
+        """
+        student_tokens : z_s  (B, T_all, D)
+        target_mask    : bool (B, T_all)  — True where token was masked
+        returns        : pred for **masked** tokens, shape (total_masked, D)
+        """
+        B, T_all, D = context_sequence.shape
+        device = context_sequence.device
+
+        # ----- positional embeddings ---------------------------------
+        pos_all = rope_2d(torch.zeros_like(context_sequence), grid_shape)
+
+        # ----- split into visible / masked ---------------------------
+        vis_mask   = ~target_mask                       # (B, T_all)
+        # gather visible tokens for memory
+        memory     = context_sequence[vis_mask].view(B, -1, D)  # ragged → padded next
+        mem_pos    = pos_all[vis_mask].view(B, -1, D)
+
+        # gather indices of masked tokens to know positional encodings
+        num_masked = target_mask.sum(-1).max().item()
+        if num_masked == 0:
+            return context_sequence.new_zeros(0, D)     # nothing to predict
+
+        # build query tensor (pad with mask_token placeholders)
+        q_content  = self.mask_token.expand(B, num_masked, -1).clone()
+        q_pos      = context_sequence.new_zeros(B, num_masked, D)
+        for b in range(B):
+            idx = torch.nonzero(target_mask[b]).squeeze(-1)
+            q_pos[b, :idx.numel()] = pos_all[b, idx]
+
+        queries = q_content + q_pos
+
+        # ----- key-padding masks so dec layer ignores pads ------------
+        mem_pad = torch.arange(memory.size(1), device=device)[None, :] >= \
+                  vis_mask.sum(-1, keepdim=True)        # (B, mem_len)
+        q_pad   = torch.arange(num_masked,  device=device)[None, :] >= \
+                  target_mask.sum(-1, keepdim=True)     # (B, q_len)
+
+        # ----- decoder forward ---------------------------------------
+        tgt = queries
+        mem = memory + mem_pos         # add pos to memory too
+        for layer in self.decoder_layers:
+            tgt = layer(tgt, mem,
+                        tgt_key_padding_mask=q_pad,
+                        memory_key_padding_mask=mem_pad)
+
+        out = self.norm_out(tgt)        # (B, q_len, D)
+        # collect predictions only for real masked slots
+        out_flat = []
+        for b in range(B):
+            k = target_mask[b].sum()
+            out_flat.append(out[b, :k])          # slice real part
+        return torch.cat(out_flat, dim=0)        # (total_masked, D)

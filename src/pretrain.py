@@ -9,8 +9,9 @@ import matplotlib.pyplot as plt
 import torch.multiprocessing
 import torch.nn.functional as tF        # avoid name clash
 import random, copy
+import warnings # For eval shape mismatch warning
 
-from models          import BJConfig, Predictor
+from models          import BJConfig, Predictor, DecoderPredictor
 from utils           import load_pretrained_encoder
 from data.bird_datasets import TorchSpecDataset
 from sklearn.metrics import roc_auc_score          # future‑proof (unused now)
@@ -33,6 +34,17 @@ def grad_norm(model: nn.Module)->float:
             g2+=p.grad.float().norm()**2
     return math.sqrt(g2)
 
+@torch.no_grad()
+def param_norm(model: nn.Module) -> float:
+    """Computes the overall L2 norm of all parameters in a model."""
+    # Ensure calculations happen on the correct device
+    # Use the device of the first parameter; assumes all params are on the same device
+    device = next(model.parameters()).device
+    total_norm_sq = torch.tensor(0.0, device=device)
+    for p in model.parameters():
+            total_norm_sq += p.norm(2).pow(2)
+    return total_norm_sq.sqrt().item()
+
 # ---------------------------------------------------------------
 AMP = torch.cuda.is_available()
 if AMP:
@@ -51,39 +63,45 @@ class Trainer:
         self.ds  = TorchSpecDataset(args.train_dir, segment_len=args.context_length)
         self.val = TorchSpecDataset(args.val_dir  or args.train_dir,
                                     segment_len=args.context_length,
-                                    infinite=False)
+                                    infinite=True)
         self.train_dl = torch.utils.data.DataLoader(self.ds,  batch_size=args.bs,
                                                     shuffle=True,  num_workers=4,
                                                     pin_memory=True,  drop_last=True)
         self.val_dl   = torch.utils.data.DataLoader(self.val, batch_size=args.bs,
-                                                    shuffle=False, num_workers=0)
+                                                    shuffle=True, num_workers=4)
 
         # ── model  (encoder + predictor) ────────────────────────
-        cfg   = BJConfig(d_model=args.d_model, n_mels=args.n_mels,
+        self.cfg = BJConfig(d_model=args.d_model, n_mels=args.n_mels,
                          pattern=args.attn_pattern)
-        self.enc = load_pretrained_encoder(cfg, None)          # start from scratch
-        self.pred = Predictor(cfg.d_model)
+        if not hasattr(self.cfg, 'pred_layers'):
+            self.cfg.pred_layers = 4
+
+        self.enc = load_pretrained_encoder(self.cfg, None)          # start from scratch
+        self.pred = DecoderPredictor(self.cfg.d_model, self.cfg.n_heads, self.cfg.pred_layers, self.cfg.ff_mult)
         self.dev = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+
         self.enc.to(self.dev); self.pred.to(self.dev)
 
         # belt-and-suspenders: always provide inference_forward
         if not hasattr(self.enc, "inference_forward"):
             self.enc.inference_forward = lambda x: (self.enc(x), None)
 
-        # ── opt / sched ───────────────────────────────────────
-        self.warmup_steps = 2000
-        self.enc_frozen   = True
-        for p in self.enc.parameters():
-            p.requires_grad = False
+        # cache token grid dims and strides for fast masking
+        with torch.no_grad():
+            d = torch.zeros(1,1,self.cfg.n_mels,args.context_length, device=self.dev)
+            _,_,self.Fp,self.Tp = self.enc.stem(d).shape
+        self.f_stride = self.cfg.n_mels        // self.Fp
+        self.t_stride = args.context_length // self.Tp
 
-        enc_lr  = args.lr
-        pred_lr = args.lr * 3
+        # ── opt / sched ───────────────────────────────────────
+        enc_lr  = 1e-4  # lower encoder learning rate
+        pred_lr = 3e-4 # lower predictor learning rate
         self.opt = torch.optim.AdamW(
-            [{"params": self.enc.parameters(),  "lr": enc_lr,  "weight_decay":1e-2},
-             {"params": self.pred.parameters(), "lr": pred_lr, "weight_decay":5e-3}]
+            [{"params": self.enc.parameters(),  "lr": enc_lr,  "weight_decay": 0.0},
+             {"params": self.pred.parameters(), "lr": pred_lr, "weight_decay": 0.0}]
         )
         self.sched = torch.optim.lr_scheduler.CosineAnnealingLR(
-                        self.opt, T_max=max(1,args.steps-self.warmup_steps),
+                        self.opt, T_max=max(1,args.steps),
                         eta_min=1e-5)
         self.scaler = torch.cuda.amp.GradScaler(enabled=AMP)
         self.crit   = nn.MSELoss()
@@ -108,9 +126,34 @@ class Trainer:
         # ── EMA teacher (frozen) ───────────────────────────────
         self.teacher = copy.deepcopy(self.enc).eval()
         for p in self.teacher.parameters(): p.requires_grad = False
-        self.mu_base   = 0.995
-        self.mu_final  = 1.0
-        self.mu_ramp   = 30_000            # linear ramp steps
+        self.mu_base   = 0.95
+        self.mu_final  = 0.999
+        self.mu_ramp   = 50000
+
+        # --- Attach pre-loss normalization components to the predictor module ---
+        self.pred.pre_loss_ln = nn.LayerNorm(self.cfg.d_model, elementwise_affine=False).to(self.dev)
+        # no running-mean centering this time – just the LN is enough
+
+        # -------- resume logic ------------------------------------
+        if args.resume:
+            ckpts = sorted((self.run_dir/'weights').glob('step_*.pt'))
+            # Initialize step to 0 in case no checkpoints are found
+            self.step = 0
+            if ckpts:
+                last = ckpts[-1]
+                print(f'[resume] loading {last}')
+                pay  = torch.load(last, map_location='cpu')
+                self.enc.load_state_dict(pay['enc'])
+                self.pred.load_state_dict(pay['pred'])
+                self.best_val   = pay.get('val_ema', self.best_val)
+                # restore teacher from encoder weights
+                self.teacher.load_state_dict(self.enc.state_dict())
+                # recover step counter so lr-sched keeps in sync
+                self.step = int(last.stem.split('_')[-1])
+                for _ in range(self.step):        # fast-fwd scheduler
+                    self.sched.step()
+                print(f'[resume] starting from step {self.step}')
+                self._warm_resumed = True          # flag
 
     # -----------------------------------------------------------------
     # ──────────────────────────────────────────────────────────────
@@ -154,24 +197,20 @@ class Trainer:
         mask_tok = self._rect_mask(Fp, Tp, self.args.mask_ratio, device=spec.device).flatten()  # (Fp*Tp,)
         mask_tok = mask_tok.unsqueeze(0).repeat(B,1)                                            # (B, Fp*Tp)
 
-        # ------- zero entire patches in spec BEFORE the stem ----------
-        spec_masked = spec.clone()
-        f_stride = F_bins // Fp
-        t_stride = T_bins // Tp
-        for f in range(Fp):
-            for t in range(Tp):
-                if mask_tok[0, f*Tp + t]:
-                    f0, f1 = f*f_stride, (f+1)*f_stride
-                    t0, t1 = t*t_stride, (t+1)*t_stride
-                    spec_masked[:, f0:f1, t0:t1] = 0.0
+        # vectorized, gpu-native masking (no copies, no python triple-loop)
+        pix_mask = torch.kron(
+            mask_tok.view(B,Fp,Tp).float(),
+            torch.ones((self.f_stride, self.t_stride), device=spec.device)
+        ).bool()                                            # (B,F_bins,T_bins)
+        spec_masked = spec.masked_fill(pix_mask, 0.)
 
         with torch.cuda.amp.autocast(enabled=AMP):
             spec_masked = spec_masked.unsqueeze(1)
             if hasattr(self.enc, "inference_forward"):
-                z, _ = self.enc.inference_forward(spec_masked)
+                z_student_masked_input, _ = self.enc.inference_forward(spec_masked)
             else:
-                z = self.enc(spec_masked)
-            B, T_tok, D = z.shape
+                z_student_masked_input = self.enc(spec_masked)
+            B, T_tok, D = z_student_masked_input.shape
 
             # -------- teacher targets (full spec, no masking) ------------
             with torch.no_grad():
@@ -181,9 +220,22 @@ class Trainer:
                            else self.teacher(full)
 
             # -------- student prediction ----------------------------------
-            z_ctx = z.clone(); z_ctx[mask_tok] = 0
-            pred = self.pred(z_ctx, (Fp, Tp))
-            loss = self.crit(pred[mask_tok], z_tgt[mask_tok])
+            pred_masked_all = self.pred(z_student_masked_input, mask_tok, (Fp, Tp))  # (ΣM_i, D)
+            sizes      = mask_tok.sum(1).tolist()            # list of M_i per sample
+            pred_chunks= pred_masked_all.split(sizes, dim=0)
+            pred_masked_0 = pred_chunks[0]                   # (M_0, D)
+            token_mask_0  = mask_tok[0].cpu()
+
+            # ----- LN-before-loss ----------------------------------------
+            loss = self.crit(
+                self.pred.pre_loss_ln(pred_masked_all),
+                self.pred.pre_loss_ln(z_tgt[mask_tok])
+            )
+
+            # variance diagnostics
+            var_pred    = pred_masked_all.var(dim=0).mean()
+            var_teacher = z_tgt[mask_tok].var(dim=0).mean()
+            var_student = z_student_masked_input.var(dim=0).mean()
 
         self.opt.zero_grad()
         self.scaler.scale(loss).backward()
@@ -200,65 +252,95 @@ class Trainer:
             for pt, ps in zip(self.teacher.parameters(), self.enc.parameters()):
                 pt.mul_(mu).add_(ps.data, alpha=1-mu)
 
-        # ── optional viz ───────────────────────────────────
-        if self.args.eval_interval and (self.args.eval_interval > 0) and (hasattr(self, 'step') and (self.step % self.args.eval_interval == 0)):
+        # ── optional viz (moved from _eval) ───────────────────────────────────
+        if self.step % self.args.eval_interval == 0 and B > 0: # Ensure batch size > 0
             with torch.no_grad():
-                s0 = spec[0].cpu()              # (F,T)
-                # for viz, reconstruct a (F,T) mask from token mask
-                m0 = torch.zeros(F_bins, T_bins, dtype=torch.bool)
+                # Reconstruct the pixel-level mask for the first item for visualization
+                # This reflects the masking applied *before* the encoder's stem
+                mask_viz_single = torch.zeros(F_bins, T_bins, dtype=torch.bool, device=spec.device)
+                f_stride = F_bins // Fp
+                t_stride = T_bins // Tp
                 for f in range(Fp):
                     for t in range(Tp):
-                        if mask_tok[0, f*Tp + t]:
+                        if mask_tok[0, f*Tp + t]: # Use the first item's token mask
                             f0, f1 = f*f_stride, (f+1)*f_stride
                             t0, t1 = t*t_stride, (t+1)*t_stride
-                            m0[f0:f1, t0:t1] = True
-                p0 = pred[0].cpu()              # (T,D)
-                z0 = z[0].cpu()                 # (T,D)
-            _viz_triptych(self.run_dir/'imgs', self.step, s0, m0, p0, z_tgt[0].cpu())
-        return float(loss.item()), mask_tok
+                            mask_viz_single[f0:f1, t0:t1] = True
+
+                # Call visualization function
+                # Pass the student's actual output (from masked input) for visualization
+                _viz_triptych(
+                    self.run_dir/'imgs', f"step_{self.step:07d}",
+                    spec[0].cpu(),
+                    mask_viz_single.cpu(),
+                    pred_masked_0.cpu(),          # ← only sample-0 preds
+                    token_mask_0, (Fp, Tp),
+                    z_tgt[0].cpu(),
+                    z_student_masked_input[0].cpu()
+                )
+
+        # Return training loss and the token mask (mask_tok might be useful elsewhere)
+        return float(loss.item()), mask_tok, (
+            var_student.item(),
+            var_teacher.item(),
+            var_pred.item())
 
     # -----------------------------------------------------------------
     @torch.no_grad()
     def _eval(self):
         self.enc.eval(); self.pred.eval()
-        tot = 0.0; n = 0
-        for spec, *_ in self.val_dl:
-            spec = spec.to(self.dev)                       # (B,F,T)
+        with torch.no_grad():
+            spec, *_ = next(iter(self.val_dl))   # just ONE batch
+            spec = spec.to(self.dev)
             B,F_bins,T_bins = spec.shape
+            if B == 0: return 0.0 # Handle empty batch case
 
-            base = self._rect_mask(F_bins, T_bins, self.args.mask_ratio,
-                                   device=spec.device)    # (F,T)
-            mask3 = base.unsqueeze(0).repeat(B,1,1)        # (B,F,T)
+            # --- Generate mask (similar logic to _step for consistency) ---
+            # Get token grid dims
+            # Need to do this on device
+            dummy = torch.zeros(1, 1, F_bins, T_bins, device=self.dev)
+            _, C, Fp, Tp = self.enc.stem(dummy).shape
+            # Generate token mask
+            mask_tok = self._rect_mask(Fp, Tp, self.args.mask_ratio, device=spec.device).flatten()
+            mask_tok = mask_tok.unsqueeze(0).repeat(B,1) # (B, Fp*Tp)
+
+            # vectorized, gpu-native masking (no copies, no python triple-loop)
+            pix_mask = torch.kron(
+                mask_tok.view(B,Fp,Tp).float(),
+                torch.ones((self.f_stride, self.t_stride), device=spec.device)
+            ).bool()                                            # (B,F_bins,T_bins)
+            spec_masked = spec.masked_fill(pix_mask, 0.)
 
             with torch.cuda.amp.autocast(enabled=AMP):
-                s = spec.unsqueeze(1)
-                z, _ = self.enc.inference_forward(s) if hasattr(self.enc,"inference_forward") \
-                          else (self.enc(s), None)        # (B,T_tok,D)
+                spec_masked_unsqueezed = spec_masked.unsqueeze(1)
+                z_student_masked_input = self.enc(spec_masked_unsqueezed) # Student on masked input
+                full = spec.unsqueeze(1)
+                z_tgt = self.teacher(full) # Teacher on unmasked input
+                pred_masked = self.pred(z_student_masked_input, mask_tok, (Fp, Tp))  # already flat
+                tgt_masked  = z_tgt[mask_tok]                                        # flat too
 
-                # pool mask to encoder grid (match stem output)
-                _, C, Fp, Tp = self.enc.stem(s).shape   # <- 8,16 here
-                k_f, k_t = F_bins // Fp, T_bins // Tp                # both ints
-                pooled = F.max_pool2d(mask3.float().unsqueeze(1),
-                                     kernel_size=(k_f, k_t),
-                                     stride=(k_f, k_t))
-                mask_tok = pooled.flatten(2).squeeze(1).bool()       # (B, Fp*Tp) == (B,128)
+                # Handle potential edge case where masking results in zero tokens selected in a small batch
+                if pred_masked.shape[0] == 0 or tgt_masked.shape[0] == 0:
+                    warnings.warn(f"Skipping eval batch due to zero masked tokens. Pred shape: {pred_masked.shape}, Target shape: {tgt_masked.shape}")
+                    return 0.0 # Or np.nan, or some indicator of no loss computed
+                assert pred_masked.shape == tgt_masked.shape, f"Shape mismatch in eval: Pred {pred_masked.shape}, Target {tgt_masked.shape}"
+                assert pred_masked.shape[1] == self.cfg.d_model, "Dimension mismatch in eval pred"
+                assert tgt_masked.shape[1] == self.cfg.d_model, "Dimension mismatch in eval target"
 
-                z_ctx = z.clone(); z_ctx[mask_tok] = 0
-                pred = self.pred(z_ctx, (Fp, Tp))
-                tot += self.crit(pred[mask_tok], z[mask_tok]).item()*B
-                n   += B
+                # the same LN path as train (no EMA update)
+                pred_norm = self.pred.pre_loss_ln(pred_masked)
+                tgt_norm  = self.pred.pre_loss_ln(tgt_masked)
+                loss      = self.crit(pred_norm, tgt_norm).item()
+                with torch.no_grad():
+                    cos = F.cosine_similarity(pred_masked, tgt_masked, dim=-1)
+                    mean_cos = cos.mean().item()
 
-            if self.args.eval_interval and (self._eval_counter % self.args.eval_interval == 0):
-                _viz_triptych(self.run_dir/'imgs', self._eval_counter,
-                              spec[0].cpu(), mask3[0].cpu(),
-                              pred[0].cpu(), z[0].cpu())
-            self._eval_counter += 1
         self.enc.train(); self.pred.train()
-        return tot/n
+        return loss, mean_cos
 
     # -----------------------------------------------------------------
     def train(self):
-        dl_iter = iter(self.train_dl); step = 0
+        dl_iter = iter(self.train_dl); step = getattr(self, 'step', 0)   # maybe restored
         first_step = True
         while step < self.args.steps:
             try:       spec, *_ = next(dl_iter)
@@ -267,15 +349,17 @@ class Trainer:
 
             step += 1
             self.step = step
-            tr_loss, m_tok = self._step(spec)
+            tr_loss, m_tok, (v_s, v_t, v_p) = self._step(spec)
             if first_step:
                 first_step = False            # scheduler already advanced in _step()
             else:
-                if step > 1:           # skip the misleading first tick
+                if hasattr(self, '_warm_resumed') and self._warm_resumed:
+                    self._warm_resumed = False     # skip sched.step() this very first loop
+                elif step > 1:           # skip the misleading first tick
                     self.sched.step()
 
             if step % self.args.eval_interval == 0:
-                val_loss = self._eval()
+                val_loss, val_cos = self._eval()           # still compute it
 
                 # EMA
                 self.train_ema = tr_loss if self.train_ema is None else \
@@ -283,34 +367,38 @@ class Trainer:
                 self.val_ema   = val_loss if self.val_ema is None else \
                                  self.alpha*val_loss + (1-self.alpha)*self.val_ema
 
-                gnorm = grad_norm(self.enc)+grad_norm(self.pred)
+                gnorm = grad_norm(self.enc) + grad_norm(self.pred)
                 lrs   = " ".join(f"lr{i}:{pg['lr']:.2e}"
                                  for i,pg in enumerate(self.opt.param_groups))
-                self.log(f"step {step:07d} | train {self.train_ema:.4f} "
-                         f"| val {self.val_ema:.4f} | gnorm {gnorm:.3e} | {lrs}")
 
+                diag  = (f" | var_s {v_s:.3e}"
+                         f" var_t {v_t:.3e}"
+                         f" var_p {v_p:.3e}")
+
+                msg = (f"step {step:07d} | train_raw {tr_loss:.4f} | val_raw {val_loss:.4f} "
+                       f"| train_ema {self.train_ema:.4f} | val_ema {self.val_ema:.4f}"
+                       f"{diag} | gnorm {gnorm:.2e} | {lrs} | mean_cos {val_cos:.3f}")
+                self.log(msg)
+
+                # Track history
                 self.hist['step'].append(step)
-                self.hist['train'].append(self.train_ema)
-                self.hist['val'].append(self.val_ema)
-                self.hist['grad'].append(gnorm)
+                self.hist['train'].append(tr_loss)
+                self.hist['val'].append(val_loss)
 
-                if self.val_ema < self.best_val - 1e-4:
+                ckpt_path = self.run_dir/'weights'/f'step_{step:07d}.pt'
+                payload = {'enc': self.enc.state_dict(),
+                           'pred': self.pred.state_dict(),
+                           'val_ema': self.val_ema}
+                torch.save(payload, ckpt_path)                     # always keep per-step
+
+                if self.val_ema < self.best_val - 1e-4:            # overwrite best
                     self.best_val = self.val_ema; self.bad_evals = 0
-                    torch.save({'enc': self.enc.state_dict(),
-                                'pred': self.pred.state_dict()},
-                               self.run_dir/'weights/best.pt')
+                    torch.save(payload, self.run_dir/'weights'/'best.pt')
                 else:
                     self.bad_evals += 1
                 if self.bad_evals >= self.args.early_stop:
                     print("early stop")
                     break
-
-            # ---- staged unfreeze -------------------------------
-            if self.enc_frozen and step >= self.warmup_steps:
-                for p in self.enc.parameters():
-                    p.requires_grad = True
-                self.enc_frozen = False
-                self.log(f"step {step}: encoder unfrozen")
 
         # plots ---------------------------------------------------
         df = pd.DataFrame(self.hist); df.to_csv(self.run_dir/'metrics.csv', index=False)
@@ -319,65 +407,92 @@ class Trainer:
         plt.tight_layout(); plt.savefig(self.run_dir/'loss_curve.png', dpi=150)
 
 # ───────────────────────────── viz util ──────────────────────────────
-def _viz_triptych(run_dir, step, spec, mask, pred, target):
+# global cache for a 3-vector PCA basis
+_PCA_BASIS = None   # will hold a (D,3) tensor on first call
+def _viz_triptych(run_dir, step,
+                  spec, pix_mask,
+                  pred_masked, token_mask, grid_shape,
+                  target, stud):
     """
-    spec  : (1,F,T)  float32 cpu
-    mask  : (F,T)   bool
-    pred  : (T,D)    torch
-    target: (T,D)    torch
+    spec         : (F,T)         cpu
+    pix_mask     : (F,T) bool    pixel-level for first row
+    pred_masked  : (M,D)         masked-token preds  (M = token_mask.sum())
+    token_mask   : (T_all,) bool flat token mask
+    grid_shape   : (PF,PT)
+    target, stud : (T_all,D)
     """
-    import matplotlib.pyplot as plt, numpy as np
-    spec = spec.squeeze(0)                  # (F,T_full)
+    import matplotlib.pyplot as plt, torch.nn.functional as tF, numpy as np, torch
+
+    PF, PT = grid_shape
     F_bins, T_full = spec.shape
-    # align spec's time axis to mask length  ---------------------------
-    if T_full != mask.shape[1]:
-        spec_ds = tF.interpolate(spec.unsqueeze(0).unsqueeze(0),
-                                 size=mask.shape[1], mode="nearest"
-                                 ).squeeze(0).squeeze(0)          # (F,T′)
+    device = pred_masked.device
+
+    # ---------- build full-grid tensors ---------------------------------
+    D = target.shape[-1]
+    pred_full  = torch.zeros(PF*PT, D, device=device)       # zeros = black
+    err_full   = torch.zeros(PF*PT,     device=device)
+
+    masked_idx = torch.nonzero(token_mask, as_tuple=False).squeeze(-1)
+    pred_full[masked_idx] = pred_masked                      # scatter
+    err_full[masked_idx]  = (pred_masked -
+                             target[masked_idx]).pow(2).mean(-1)
+
+    pred_full  = pred_full.view(PF, PT, D)
+    err_full   = err_full.view(PF, PT)
+
+    # -------- PCA->RGB with shared basis -------------------------------------
+    def _pca_img_shared(z, fit=False):
+        # z : (T,D) torch cpu
+        global _PCA_BASIS
+        x = z.float().view(PF*PT, -1)          # (tokens,D)
+
+        # STEP 1 – fit basis once on teacher (now: only on masked rows)
+        if fit or _PCA_BASIS is None:
+            # Only use masked rows for PCA fit
+            masked_rows = torch.nonzero(token_mask, as_tuple=False).squeeze(-1)
+            x_masked = x[masked_rows]
+            mu = x_masked.mean(0, keepdims=True)
+            _, _, vh = torch.linalg.svd((x_masked - mu), full_matrices=False)
+            _PCA_BASIS = vh[:3].T              # (D,3)
+
+        # STEP 2 – project any x onto cached basis
+        mu = x.mean(0, keepdims=True)
+        y = (x - mu) @ _PCA_BASIS             # (tokens,3)
+        pc = y.view(PF, PT, 3)
+        pc -= pc.amin(dim=(0,1), keepdim=True)
+        pc /= pc.amax(dim=(0,1), keepdim=True) + 1e-6
+        return pc
+
+    teach_img = _pca_img_shared(target, fit=True)     # fit basis
+    stud_img  = _pca_img_shared(stud)                 # project
+    pred_img  = _pca_img_shared(pred_full)            # project
+
+    # ---------- prep spectrogram panels ---------------------------------
+    if T_full != pix_mask.shape[1]:
+        spec_ds = tF.interpolate(spec[None,None], size=pix_mask.shape[1],
+                                 mode="nearest").squeeze()
     else:
         spec_ds = spec
+    spec_masked = spec_ds.clone(); spec_masked[pix_mask] = 0.0
 
-    spec_masked = spec_ds.clone()
-    spec_masked[mask] = 0.0          # zero wherever mask == True (2‑D)
+    # ---------- plot ----------------------------------------------------
+    fig, ax = plt.subplots(2,3, figsize=(12,4), dpi=120)
+    kw  = dict(aspect='auto', origin='lower', cmap='magma')
+    kw2 = dict(aspect='auto', origin='lower', interpolation='nearest')
 
-    # ---------- infer token grid from pred shape ----------------------
-    PF = 8                                   # freq remains fixed
-    PT = pred.shape[0] // PF                 # time bins = tokens / 8
+    ax[0,0].imshow(spec,       **kw);  ax[0,0].set_title('input')
+    ax[0,1].imshow(spec_masked,**kw);  ax[0,1].set_title('masked')
+    ax[0,2].imshow(err_full.cpu(), cmap='coolwarm', **kw2); ax[0,2].set_title('MSE')
 
-    # 1) error heat-map ------------------------------------------
-    err = (pred - target).abs().mean(-1).cpu().numpy()        # (tokens,)
-    err_grid = err.reshape(PF, PT)
-    err_img = tF.interpolate(torch.from_numpy(err_grid)[None,None],
-                             size=spec_ds.shape, mode="nearest"
-               ).squeeze().numpy()
-
-    # 2) teacher / student token norms ---------------------------
-    teach = target.norm(dim=-1).cpu().numpy().reshape(PF,PT)
-    stud  =  pred .norm(dim=-1).cpu().numpy().reshape(PF,PT)
-    teach = (teach - teach.min()) / (teach.ptp()+1e-6)
-    stud  = (stud  - stud .min()) / (stud .ptp()+1e-6)
-
-    # 3) grid-downsampled input ----------------------------------
-    spec_grid = tF.adaptive_avg_pool2d(
-                    spec_ds.unsqueeze(0).unsqueeze(0), (PF,PT)
-                ).squeeze().numpy()
-
-    fig,ax = plt.subplots(2,3,figsize=(9,6),dpi=120)
-    kw = dict(aspect='auto',origin='lower',cmap='magma')
-    # top row ------------------------------------------------------
-    ax[0,0].imshow(spec, **kw);           ax[0,0].set_title("input")
-    ax[0,1].imshow(spec_masked, **kw);    ax[0,1].set_title("masked")
-    ax[0,2].imshow(err_img, cmap='coolwarm', aspect='auto',
-                   origin='lower', vmin=0, vmax=err_img.max());
-    ax[0,2].set_title("error")
-    # bottom row ---------------------------------------------------
-    ax[1,0].imshow(spec_grid, **kw);      ax[1,0].set_title("grid")
-    ax[1,1].imshow(stud.T,  cmap='viridis');ax[1,1].set_title("student |z|")
-    ax[1,2].imshow(teach.T, cmap='viridis');ax[1,2].set_title("teacher |z|")
+    ax[1,0].imshow(teach_img, **kw2); ax[1,0].set_title('teacher')
+    ax[1,1].imshow(stud_img,  **kw2); ax[1,1].set_title('student')
+    ax[1,2].imshow(pred_img,  **kw2); ax[1,2].set_title('pred')
 
     for a in ax.ravel(): a.axis('off')
-    out = Path(run_dir) / f"viz_{step:07d}.png"
-    fig.tight_layout(); fig.savefig(out); plt.close(fig)
+    fig.tight_layout()
+    Path(run_dir).mkdir(parents=True, exist_ok=True)
+    fig.savefig(Path(run_dir)/f"viz_{step}.png")
+    plt.close(fig)
 
 # ╭───────────────────────────────────────────────────────────────╮
 # │ CLI                                                          │
@@ -400,14 +515,18 @@ def main():
     p.add_argument('--eval_interval', type=int, default=200,
                   help="steps between val-loss / console log / viz dump")
     p.add_argument('--early_stop', type=int, default=30)
+    p.add_argument('--resume', action='store_true',
+                   help='continue training from runs/<run_dir> if it already exists')
     args = p.parse_args()
 
     # rotate previous run
     rd = Path(args.run_dir)
-    if rd.exists():
+    if rd.exists() and not args.resume:
         stamp = dt.datetime.now().strftime('%Y%m%d_%H%M%S')+'_'+uuid.uuid4().hex[:6]
         shutil.move(rd, Path('runs/archive')/f'{rd.name}_{stamp}')
-    rd.mkdir(parents=True, exist_ok=True)
+        rd.mkdir(parents=True, exist_ok=True)
+    elif not rd.exists():
+        rd.mkdir(parents=True, exist_ok=True)
 
     Trainer(args).train()
 

@@ -103,12 +103,38 @@ class BirdSpectrogramDataset(Dataset):
             else:
                 labels = labels_t
 
+            spec = spec[:, :-1]
+            if labels.shape[0] > spec.shape[1]:  # align labels length
+                labels = labels[:spec.shape[1]]
+            elif labels.shape[0] < spec.shape[1]:
+                pad = np.zeros(spec.shape[1], dtype=labels.dtype)
+                pad[:labels.shape[0]] = labels
+                labels = pad
+
+            # Apply per-instance normalization before segmentation
+            spec = spec.astype(np.float64)  # Use float64 for calculation stability
+            spec = (spec - spec.mean()) / (spec.std() + 1e-8)
+            spec = spec.astype(np.float32)  # Convert back after calculation
+
             # ── slice random segment for training ─────────────────────────
             if self.segment_len is not None:                 # training mode
                 spec, labels = self._pull_segment(spec, labels)
 
             fname = Path(path).name
-            return spec, labels, fname
+            # Check the numpy array 'spec' after all processing (including normalization)
+            if np.isnan(spec).any() or np.isinf(spec).any():
+                print(f"!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!")
+                print(f"ERROR: NaN or Inf detected in segment from file: {fname}")
+                print(f"!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!")
+                raise ValueError(f"NaN/Inf in data: {fname}")
+            # Convert to tensors if valid
+            spec_tensor = torch.from_numpy(spec).float()
+            label_tensor = torch.from_numpy(labels).long()
+            # Optional: Double-check tensors
+            if torch.isnan(spec_tensor).any() or torch.isinf(spec_tensor).any():
+                print(f"ERROR: NaN/Inf detected in TENSOR from file: {fname}")
+                raise ValueError(f"NaN/Inf in tensor: {fname}")
+            return spec_tensor, label_tensor, fname
         else:  # .npz
             try:
                 npz = load_np(path)
@@ -131,15 +157,28 @@ class BirdSpectrogramDataset(Dataset):
             pad[: labels.shape[0]] = labels
             labels = pad
 
+        # Apply per-instance normalization before segmentation
+        spec = spec.astype(np.float64)  # Use float64 for calculation stability
+        spec = (spec - spec.mean()) / (spec.std() + 1e-8)
+        spec = spec.astype(np.float32)  # Convert back after calculation
+
         seg, seg_lab = self._pull_segment(spec, labels)
 
-        # global z‑score
-        seg = (seg - seg.mean()) / (seg.std() + 1e-8)
-
         fname = Path(path).name        # robust whether path is str or Path
-        return (torch.from_numpy(seg).float(),
-                torch.from_numpy(seg_lab).long(),
-                fname)
+        # Check the numpy array 'seg' after all processing (including normalization)
+        if np.isnan(seg).any() or np.isinf(seg).any():
+            print(f"!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!")
+            print(f"ERROR: NaN or Inf detected in segment from file: {fname}")
+            print(f"!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!")
+            raise ValueError(f"NaN/Inf in data: {fname}")
+        # Convert to tensors if valid
+        spec_tensor = torch.from_numpy(seg).float()
+        label_tensor = torch.from_numpy(seg_lab).long()
+        # Optional: Double-check tensors
+        if torch.isnan(spec_tensor).any() or torch.isinf(spec_tensor).any():
+            print(f"ERROR: NaN/Inf detected in TENSOR from file: {fname}")
+            raise ValueError(f"NaN/Inf in tensor: {fname}")
+        return spec_tensor, label_tensor, fname
 
     def label_idx(self, npz_name: str):
         """
