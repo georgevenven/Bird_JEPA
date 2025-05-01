@@ -1,5 +1,5 @@
 # ──────────────────────────────────────────────────────────────────────────────
-# src/pretrain.py   
+# src/pretrain.py      • MAE training with Pixel Reconstruction (Block Mask, No Internal Norm)
 # ──────────────────────────────────────────────────────────────────────────────
 import argparse, json, time, os, shutil, uuid, datetime as dt, math
 from pathlib import Path
@@ -48,9 +48,14 @@ def param_norm(model: nn.Module) -> float:
 
 # --- Utility for converting token mask to pixel mask ---
 def token_mask_to_pixel_mask(mask_tok, Fp, Tp, f_stride, t_stride):
-    if mask_tok.ndim == 1:
+    """
+    Converts a token mask (B, Fp*Tp) or (Fp*Tp) to a pixel mask.
+    If input is (Fp*Tp), it expands to (1, F_bins, T_bins) first.
+    Outputs (B, F_bins, T_bins).
+    """
+    if mask_tok.ndim == 1: # Single mask for the batch
         B = 1
-        mask_tok = mask_tok.unsqueeze(0)
+        mask_tok = mask_tok.unsqueeze(0) # Add batch dim
     else:
         B = mask_tok.shape[0]
 
@@ -58,15 +63,17 @@ def token_mask_to_pixel_mask(mask_tok, Fp, Tp, f_stride, t_stride):
     T_bins = Tp * t_stride
     device = mask_tok.device
 
+    # Reshape token mask to grid
     mask_tok_grid = mask_tok.view(B, Fp, Tp)
 
-    # Repeat vertically (frequency)
-    pixel_mask_freq_repeated = mask_tok_grid.repeat_interleave(f_stride, dim=1)
-    # Shape: (B, Fp * f_stride, Tp) == (B, F_bins, Tp)
+    # Create patch template (used for kronecker product)
+    patch_template = torch.ones((f_stride, t_stride), device=device, dtype=torch.bool)
 
-    # Repeat horizontally (time)
-    pixel_mask = pixel_mask_freq_repeated.repeat_interleave(t_stride, dim=2)
-    # Shape: (B, F_bins, Tp * t_stride) == (B, F_bins, T_bins)
+    # Use broadcasting and repeat for efficiency
+    mask_tok_expanded = mask_tok_grid.unsqueeze(2).unsqueeze(4) # (B, Fp, 1, Tp, 1)
+    patch_template_expanded = patch_template.unsqueeze(0).unsqueeze(1).unsqueeze(3) # (1, 1, f_stride, 1, t_stride)
+    pixel_mask_expanded = mask_tok_expanded & patch_template_expanded # (B, Fp, f_stride, Tp, t_stride)
+    pixel_mask = pixel_mask_expanded.view(B, Fp, Tp, f_stride, t_stride).permute(0, 1, 3, 2, 4).reshape(B, F_bins, T_bins)
 
     return pixel_mask
 
@@ -206,23 +213,72 @@ class Trainer:
 
     # -----------------------------------------------------------------
     # ──────────────────────────────────────────────────────────────
-    #  rectangle mask generation (remains the same) - Generates ONE mask
+    #  Block Mask Generation - Generates ONE mask for the batch
     # ──────────────────────────────────────────────────────────────
     def _generate_batch_mask(self, F_tokens, T_tokens, mask_ratio=.30, device="cpu"):
-        """ Generates a single random mask for the whole batch """
-        num_tokens = F_tokens * T_tokens
-        num_masked = int(mask_ratio * num_tokens)
+        """
+        Generates a single block mask for the whole batch using iterative
+        rectangle placement until the target mask ratio is reached.
+        Operates on the token grid (F_tokens, T_tokens).
+        Returns a flat boolean mask (F_tokens * T_tokens,) where True means masked.
+        """
+        target_masked_tokens = int(mask_ratio * F_tokens * T_tokens)
+        masked_count = 0
+        # Initialize mask grid (F_tokens, T_tokens)
+        mask_grid = torch.zeros(F_tokens, T_tokens, dtype=torch.bool, device=device)
 
-        # Generate random indices to mask ONCE
-        indices = torch.randperm(num_tokens, device=device)
-        masked_indices = indices[:num_masked]
+        # Add minimum/maximum block size constraints if desired
+        min_h, max_h = self.args.min_mask_h, self.args.max_mask_h
+        min_w, max_w = self.args.min_mask_w, self.args.max_mask_w
 
-        # Create boolean mask (True where masked)
-        mask = torch.zeros(num_tokens, dtype=torch.bool, device=device)
-        mask[masked_indices] = True
-        # Keep it flat (Fp*Tp,)
+        attempts = 0 # Safety break
+        max_attempts = F_tokens * T_tokens * 2 # Heuristic limit
 
-        return mask
+        while masked_count < target_masked_tokens and attempts < max_attempts:
+            attempts += 1
+            # Determine block size (height h, width w)
+            # Ensure max size doesn't exceed grid dimensions
+            h = random.randint(min_h, min(F_tokens, max_h))
+            w = random.randint(min_w, min(T_tokens, max_w))
+
+            # Determine top-left corner (f0, t0)
+            f0 = random.randint(0, F_tokens - h)
+            t0 = random.randint(0, T_tokens - w)
+
+            # Check how many *new* tokens this block would mask
+            current_block_mask = torch.zeros_like(mask_grid)
+            current_block_mask[f0 : f0 + h, t0 : t0 + w] = True
+            newly_masked = torch.logical_and(current_block_mask, ~mask_grid) # Find tokens that are True in block but False in main mask
+            num_newly_masked = newly_masked.sum().item()
+
+            # Calculate how many more tokens we *need*
+            needed = target_masked_tokens - masked_count
+
+            # Only apply the block if it adds new tokens and doesn't overshoot the target too much
+            # (or if we are far from the target and need to add something)
+            # Allow slight overshoot by accepting if num_newly_masked is not drastically larger than needed
+            if num_newly_masked > 0 and (num_newly_masked <= needed * 1.5 or masked_count < target_masked_tokens * 0.8):
+                 # Apply the mask: set the block region to True
+                 mask_grid[f0 : f0 + h, t0 : t0 + w] = True
+                 # Recalculate the total masked count accurately
+                 masked_count = mask_grid.sum().item()
+
+        # If overshoot happened, randomly unmask some tokens to reach the target
+        if masked_count > target_masked_tokens:
+             excess = masked_count - target_masked_tokens
+             # Get indices of currently masked tokens
+             masked_indices = torch.nonzero(mask_grid.flatten()).squeeze()
+             # Randomly select 'excess' indices to unmask
+             unmask_indices = masked_indices[torch.randperm(masked_indices.numel(), device=device)[:excess]]
+             # Flatten mask, unmask selected indices, reshape back
+             mask_flat = mask_grid.flatten()
+             mask_flat[unmask_indices] = False
+             # mask_grid = mask_flat.view(F_tokens, T_tokens) # Reshape if needed later
+             return mask_flat # Return the final flat mask
+
+        # Return the flat mask (True where masked)
+        return mask_grid.flatten()
+
 
     # -----------------------------------------------------------------
     def _step(self, spec_batch, is_train=True):
@@ -234,38 +290,36 @@ class Trainer:
         # Add channel dimension: (B, 1, F, T) - Use original spec_batch
         spec_input = spec_batch.unsqueeze(1)
 
-        # --- Generate ONE Token Mask for the Batch ---
+        # --- Generate ONE Token Mask (Block Strategy) for the Batch ---
         Fp, Tp = self.Fp, self.Tp
         num_tokens = Fp * Tp
-        # Generate a single mask (Fp*Tp,)
+        # Generate a single block mask (Fp*Tp,)
         single_mask_tok_flat = self._generate_batch_mask(Fp, Tp, self.args.mask_ratio, device=self.dev)
         # Repeat the same mask for all items in the batch
         mask_tok = single_mask_tok_flat.unsqueeze(0).expand(B, -1) # (B, Fp*Tp)
 
         # --- Calculate indices based on the single mask ---
         # These are now the same for every item in the batch conceptually
-        num_masked = single_mask_tok_flat.sum().item()
-        num_visible = num_tokens - num_masked
-        ids_shuffle = torch.argsort(torch.rand(num_tokens, device=self.dev)) # Need a consistent shuffle order
-        ids_keep = ids_shuffle[:num_visible]    # Indices of visible tokens (same for all batch items)
-        # ids_restore = torch.argsort(ids_shuffle) # Not directly needed if using boolean mask
+        masked_indices = torch.nonzero(single_mask_tok_flat).squeeze() # Indices of masked tokens (1D)
+        visible_indices = torch.nonzero(~single_mask_tok_flat).squeeze() # Indices of visible tokens (1D)
+        num_masked = masked_indices.numel()
+        num_visible = visible_indices.numel()
 
-        # --- Create Input with Masked Areas Zeroed Out ---
-        # Convert token mask (B, Fp*Tp) to pixel mask (B, F_bins, T_bins)
-        pixel_mask = token_mask_to_pixel_mask(mask_tok, self.Fp, self.Tp, self.f_stride, self.t_stride) # (B, F_bins, T_bins)
-        # Clone original input and apply pixel mask (zeroing out)
-        masked_spec_input = spec_input.clone()
-        masked_spec_input[pixel_mask.unsqueeze(1)] = 0.0 # Use unsqueezed mask for channel dim
+        # Ensure indices are tensors even if only one element
+        if num_masked == 1: masked_indices = masked_indices.unsqueeze(0)
+        if num_visible == 1: visible_indices = visible_indices.unsqueeze(0)
 
         # --- MAE Encoder Forward Pass (Only Visible Tokens) ---
+        # This requires modifying the encoder or simulating it.
+        # Simulation: Encode all, then select visible based on indices.
         with torch.cuda.amp.autocast(enabled=AMP):
-            # Encoder receives input where masked patches are zeroed
-            encoded_all, _, _ = self.enc(masked_spec_input) # (B, Fp*Tp, D_enc)
+            encoded_all, _, _ = self.enc(spec_input) # (B, Fp*Tp, D_enc)
             D_enc = encoded_all.shape[-1]
 
             # Select only VISIBLE encoded tokens using indices
-            ids_keep_batch = ids_keep.unsqueeze(0).expand(B, -1) # (B, num_visible)
-            encoded_vis = torch.gather(encoded_all, dim=1, index=ids_keep_batch.unsqueeze(-1).expand(-1, -1, D_enc))
+            # Expand visible_indices for batch gathering
+            visible_indices_batch = visible_indices.unsqueeze(0).expand(B, -1) # (B, num_visible)
+            encoded_vis = torch.gather(encoded_all, dim=1, index=visible_indices_batch.unsqueeze(-1).expand(-1, -1, D_enc))
             # encoded_vis shape: (B, num_visible, D_enc)
 
             # -------- Decoder predicts masked pixels --------------------
@@ -273,19 +327,17 @@ class Trainer:
             pred_pixels_flat = self.dec(encoded_vis, mask_tok, (Fp, Tp))
             # pred_pixels_flat shape: (B * num_masked, num_pixels_per_patch)
 
-            # -------- Get target PIXELS for masked tokens (from ORIGINAL spec) -------------
+            # -------- Get target PIXELS for masked tokens -------------
             # Extract patches from the original (dataloader-normalized) spec_input
             spec_patches = spec_input.unfold(2, self.f_stride, self.f_stride).unfold(3, self.t_stride, self.t_stride)
-            # spec_patches shape: (B, 1, Fp, Tp, f_stride, t_stride)
             spec_patches = spec_patches.permute(0, 2, 3, 1, 4, 5).reshape(B, Fp * Tp, -1)
-            # spec_patches shape: (B, Fp*Tp, num_pixels_per_patch)
-
             # Select the target patches using the boolean mask `mask_tok`
             target_pixels_flat = spec_patches[mask_tok]
             # target_pixels_flat shape: (B * num_masked, num_pixels_per_patch)
 
             # -------- Loss calculation ------------------------------------
-            loss = self.crit(pred_pixels_flat, target_pixels_flat)
+            # Ensure float32 for loss calculation stability
+            loss = self.crit(pred_pixels_flat.float(), target_pixels_flat.float())
 
         # --- Backpropagation ---
         gnorm_total = 0.0 # Initialize gradient norm
@@ -295,82 +347,27 @@ class Trainer:
             self.scaler.unscale_(self.opt)
             grad_norm_enc = torch.nn.utils.clip_grad_norm_(self.enc.parameters(), self.args.clip_grad)
             grad_norm_dec = torch.nn.utils.clip_grad_norm_(self.dec.parameters(), self.args.clip_grad)
-            gnorm_total = float(grad_norm_enc + grad_norm_dec)
+            gnorm_total = float(grad_norm_enc + grad_norm_dec) # Or use torch.norm if needed
             self.scaler.step(self.opt)
-            # Avoid race condition? Wait for step to finish before updating scaler
-            # self.opt.synchronize() # Uncomment if using DDP FSDP? Check docs.
             self.scaler.update()
 
-        return float(loss.item()), gnorm_total # Removed viz_data return
-
-    # -----------------------------------------------------------------
-    @torch.no_grad()
-    def _eval(self):
-        """ Evaluate the model on the validation set """
-        self.enc.eval()
-        self.dec.eval()
-        avg_loss = float('inf') # Default value
-        viz_data = None         # Initialize viz_data for validation
-        start_time = time.time() # DEBUG TIMING
-
-        try:
-            spec_batch, *_ = next(iter(self.val_dl))   # just ONE batch
-            spec_batch = spec_batch.to(self.dev) # Move to GPU
-            B, F_bins, T_bins = spec_batch.shape
-            spec_input = spec_batch.unsqueeze(1) # Add channel dim
-
-            if B == 0:
-                 print("--- Eval Warning: Validation batch is empty. ---")
-                 return float('inf'), None # Return None for viz_data
-
-            # This is where the autocast context starts
-            with torch.cuda.amp.autocast(enabled=AMP):
-                # --- Generate Mask (same logic as _step) ---
-                Fp, Tp = self.Fp, self.Tp
-                num_tokens = Fp * Tp
-                single_mask_tok_flat = self._generate_batch_mask(Fp, Tp, self.args.mask_ratio, device=self.dev)
-                mask_tok = single_mask_tok_flat.unsqueeze(0).expand(B, -1)
-                num_masked = single_mask_tok_flat.sum().item()
-                num_visible = num_tokens - num_masked
-                ids_shuffle = torch.argsort(torch.rand(num_tokens, device=self.dev))
-                ids_keep = ids_shuffle[:num_visible]
-                ids_keep_batch = ids_keep.unsqueeze(0).expand(B, -1)
-
-                # --- Encoder Forward ---
-                encoded_all, _, _ = self.enc(spec_input.to(torch.half)) # Cast input here
-                D_enc = encoded_all.shape[-1]
-
-                # --- Select Visible Tokens ---
-                encoded_vis = torch.gather(encoded_all, dim=1, index=ids_keep_batch.unsqueeze(-1).expand(-1, -1, D_enc))
-
-                # --- Decoder Forward ---
-                pred_pixels_flat = self.dec(encoded_vis, mask_tok, (Fp, Tp))
-
-                # --- Target Extraction ---
-                spec_patches = spec_input.unfold(2, self.f_stride, self.f_stride).unfold(3, self.t_stride, self.t_stride)
-                spec_patches = spec_patches.permute(0, 2, 3, 1, 4, 5).reshape(B, Fp * Tp, -1)
-                target_pixels_flat = spec_patches[mask_tok]
-
-                # --- Loss Calculation ---
-                # Ensure prediction and target are float32 for stable loss calculation
-                loss = self.crit(pred_pixels_flat.float(), target_pixels_flat.float())
-                avg_loss = loss.item()
-
-                # --- Visualization Data Prep (from validation batch) ---
-                if B > 0: # Prepare visualization data if batch is not empty
+        # --- Visualization Data Prep ---
+        viz_data = None
+        # Prepare viz data less frequently if needed, e.g., self.step % (self.args.eval_interval * 5) == 0
+        if not is_train or (self.step % self.args.eval_interval == 0):
+            if B > 0 and num_masked > 0: # Ensure there's something to visualize
+                 with torch.no_grad():
                     # Use the first sample and the common mask for visualization
                     spec_orig_0 = spec_batch[0].cpu() # Original spec for sample 0
                     mask_tok_0 = mask_tok[0].cpu()    # Token mask for sample 0 (same as others)
 
                     # Reshape predictions and targets for the first sample
-                    # Predictions are ordered B*M, so take the first M predictions
                     pred_pixels_sample0 = pred_pixels_flat[:num_masked].detach().cpu()
-                    # Targets are also ordered B*M
                     target_pixels_sample0 = target_pixels_flat[:num_masked].detach().cpu()
 
                     viz_data = {
                         "spec_orig": spec_orig_0,
-                        "spec_norm": spec_orig_0, # Pass original again
+                        "spec_norm": spec_orig_0, # Pass original again for 'normalized' slot
                         "mask_tok": mask_tok_0,
                         "pred_pixels_flat": pred_pixels_sample0,
                         "target_pixels_flat": target_pixels_sample0,
@@ -378,23 +375,81 @@ class Trainer:
                         "patch_shape": (self.f_stride, self.t_stride)
                     }
 
+        return float(loss.item()), gnorm_total, viz_data
+
+    # -----------------------------------------------------------------
+    @torch.no_grad()
+    def _eval(self):
+        """ Evaluate the model on the validation set (single batch) """
+        self.enc.eval()
+        self.dec.eval()
+        avg_loss = float('inf') # Default value
+        start_time = time.time()
+
+        try:
+            spec_batch, *_ = next(iter(self.val_dl))   # Get ONE batch
+            spec_batch = spec_batch.to(self.dev)
+            B, F_bins, T_bins = spec_batch.shape
+            spec_input = spec_batch.unsqueeze(1)
+
+            if B == 0:
+                 print("--- Eval Warning: Validation batch is empty. ---")
+                 return float('inf')
+
+            # --- Generate ONE Mask for the Batch ---
+            Fp, Tp = self.Fp, self.Tp
+            num_tokens = Fp * Tp
+            single_mask_tok_flat = self._generate_batch_mask(Fp, Tp, self.args.mask_ratio, device=self.dev)
+            mask_tok = single_mask_tok_flat.unsqueeze(0).expand(B, -1)
+            masked_indices = torch.nonzero(single_mask_tok_flat).squeeze()
+            visible_indices = torch.nonzero(~single_mask_tok_flat).squeeze()
+            num_masked = masked_indices.numel()
+            num_visible = visible_indices.numel()
+            if num_masked == 1: masked_indices = masked_indices.unsqueeze(0)
+            if num_visible == 1: visible_indices = visible_indices.unsqueeze(0)
+
+            # --- Forward Pass ---
+            with torch.cuda.amp.autocast(enabled=AMP):
+                encoded_all, _, _ = self.enc(spec_input.to(torch.half)) # Cast input
+                D_enc = encoded_all.shape[-1]
+
+                visible_indices_batch = visible_indices.unsqueeze(0).expand(B, -1)
+                encoded_vis = torch.gather(encoded_all, dim=1, index=visible_indices_batch.unsqueeze(-1).expand(-1, -1, D_enc))
+
+                pred_pixels_flat = self.dec(encoded_vis, mask_tok, (Fp, Tp))
+
+                spec_patches = spec_input.unfold(2, self.f_stride, self.f_stride).unfold(3, self.t_stride, self.t_stride)
+                spec_patches = spec_patches.permute(0, 2, 3, 1, 4, 5).reshape(B, Fp * Tp, -1)
+                target_pixels_flat = spec_patches[mask_tok]
+
+                # --- Loss ---
+                if num_masked > 0: # Avoid loss calculation if nothing was masked
+                    loss = self.crit(pred_pixels_flat.float(), target_pixels_flat.float())
+                    avg_loss = loss.item()
+                else:
+                    avg_loss = 0.0 # No loss if no tokens were masked
+                    print("--- Eval Warning: No tokens were masked in validation batch. ---")
+
+
         except StopIteration:
-            print("--- Eval Warning: Validation DataLoader is empty. ---") # DEBUG
-            avg_loss = float('inf') # Or handle as appropriate
+            print("--- Eval Warning: Validation DataLoader is empty. ---")
+            avg_loss = float('inf')
         except Exception as e:
-             print(f"--- Eval Error: An exception occurred during validation: {e} ---") # DEBUG
+             print(f"--- Eval Error: An exception occurred during validation: {e} ---")
              import traceback
              traceback.print_exc()
-             avg_loss = float('inf') # Indicate error
+             avg_loss = float('inf')
 
         eval_time = time.time() - start_time
-        print(f"Validation (1 batch) finished in {eval_time:.2f}s")
+        print(f"Validation (1 batch) finished in {eval_time:.2f}s, Loss: {avg_loss:.4f}")
 
         self.enc.train() # Set back to train mode
         self.dec.train()
-        return avg_loss, viz_data # Return loss AND visualization data
+        return avg_loss
 
     # -----------------------------------------------------------------
+    # --- train() method remains largely the same ---
+    # --- (ensure LR schedule, logging, checkpointing, plotting are correct) ---
     def train(self):
         """ Main training loop """
         start_time = time.time()
@@ -402,13 +457,12 @@ class Trainer:
         dl_iter = iter(self.train_dl) # Initialize iterator outside loop
 
         while self.step < self.args.steps:
-            # --- Warmup Phase ---
+            # --- Warmup Phase & LR Scheduling ---
             if self.step < self.args.warmup_steps:
                  lr_scale = min(1.0, float(self.step + 1) / self.args.warmup_steps)
                  current_lr_target = self.args.lr * lr_scale
-            # --- Post-Warmup / Cosine Decay Phase ---
             else:
-                 # Calculate cosine decay progress
+                 # Cosine decay phase
                  progress = float(self.step - self.args.warmup_steps) / float(max(1, self.args.steps - self.args.warmup_steps))
                  current_lr_target = self.args.lr_min + 0.5 * (self.args.lr - self.args.lr_min) * (1 + math.cos(math.pi * progress))
 
@@ -426,22 +480,22 @@ class Trainer:
 
             # --- Training Step ---
             self.step += 1
-            train_loss, gnorm_total = self._step(spec_batch, is_train=True) # No longer returns viz_data
+            train_loss, gnorm_total, viz_data = self._step(spec_batch, is_train=True)
 
             # --- Logging & Evaluation ---
-            if self.step % self.args.eval_interval == 0 or self.step == self.args.steps: # Log/Eval on interval or last step
-                val_loss, val_viz_data = self._eval()
+            if self.step % self.args.eval_interval == 0 or self.step == self.args.steps:
+                val_loss = self._eval() # Evaluate on a single batch
 
                 # EMA Loss Calculation
                 if self.train_loss_ema is None:
                     self.train_loss_ema = train_loss
-                    self.val_loss_ema = val_loss if not math.isnan(val_loss) else train_loss # Handle potential initial NaN val_loss
+                    self.val_loss_ema = val_loss if not math.isinf(val_loss) else train_loss # Handle potential initial Inf val_loss
                 else:
                     self.train_loss_ema = self.alpha * train_loss + (1 - self.alpha) * self.train_loss_ema
-                    if not math.isnan(val_loss):
+                    if not math.isinf(val_loss):
                          self.val_loss_ema = self.alpha * val_loss + (1 - self.alpha) * self.val_loss_ema
 
-                current_lr = self.opt.param_groups[0]['lr'] # Get actual LR after potential warmup/decay
+                current_lr = self.opt.param_groups[0]['lr']
                 self.hist['step'].append(self.step)
                 self.hist['train_loss'].append(train_loss)
                 self.hist['val_loss'].append(val_loss)
@@ -455,18 +509,17 @@ class Trainer:
 
                 msg = (f"step {self.step:07d}/{self.args.steps} | "
                        f"train_loss {train_loss:.4f} (ema {self.train_loss_ema:.4f}) | "
-                       # Use try-except for val_loss formatting in case it's NaN/inf
-                       f"val_loss {'%.4f'%val_loss if isinstance(val_loss, float) and not math.isnan(val_loss) and not math.isinf(val_loss) else str(val_loss)} (ema {'%.4f'%self.val_loss_ema if self.val_loss_ema is not None else 'N/A'}) | "
+                       f"val_loss {val_loss:.4f} (ema {self.val_loss_ema:.4f}) | "
                        f"lr {current_lr:.2e} | gnorm {gnorm_total:.2e} | "
-                       f"{steps_per_sec:.1f} steps/s | eta {eta_str}")
+                       f"{steps_per_sec:.2f} steps/s | eta {eta_str}")
                 self.log(msg)
 
                 # --- Visualization ---
-                if val_viz_data: # Use visualization data from the validation step
+                if viz_data:
                     _viz_triptych(
                         self.run_dir/'imgs', f"step_{self.step:07d}",
-                        viz_data=val_viz_data # Pass the validation data
-                    ) # Consider renaming viz file to 'viz_val_...' if needed
+                        viz_data=viz_data
+                    )
 
                 # --- Checkpointing ---
                 is_best = val_loss < self.best_val_loss
@@ -484,18 +537,16 @@ class Trainer:
                     'enc': self.enc.state_dict(),
                     'dec': self.dec.state_dict(),
                     'opt': self.opt.state_dict(),
-                    'sched': self.sched.state_dict(), # Save scheduler state
+                    'sched': self.sched.state_dict(),
                     'scaler': self.scaler.state_dict(),
                     'best_val_loss': self.best_val_loss,
                     'train_loss_ema': self.train_loss_ema,
                     'val_loss_ema': self.val_loss_ema,
                     'hist': self.hist,
-                    'args': vars(self.args) # Save args used for this run
+                    'args': vars(self.args)
                 }
                 torch.save(payload, ckpt_path)
-                # print(f"  Saved latest checkpoint to {ckpt_path}") # Can be verbose
 
-                # Save best checkpoint if current is best
                 if is_best:
                     best_path = self.run_dir/'weights'/'best.pt'
                     shutil.copyfile(ckpt_path, best_path)
@@ -508,31 +559,23 @@ class Trainer:
 
                 start_time = time.time() # Reset timer for next interval
 
-
         # --- Final Actions ---
         self.log("Training finished.")
-        # Final plot
+        # Final plot (remains the same)
         df = pd.DataFrame(self.hist)
         df.to_csv(self.run_dir/'metrics.csv', index=False)
         try:
             plt.figure(figsize=(12, 5))
-
             plt.subplot(1, 2, 1)
             plt.plot(df.step, df.train_loss, label='Train Loss', alpha=0.7)
             plt.plot(df.step, df.val_loss, label='Val Loss', alpha=0.7)
             # Add EMA plots if available
-            if 'train_loss_ema' in df.columns:
-                 plt.plot(df.step, df.train_loss_ema, label='Train Loss EMA', linestyle='--')
-            if 'val_loss_ema' in df.columns:
-                 plt.plot(df.step, df.val_loss_ema, label='Val Loss EMA', linestyle='--')
-
             plt.xlabel('Step')
             plt.ylabel('Loss')
             plt.legend()
             plt.title('Loss Curve')
             plt.grid(True, alpha=0.5)
-            plt.ylim(bottom=0) # Loss should not be negative
-
+            plt.ylim(bottom=0)
             plt.subplot(1, 2, 2)
             plt.plot(df.step, df.lr, label='Learning Rate')
             plt.xlabel('Step')
@@ -540,15 +583,13 @@ class Trainer:
             plt.legend()
             plt.title('Learning Rate Schedule')
             plt.grid(True, alpha=0.5)
-
             plt.tight_layout()
             plt.savefig(self.run_dir/'curves.png', dpi=150)
             plt.close()
             self.log(f"Saved final metric plots to {self.run_dir/'curves.png'}")
         except Exception as e:
              self.log(f"Failed to generate final plots: {e}")
-
-        self.log.close() # Close log file
+        self.log.close()
 
 
 # ───────────────────────────── viz util (Remains mostly the same) ──────────────────────────────
@@ -579,7 +620,6 @@ def _viz_triptych(run_dir, step_str, viz_data):
 
         # --- Create Masked Input Visualization ---
         spec_masked_viz = spec_orig.clone()
-        # Use a distinct value for masking, e.g., slightly below min or 0 if appropriate
         mask_fill_value = spec_orig.min() - (spec_orig.max() - spec_orig.min()) * 0.1
         spec_masked_viz[pixel_mask] = mask_fill_value
 
@@ -587,51 +627,39 @@ def _viz_triptych(run_dir, step_str, viz_data):
         recon_spec = spec_orig.clone() # Start with original visible patches
 
         if num_masked > 0:
-            # Reshape predicted pixels back to patches: (num_masked, f_stride, t_stride)
             pred_patches = pred_pixels_flat.reshape(num_masked, 1, f_stride, t_stride)
-
-            # Get indices of masked tokens
             masked_indices_flat = torch.nonzero(mask_tok).squeeze(-1)
             rows, cols = np.unravel_index(masked_indices_flat.numpy(), (Fp, Tp))
-
-            # Scatter predicted patches into the recon_spec
             for i, (r, c) in enumerate(zip(rows, cols)):
                 f_start, f_end = r * f_stride, (r + 1) * f_stride
                 t_start, t_end = c * t_stride, (c + 1) * t_stride
-                recon_spec[f_start:f_end, t_start:t_end] = pred_patches[i, 0] # Remove channel dim
+                recon_spec[f_start:f_end, t_start:t_end] = pred_patches[i, 0]
 
         # --- Calculate Pixel MSE Map (Optional) ---
         mse_map = torch.zeros_like(spec_orig)
         if num_masked > 0:
-            # Also need target pixels for MSE map
-            target_pixels_flat = viz_data["target_pixels_flat"] # (num_masked, P*P)
+            target_pixels_flat = viz_data["target_pixels_flat"]
             target_patches = target_pixels_flat.reshape(num_masked, 1, f_stride, t_stride)
-            mse_per_patch = tF.mse_loss(pred_patches, target_patches, reduction='none').mean(dim=(1, 2, 3))
-
+            mse_per_patch = F.mse_loss(pred_patches, target_patches, reduction='none').mean(dim=(1, 2, 3))
             for i, (r, c) in enumerate(zip(rows, cols)):
-                f_start, f_end = r * f_stride, (r + 1) * f_stride
-                t_start, t_end = c * t_stride, (c + 1) * t_stride
-                mse_map[f_start:f_end, t_start:t_end] = mse_per_patch[i]
-        mse_map[~pixel_mask] = 0.0 # Zero out visible regions
-
-        # --- FIX: Define vmin and vmax ---
-        # Determine robust color limits for spectrograms based on original input
-        # Ensure spec_orig is float for quantile calculation
-        spec_orig_float = spec_orig.float()
-        vmin = torch.quantile(spec_orig_float, 0.01)
-        vmax = torch.quantile(spec_orig_float, 0.99)
-        # Handle potential edge case where min/max are equal
-        if vmin == vmax:
-            vmin = spec_orig_float.min()
-            vmax = spec_orig_float.max()
-            if vmin == vmax: # If still equal (e.g., all zeros)
-                vmax = vmin + 1e-6 # Add small epsilon to avoid division by zero in color mapping
+                 f_start, f_end = r * f_stride, (r + 1) * f_stride
+                 t_start, t_end = c * t_stride, (c + 1) * t_stride
+                 mse_map[f_start:f_end, t_start:t_end] = mse_per_patch[i]
+        mse_map[~pixel_mask] = 0.0
 
         # ---------- Plotting ----------------------------------------------------
         fig, ax = plt.subplots(2, 3, figsize=(15, 8), dpi=120)
         kw_spec = dict(aspect='auto', origin='lower', cmap='magma')
         kw_err = dict(aspect='auto', origin='lower', cmap='coolwarm', interpolation='nearest')
         kw_diff = dict(aspect='auto', origin='lower', cmap='viridis', interpolation='nearest')
+
+        spec_orig_float = spec_orig.float()
+        vmin = torch.quantile(spec_orig_float, 0.01)
+        vmax = torch.quantile(spec_orig_float, 0.99)
+        if vmin == vmax:
+            vmin = spec_orig_float.min()
+            vmax = spec_orig_float.max()
+            if vmin == vmax: vmax = vmin + 1e-6
 
         # Row 1
         ax[0,0].imshow(spec_orig, **kw_spec, vmin=vmin, vmax=vmax)
@@ -643,25 +671,20 @@ def _viz_triptych(run_dir, step_str, viz_data):
         fig.colorbar(im_err, ax=ax[0,2], fraction=0.046, pad=0.04)
 
         # Row 2
-        # --- Bottom Left: Mask Boolean ---
-        # Display the pixel_mask (True=masked=white, False=visible=black)
-        # Ensure pixel_mask is on CPU and float for imshow
-        ax[1,0].imshow(pixel_mask.cpu().float(), cmap='gray', origin='lower', aspect='auto', vmin=0, vmax=1)
-        ax[1,0].set_title('Mask Boolean (True=Masked)')
-        # --- Bottom Middle: Reconstructed Spectrogram ---
+        ax[1,0].imshow(spec_orig, **kw_spec, vmin=vmin, vmax=vmax)
+        ax[1,0].set_title('Target Spectrogram')
         im_recon = ax[1,1].imshow(recon_spec, **kw_spec, vmin=vmin, vmax=vmax)
         ax[1,1].set_title('Reconstructed Spectrogram')
         fig.colorbar(im_recon, ax=ax[1,1], fraction=0.046, pad=0.04)
-        # --- Bottom Right: Absolute Difference ---
+
         diff_map = (spec_orig - recon_spec).abs()
         im_diff = ax[1,2].imshow(diff_map, **kw_diff)
         ax[1,2].set_title('Absolute Difference')
         fig.colorbar(im_diff, ax=ax[1,2], fraction=0.046, pad=0.04)
 
-        # General settings
         for row_ax in ax:
             for subplot_ax in row_ax:
-                subplot_ax.axis('off')
+                 subplot_ax.axis('off')
 
         fig.suptitle(f"Visualization at {step_str}", fontsize=14)
         fig.tight_layout(rect=[0, 0.03, 1, 0.97])
@@ -676,7 +699,7 @@ def _viz_triptych(run_dir, step_str, viz_data):
         import traceback
         traceback.print_exc()
         if 'fig' in locals() and fig is not None:
-            plt.close(fig) # Attempt to close figure even if error occurred
+             plt.close(fig)
 
 
 # ╭───────────────────────────────────────────────────────────────╮
@@ -693,12 +716,17 @@ def main():
     p.add_argument('--steps',    type=int, default=300000, help="Total training steps")
     p.add_argument('--warmup_steps', type=int, default=10000, help="Number of linear warmup steps")
     p.add_argument('--bs',       type=int, default=64, help="Batch size per GPU")
-    # Note: Learning rate might need scaling based on batch size, e.g., lr = base_lr * total_bs / 256
     p.add_argument('--lr',       type=float, default=5e-4, help="Base learning rate (before warmup/decay)")
     p.add_argument('--lr_min',   type=float, default=1e-5, help="Minimum learning rate for cosine decay")
     p.add_argument('--wd',       type=float, default=0.05, help="Weight decay")
     p.add_argument('--mask_ratio', type=float, default=0.75, help="Fraction of patches to mask")
     p.add_argument('--clip_grad', type=float, default=1.0, help="Gradient clipping value")
+    # Block Masking Specific Params
+    p.add_argument('--min_mask_h', type=int, default=1, help="Min height of masking block (tokens)")
+    p.add_argument('--max_mask_h', type=int, default=4, help="Max height of masking block (tokens)")
+    p.add_argument('--min_mask_w', type=int, default=10, help="Min width of masking block (tokens)")
+    p.add_argument('--max_mask_w', type=int, default=80, help="Max width of masking block (tokens)")
+
 
     # Model Config
     p.add_argument('--context_length', type=int, default=256, help="Spectrogram time length (frames)")

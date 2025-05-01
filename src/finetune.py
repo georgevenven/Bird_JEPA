@@ -135,7 +135,8 @@ class Net(nn.Module):
         self.clf     = BetterHead(cfg.d_model, n_cls)
     def forward(self, spec):                                      # (B,F,T)
         spec = spec.unsqueeze(1)                   # (B,1,F,T)
-        emb = self.encoder(spec)                       # Sequential(stem,enc) case
+        encoder_output = self.encoder(spec)
+        emb = encoder_output[0]
         return self.clf(emb)
 
 # ╭──────────────────────────────────────────────────────────────────────────╮
@@ -170,7 +171,7 @@ class Trainer:
                                                     shuffle=False, num_workers=0)
 
         # ── model ──────────────────────────────────────────────
-        cfg = BJConfig(d_model=args.enc_width, pattern=args.attn_pattern)
+        cfg = BJConfig(d_model=args.enc_width)
         self.net = Net(args.pretrained_model_path, cfg,
                        len(self.classes))
         self.dev = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
@@ -422,7 +423,7 @@ class Infer:
                sorted((Path(args.output_dir)/"weights").glob("best_*.pt"))[-1]
         state=torch.load(ckpt,map_location="cpu", weights_only=True)
 
-        cfg=BJConfig(d_model=args.enc_width, pattern=args.attn_pattern)
+        cfg=BJConfig(d_model=args.enc_width)
         self.net=Net(args.pretrained_model_path,cfg,len(self.classes))
         self.net.load_state_dict(state["model"]); self.net.eval()
 
@@ -531,7 +532,6 @@ def main():
     p.add_argument("--batch_size",type=int,default=320)
     p.add_argument("--learning_rate",type=float,default=5e-3)
     p.add_argument("--max_steps",type=int,default=20000)
-    p.add_argument("--attn_pattern", default="local50,global100,local50,global100")
     p.add_argument("--eval_interval",type=int,default=100)
     p.add_argument("--save_interval",type=int,default=1000)
     p.add_argument("--early_stopping_patience", default=1000, type=int)

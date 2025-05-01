@@ -9,7 +9,6 @@ from dataclasses import dataclass, field
 from .rope import rope, rope_2d
 from .utils_misc import count_params
 import random # For potential future masking strategies if needed
-from typing import List, Tuple, Optional
 
 print(">> birdjepa loaded from", __file__)
 
@@ -30,7 +29,7 @@ class BJConfig:
     d_model: int = 192 # Encoder dimension
     n_heads: int = 6
     ff_mult: int = 4
-    context_length: int = 256 # Add context_length (provide a default if desired)
+    pattern: str = None
 
     # decoder
     decoder_d_model: int = None # If None, use encoder d_model
@@ -38,9 +37,14 @@ class BJConfig:
     decoder_n_heads: int = 4
     decoder_ff_mult: int = 4
 
-    # patch size
-    patch_size_f: int = 16 # Freq patch size
-    patch_size_t: int = 16 # Time patch size - DEPRECATED (calculated from context_length)
+    # ---------- MAE masking -------------------------------------
+    mask_t:      int   = 1000   # training segment length (time frames)
+    # mask_ratio is handled in pretrain.py args, not config fixed
+    # rect mask params remain relevant if using rect_mask in pretrain.py
+
+    def __post_init__(self):
+        if self.pattern is None:
+            self.pattern = ','.join(['local50,global100'] * (self.layers // 2))
 
 # ──────────────────────────────────────
 #  stem: conv stack, tracks Fp
@@ -103,7 +107,7 @@ def build_encoder(cfg: BJConfig):
                          for _ in range(cfg.layers)])
 
 # ──────────────────────────────────────
-#   Encoder
+#  BirdMAE Encoder
 # ──────────────────────────────────────
 class BirdJEPA(nn.Module):
     def __init__(self, cfg: BJConfig):
@@ -148,48 +152,37 @@ class BirdJEPA(nn.Module):
         for blk in self.core:                  # ← iterate manually
             encoded_all = blk(encoded_all, (Fp, Tp)) # RoPE applied inside blocks
 
-        return encoded_all, self.Fp, self.Tp # Return all encoded, Fp, Tp as scalars
+        return encoded_all, z_flat, (Fp, Tp) # Return all encoded, stem output, grid shape
 
     def _print_par_count(self):
         m = count_params(self)
-        print(f"[Encoder] {m:.2f}M parameters")
+        print(f"[BirdMAE Encoder] {m:.2f}M parameters")
 
+# ──────────────────────────────────────
+#  Spectrogram Decoder (MAE Style)
+# ──────────────────────────────────────
 class SpectrogramDecoder(nn.Module):
     """
-    Takes encoded visible tokens, uses mask tokens for masked positions,
-    and reconstructs the *pixel values* for the masked patches.
+    Takes encoded visible tokens and mask tokens, reconstructs
+    the stem output features for the masked positions.
     """
-    def __init__(self, cfg: BJConfig, patch_size_f: int, patch_size_t: int, in_chans: int = 1):
-        """
-        Args:
-            cfg: Configuration object (BJConfig).
-            patch_size_f: Height of the original patch in pixels (frequency).
-            patch_size_t: Width of the original patch in pixels (time).
-            in_chans: Number of input channels (e.g., 1 for grayscale spectrogram).
-        """
+    def __init__(self, cfg: BJConfig, stem_channels: int):
         super().__init__()
         self.decoder_d_model = cfg.decoder_d_model or cfg.d_model
         self.decoder_layers = cfg.decoder_layers
         self.decoder_n_heads = cfg.decoder_n_heads
         self.decoder_ff_mult = cfg.decoder_ff_mult
         self.d_model = cfg.d_model # Encoder output dim
-
-        # Calculate the number of pixels per patch to predict
-        self.patch_size_f = patch_size_f
-        self.patch_size_t = patch_size_t
-        self.in_chans = in_chans
-        self.num_pixels_per_patch = self.in_chans * self.patch_size_f * self.patch_size_t
+        self.stem_channels = stem_channels # Target dim (C)
 
         # Project encoder output to decoder dimension if different
         self.enc_to_dec_proj = nn.Linear(self.d_model, self.decoder_d_model) if self.d_model != self.decoder_d_model else nn.Identity()
 
         # Learnable mask token
         self.mask_token = nn.Parameter(torch.randn(1, 1, self.decoder_d_model))
-        # Initialize mask token parameter - important for MAE stability
-        torch.nn.init.normal_(self.mask_token, std=.02)
-        # self._mask_token_init_done = False # Flag removed, init done here
+        self._mask_token_init_done = False # Flag for possible scaled init
 
-        # Decoder blocks (using standard Transformer blocks with RoPE)
+        # Using standard TransformerEncoderLayer as decoder blocks, no cross-attention needed
         decoder_block = SDPABlock(
             d=self.decoder_d_model,
             h=self.decoder_n_heads,
@@ -197,88 +190,66 @@ class SpectrogramDecoder(nn.Module):
         )
         self.decoder_blocks = nn.ModuleList([copy.deepcopy(decoder_block) for _ in range(self.decoder_layers)])
 
-        # Final normalization and projection layer to predict pixels
+        # Final projection layer to predict stem channels
         self.norm_out = nn.LayerNorm(self.decoder_d_model)
-        # Head projects from decoder dimension to the flattened pixel count of a patch
-        self.pixel_head = nn.Linear(self.decoder_d_model, self.num_pixels_per_patch)
-        # Initialize the head layer - often beneficial
-        # Example: Xavier uniform initialization
-        torch.nn.init.xavier_uniform_(self.pixel_head.weight)
-        torch.nn.init.zeros_(self.pixel_head.bias)
-
+        self.head = nn.Linear(self.decoder_d_model, self.stem_channels)
 
         self._print_par_count()
 
     def forward(self, encoded_vis, mask_tok, grid_shape):
         """
-        Args:
-            encoded_vis : (B, num_vis, D_enc) - Encoded visible tokens from encoder.
-            mask_tok    : (B, Fp*Tp) bool     - True where token IS masked.
-            grid_shape  : (Fp, Tp)            - Token grid dimensions.
-
+        encoded_vis : (B, num_vis, D_enc) - Encoded visible tokens
+        mask_tok    : (B, Fp*Tp) bool     - True where token IS masked
+        grid_shape  : (Fp, Tp)
         Returns:
-            predictions for masked tokens : (total_masked, num_pixels_per_patch)
-                                            Predicted pixel values (flattened) for each masked patch.
+            predictions for masked tokens : (total_masked, C)
         """
-        B, T_all = mask_tok.shape[0], mask_tok.shape[1]
+        B, T_all, _ = mask_tok.shape[0], mask_tok.shape[1], self.decoder_d_model # Use T_all = Fp*Tp
         Fp, Tp = grid_shape
         assert T_all == Fp * Tp, "Mask shape mismatch"
         device = encoded_vis.device
-        D_dec = self.decoder_d_model
 
         # Project visible tokens to decoder dimension
         encoded_vis = self.enc_to_dec_proj(encoded_vis) # (B, num_vis, D_dec)
 
-        # ----- Prepare full sequence for decoder input -------------
-        # RoPE positional embeddings will be applied inside the decoder blocks.
-        # Create placeholder for the full sequence length.
-        x_full = torch.zeros(B, T_all, D_dec, device=device, dtype=encoded_vis.dtype)
-        vis_mask = ~mask_tok # Boolean mask: True where visible
+        # Maybe initialize mask token based on data std
+        if not self._mask_token_init_done and self.training:
+             nn.init.normal_(self.mask_token, std=.02)
+             self._mask_token_init_done = True
 
-        # Scatter visible tokens and mask tokens into the full sequence tensor
-        # Need indices to handle potentially varying numbers of visible tokens per sample
+        # ----- positional embeddings ---------------------------------
+        # RoPE is applied *inside* the SDPABlocks based on full grid shape
+        # Create placeholder for full sequence + scatter vis/mask tokens
+        x_full = torch.zeros(B, T_all, self.decoder_d_model, device=device)
+        vis_mask = ~mask_tok # True where visible
+
+        # Need indices to scatter correctly if num_vis varies per batch item
         num_vis_per_sample = vis_mask.sum(dim=1)
+        num_masked_per_sample = mask_tok.sum(dim=1)
+        max_masked = num_masked_per_sample.max()
+        if max_masked == 0:
+             return x_full.new_zeros(0, self.stem_channels) # Nothing to predict
 
-        # Iterate through batch to correctly place visible tokens and mask tokens
+        current_vis_idx = 0
         for b in range(B):
             num_vis = num_vis_per_sample[b].item()
             idx_vis = torch.nonzero(vis_mask[b]).squeeze(-1)
             idx_mask = torch.nonzero(mask_tok[b]).squeeze(-1)
 
-            # Place encoded visible tokens
-            if num_vis > 0: # Handle cases where a sample might be fully masked (unlikely but possible)
-                 # Ensure slicing matches the actual number of visible tokens for this sample
-                x_full[b, idx_vis] = encoded_vis[b, :num_vis]
+            x_full[b, idx_vis] = encoded_vis[b, :num_vis] # Use actual num_vis
+            x_full[b, idx_mask] = self.mask_token
 
-            # Place mask tokens (cast to correct dtype if needed, e.g., for AMP)
-            if idx_mask.numel() > 0: # Check if there are any masked tokens
-                x_full[b, idx_mask] = self.mask_token.to(x_full.dtype)
-
-        # ----- Decoder forward pass -------------------------------
-        # Pass the full sequence through the decoder blocks
+        # ----- decoder forward (using encoder blocks) --------------
         decoded_all = x_full
         for blk in self.decoder_blocks:
-            # Pass grid_shape for RoPE calculation inside the block
-            decoded_all = blk(decoded_all, grid_shape)
+            decoded_all = blk(decoded_all, grid_shape) # Pass grid shape for RoPE
 
-        # ----- Project features of MASKED tokens to pixels --------
-        # Apply final normalization
-        decoded_all_norm = self.norm_out(decoded_all)
+        # ----- Project masked tokens to stem channels --------------
+        decoded_masked = decoded_all[mask_tok] # Select only masked tokens -> (total_masked, D_dec)
+        preds = self.head(decoded_masked)      # (total_masked, C)
 
-        # Select only the feature vectors corresponding to the MASKED tokens
-        decoded_masked_norm = decoded_all_norm[mask_tok] # Shape: (total_masked, D_dec)
-
-        # Predict pixel values using the final head
-        pred_pixels_flat = self.pixel_head(decoded_masked_norm) # Shape: (total_masked, num_pixels_per_patch)
-
-        return pred_pixels_flat
+        return preds
 
     def _print_par_count(self):
         m = count_params(self)
-        print(f"[SpectrogramDecoder (Pixel)] {m:.2f}M parameters")
-
-class Predictor(nn.Module):
-    pass 
-
-class DecoderPredictor(nn.Module):
-    pass 
+        print(f"[SpectrogramDecoder] {m:.2f}M parameters")
