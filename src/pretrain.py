@@ -474,32 +474,28 @@ class Trainer:
                     self.best_val_loss = val_loss
                     self.bad_evals = 0
                     print(f"  New best val_loss: {self.best_val_loss:.4f}")
+                    # Save best checkpoint only
+                    best_path = self.run_dir/'weights'/'best.pt'
+                    payload = {
+                        'step': self.step,
+                        'enc': self.enc.state_dict(),
+                        'dec': self.dec.state_dict(),
+                        'opt': self.opt.state_dict(),
+                        'sched': self.sched.state_dict(), # Save scheduler state
+                        'scaler': self.scaler.state_dict(),
+                        'best_val_loss': self.best_val_loss,
+                        'train_loss_ema': self.train_loss_ema,
+                        'val_loss_ema': self.val_loss_ema,
+                        'hist': self.hist,
+                        'args': vars(self.args) # Save args used for this run
+                    }
+                    torch.save(payload, best_path)
+                    print(f"  Saved best checkpoint to {best_path}")
                 else:
                     self.bad_evals += 1
-
-                # Save latest checkpoint
-                ckpt_path = self.run_dir/'weights'/'latest.pt'
-                payload = {
-                    'step': self.step,
-                    'enc': self.enc.state_dict(),
-                    'dec': self.dec.state_dict(),
-                    'opt': self.opt.state_dict(),
-                    'sched': self.sched.state_dict(), # Save scheduler state
-                    'scaler': self.scaler.state_dict(),
-                    'best_val_loss': self.best_val_loss,
-                    'train_loss_ema': self.train_loss_ema,
-                    'val_loss_ema': self.val_loss_ema,
-                    'hist': self.hist,
-                    'args': vars(self.args) # Save args used for this run
-                }
-                torch.save(payload, ckpt_path)
-                # print(f"  Saved latest checkpoint to {ckpt_path}") # Can be verbose
-
-                # Save best checkpoint if current is best
-                if is_best:
-                    best_path = self.run_dir/'weights'/'best.pt'
-                    shutil.copyfile(ckpt_path, best_path)
-                    print(f"  Saved best checkpoint to {best_path}")
+                # Save checkpoint at every eval interval as step_{step}.pt
+                step_ckpt_path = self.run_dir/'weights'/f'step_{self.step:07d}.pt'
+                torch.save(payload, step_ckpt_path)
 
                 # Early stopping check
                 if self.args.early_stop > 0 and self.bad_evals >= self.args.early_stop:
