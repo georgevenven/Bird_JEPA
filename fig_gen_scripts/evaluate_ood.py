@@ -29,6 +29,7 @@ from data.bird_datasets import TorchSpecDataset
 def token_mask_to_pixel_mask(mask_tok, Fp, Tp, f_stride, t_stride):
     """
     Converts a token mask (B, Fp*Tp) or (Fp*Tp) to a pixel mask.
+    Fixed implementation using repeat_interleave to create proper rectangular patches.
     """
     if mask_tok.ndim == 1:
         B = 1
@@ -40,17 +41,15 @@ def token_mask_to_pixel_mask(mask_tok, Fp, Tp, f_stride, t_stride):
     T_bins = Tp * t_stride
     device = mask_tok.device
 
-    # Reshape token mask to grid
     mask_tok_grid = mask_tok.view(B, Fp, Tp)
 
-    # Create patch template
-    patch_template = torch.ones((f_stride, t_stride), device=device, dtype=torch.bool)
+    # Repeat vertically (frequency)
+    pixel_mask_freq_repeated = mask_tok_grid.repeat_interleave(f_stride, dim=1)
+    # Shape: (B, Fp * f_stride, Tp) == (B, F_bins, Tp)
 
-    # Use broadcasting and repeat for efficiency
-    mask_tok_expanded = mask_tok_grid.unsqueeze(2).unsqueeze(4)
-    patch_template_expanded = patch_template.unsqueeze(0).unsqueeze(1).unsqueeze(3)
-    pixel_mask_expanded = mask_tok_expanded & patch_template_expanded
-    pixel_mask = pixel_mask_expanded.view(B, Fp, Tp, f_stride, t_stride).permute(0, 1, 3, 2, 4).reshape(B, F_bins, T_bins)
+    # Repeat horizontally (time)
+    pixel_mask = pixel_mask_freq_repeated.repeat_interleave(t_stride, dim=2)
+    # Shape: (B, F_bins, Tp * t_stride) == (B, F_bins, T_bins)
 
     return pixel_mask
 
@@ -142,27 +141,40 @@ def evaluate_model(encoder, decoder, dataset, cfg, train_config, Fp, Tp, f_strid
         if num_samples is not None and total_samples >= num_samples:
             break
             
-        spec_batch = spec_batch.to(device)
-        B, freq_bins, time_bins = spec_batch.shape
+        spec_batch_orig = spec_batch.to(device)  # Keep original for target calculation
+        B, freq_bins, time_bins = spec_batch_orig.shape
         
         # Add channel dimension: (B, freq_bins, time_bins) -> (B, 1, freq_bins, time_bins)
-        spec_batch = spec_batch.unsqueeze(1)
+        spec_batch_orig_unsqueezed = spec_batch_orig.unsqueeze(1)
         
         # Generate ONE mask for the entire batch (same as training)
         # This matches the training procedure from pretrain.py
         num_tokens = Fp * Tp
         single_mask_tok_flat = generate_batch_mask(Fp, Tp, mask_ratio, device)
         # Repeat the same mask for all items in the batch
-        mask_batch = single_mask_tok_flat.unsqueeze(0).expand(B, -1)  # (B, Fp*Tp)
+        mask_batch = single_mask_tok_flat.unsqueeze(0).expand(B, -1)  # (B, Fp*Tp), True where masked
+        
+        # ---- MODIFICATION START: Degrade input for encoder ----
+        # Convert token mask to pixel mask for zeroing out input
+        # This pixel_mask_for_input will be (B, freq_bins, time_bins)
+        pixel_mask_for_input = token_mask_to_pixel_mask(mask_batch, Fp, Tp, f_stride, t_stride)
+        
+        # Clone the original spectrogram batch (with channel dim) to create the encoder input
+        masked_spec_batch_for_encoder = spec_batch_orig_unsqueezed.clone()
+        
+        # Zero out the masked regions in the encoder input
+        # pixel_mask_for_input.unsqueeze(1) makes it (B, 1, freq_bins, time_bins) to match masked_spec_batch_for_encoder
+        masked_spec_batch_for_encoder[pixel_mask_for_input.unsqueeze(1).expand_as(masked_spec_batch_for_encoder)] = 0.0
+        # ---- MODIFICATION END ----
         
         # Calculate indices based on the single mask (same as training)
         num_masked = single_mask_tok_flat.sum().item()
         num_visible = num_tokens - num_masked
-        ids_shuffle = torch.argsort(torch.rand(num_tokens, device=device))
+        ids_shuffle = torch.argsort(torch.rand(num_tokens, device=device))  # Ensures random selection of visible patches
         ids_keep = ids_shuffle[:num_visible]  # Indices of visible tokens
         
-        # Encode full spectrogram (same as training)
-        encoded_all, _, _ = encoder(spec_batch)  # (B, Fp*Tp, D)
+        # Encode the MODIFIED spectrogram (where masked patches are zeroed)
+        encoded_all, _, _ = encoder(masked_spec_batch_for_encoder)  # (B, Fp*Tp, D)
         D_enc = encoded_all.shape[-1]
         
         # Select only VISIBLE encoded tokens using indices (same as training)
@@ -173,11 +185,13 @@ def evaluate_model(encoder, decoder, dataset, cfg, train_config, Fp, Tp, f_strid
         # Decode (reconstruct masked patches) - same as training
         pred_pixels = decoder(encoded_vis, mask_batch, (Fp, Tp))  # (B * num_masked, patch_pixels)
         
-        # Get target pixels for masked patches - same as training
-        pixel_mask = token_mask_to_pixel_mask(mask_batch, Fp, Tp, f_stride, t_stride)  # (B, freq_bins, time_bins)
+        # Get target pixels for masked patches - use the ORIGINAL spec_batch_orig_unsqueezed
+        # The pixel_mask for target and visualization should be the same as pixel_mask_for_input.
+        # Let's rename for clarity in visualization functions if they expect 'pixel_mask'.
+        pixel_mask_for_target_and_vis = pixel_mask_for_input
         
-        # Extract patches from the original spectrogram (same as training)
-        spec_patches = spec_batch.unfold(2, f_stride, f_stride).unfold(3, t_stride, t_stride)
+        # Extract patches from the ORIGINAL spectrogram (same as training)
+        spec_patches = spec_batch_orig_unsqueezed.unfold(2, f_stride, f_stride).unfold(3, t_stride, t_stride)
         # spec_patches shape: (B, 1, Fp, Tp, f_stride, t_stride)
         spec_patches = spec_patches.permute(0, 2, 3, 1, 4, 5).reshape(B, Fp * Tp, -1)
         # spec_patches shape: (B, Fp*Tp, num_pixels_per_patch)
@@ -189,7 +203,7 @@ def evaluate_model(encoder, decoder, dataset, cfg, train_config, Fp, Tp, f_strid
         # Create reconstructed spectrograms for visualization
         if save_visualizations and output_dir:
             reconstructed_specs = create_reconstructed_spectrograms(
-                spec_batch, pred_pixels, pixel_mask, mask_batch, Fp, Tp, f_stride, t_stride
+                spec_batch_orig_unsqueezed, pred_pixels, pixel_mask_for_target_and_vis, mask_batch, Fp, Tp, f_stride, t_stride  # Use original for base
             )
         
         # Calculate MSE for the entire batch (same as training)
@@ -202,7 +216,7 @@ def evaluate_model(encoder, decoder, dataset, cfg, train_config, Fp, Tp, f_strid
         # Save visualizations for first few batches
         if save_visualizations and output_dir and batch_idx < 5:  # Save first 5 batches
             save_batch_visualizations(
-                spec_batch, reconstructed_specs, pixel_mask, 
+                spec_batch_orig_unsqueezed, reconstructed_specs, pixel_mask_for_target_and_vis,  # Use original for base
                 filenames, vis_dir, batch_idx, mse_losses[-1] if mse_losses else 0.0
             )
         
@@ -289,10 +303,16 @@ def save_batch_visualizations(spec_batch, reconstructed_specs, pixel_mask, filen
         axes[0].set_ylabel('Frequency bins', fontsize=24)
         axes[0].tick_params(labelsize=20)
         
-        # Masked spectrogram (set masked regions to 0)
+        # Masked spectrogram - show TOKEN-based masking with clear patch boundaries
         masked = original.copy()
-        mask = pixel_mask[i].cpu().numpy()
-        masked[mask] = 0
+        # Instead of using pixel_mask, manually create token-based mask visualization
+        # Get the token mask for this sample (same pattern for all samples in batch)
+        token_mask = pixel_mask[i].cpu().numpy()  # This gives us the pixel-level mask
+        
+        # But we want to show clear token boundaries, so let's create it properly
+        # We'll set entire token patches to 0 to show the token-based nature
+        masked[token_mask] = 0  # This still gives us the token boundaries since pixel_mask comes from token_mask
+        
         im2 = axes[1].imshow(masked, aspect='auto', origin='lower', cmap='viridis')
         axes[1].set_title(f'B. Masked (75% hidden)', fontsize=24)
         axes[1].set_ylabel('Frequency bins', fontsize=24)

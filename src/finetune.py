@@ -123,16 +123,23 @@ def grad_norm(model: nn.Module) -> float:
 # ╭──────────────────────────────────────────────────────────────────────────╮
 # │  classifier head                                                        │
 # ╰──────────────────────────────────────────────────────────────────────────╯
+# class SimplerHead(nn.Module):
+#     def __init__(self, d, n_cls):
+#         super().__init__()
+#         self.w = nn.Linear(d, 1, bias=False)  # attention weights
+#         self.fc = nn.Linear(d, n_cls)         # single linear layer for classification
+#     def forward(self, x):  # (B,T,d)
+#         α = torch.softmax(self.w(x).squeeze(-1), dim=-1).unsqueeze(-1)
+#         pooled = (α * x).sum(1)
+#         return self.fc(pooled)
+
 class SimplerHead(nn.Module):
     def __init__(self, d, n_cls):
         super().__init__()
-        self.w = nn.Linear(d, 1, bias=False)  # attention weights
         self.fc = nn.Linear(d, n_cls)         # single linear layer for classification
     def forward(self, x):  # (B,T,d)
-        α = torch.softmax(self.w(x).squeeze(-1), dim=-1).unsqueeze(-1)
-        pooled = (α * x).sum(1)
+        pooled = x.mean(1)  # simple average pooling
         return self.fc(pooled)
-
 # ╭──────────────────────────────────────────────────────────────────────────╮
 # │  Net = frozen (or not) encoder + head                                    │
 # ╰──────────────────────────────────────────────────────────────────────────╯
