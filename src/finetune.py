@@ -22,38 +22,50 @@ from data.bird_datasets import BirdSpectrogramDataset, TorchSpecDataset
 # ── tiny wrapper that augments *only* when we call it from fine-tune ──────────
 class AugTorchSpecDataset(TorchSpecDataset):
     """
-    • Gaussian noise  (σ = noise_std · spec.std())
-    • mel-axis roll   (± max_shift bins)   – a quick 'pitch-shift'
-    Everything happens on-the-fly on the CPU tensor that _load_clip returns.
+    Augmentations are currently disabled in the _augment method for baseline testing.
+    To re-enable or add augmentations, modify the _augment method.
+    Current parameters are retained for future use.
     """
     def __init__(self, *a,
-                 noise_p   =0.5,  noise_std =0.08,
-                 shift_p   =0.5,  max_shift =4,
+                 noise_p   =0.5,  noise_std =0.08, # Retained for future re-enablement
+                 shift_p   =0.5,  max_shift =4,   # Retained for future re-enablement
                  **kw):
         super().__init__(*a, **kw)
+        # Store augmentation parameters. They are not used if _augment is a pass-through,
+        # but this keeps the instantiation in Trainer consistent.
         self.noise_p,  self.noise_std  = noise_p,  noise_std
         self.shift_p,  self.max_shift  = shift_p,  max_shift
 
     # ------------------------------------------------------------------
     def _augment(self, spec):
-        # make sure it's a torch Tensor on CPU, float32
-        if not torch.is_tensor(spec):
-            spec = torch.from_numpy(spec)
-        spec = spec.to(dtype=torch.float32, device="cpu")
+        # --- AUGMENTATIONS CURRENTLY DISABLED FOR BASELINE TEST BED ---
+        # To re-enable augmentations, uncomment or add the desired operations below.
+        # The original spectrogram is returned unmodified.
 
-        if torch.rand(1) < self.noise_p:
-            spec = spec + torch.randn_like(spec) * self.noise_std * spec.std()
-        if torch.rand(1) < self.shift_p:
-            shift = int(torch.randint(-self.max_shift,
-                                       self.max_shift + 1, (1,)))
-            spec  = torch.roll(spec, shifts=shift, dims=0)
-        # --- time-axis random erase (SpecAugment-style) ---
-        if torch.rand(1) < 0.5:
-            T = spec.shape[1]
-            erase_len = int(torch.randint(10, 41, (1,)))
-            start = int(torch.randint(0, max(1, T-erase_len+1), (1,)))
-            spec[:, start:start+erase_len] = 0
-        return spec
+        # Original augmentation logic (example, currently commented out):
+        # # make sure it's a torch Tensor on CPU, float32
+        # if not torch.is_tensor(spec):
+        #     spec = torch.from_numpy(spec)
+        # spec = spec.to(dtype=torch.float32, device="cpu")
+        #
+        # # Example: Gaussian Noise
+        # if torch.rand(1) < self.noise_p:
+        #     spec = spec + torch.randn_like(spec) * self.noise_std * spec.std()
+        #
+        # # Example: Mel-axis Roll
+        # if torch.rand(1) < self.shift_p:
+        #     shift = int(torch.randint(-self.max_shift,
+        #                                self.max_shift + 1, (1,)))
+        #     spec  = torch.roll(spec, shifts=shift, dims=0)
+        #
+        # # Example: Time-axis Random Erase (SpecAugment-style)
+        # if torch.rand(1) < 0.5: # Placeholder probability
+        #     T = spec.shape[1]
+        #     erase_len = int(torch.randint(10, 41, (1,))) # Example range
+        #     start = int(torch.randint(0, max(1, T-erase_len+1), (1,)))
+        #     spec[:, start:start+erase_len] = 0
+        #
+        return spec # Return original spec without any augmentation
 
     # ------------------------------------------------------------------
     def __getitem__(self, idx):
@@ -111,18 +123,15 @@ def grad_norm(model: nn.Module) -> float:
 # ╭──────────────────────────────────────────────────────────────────────────╮
 # │  classifier head                                                        │
 # ╰──────────────────────────────────────────────────────────────────────────╯
-class BetterHead(nn.Module):
-    def __init__(self,d,n_cls,hid=128):
+class SimplerHead(nn.Module):
+    def __init__(self, d, n_cls):
         super().__init__()
-        self.w = nn.Linear(d,1,bias=False)           # scalar score
-        self.mlp = nn.Sequential(
-            nn.LayerNorm(d),
-            nn.Linear(d,hid),nn.GELU(),
-            nn.Dropout(0.3),nn.Linear(hid,n_cls))
-    def forward(self,x):                              # (B,T,d)
+        self.w = nn.Linear(d, 1, bias=False)  # attention weights
+        self.fc = nn.Linear(d, n_cls)         # single linear layer for classification
+    def forward(self, x):  # (B,T,d)
         α = torch.softmax(self.w(x).squeeze(-1), dim=-1).unsqueeze(-1)
-        pooled = (α*x).sum(1)
-        return self.mlp(pooled)
+        pooled = (α * x).sum(1)
+        return self.fc(pooled)
 
 # ╭──────────────────────────────────────────────────────────────────────────╮
 # │  Net = frozen (or not) encoder + head                                    │
@@ -132,7 +141,7 @@ class Net(nn.Module):
                  n_cls:int):
         super().__init__()
         self.encoder = load_pretrained_encoder(cfg, enc_ckpt)     # freeze later
-        self.clf     = BetterHead(cfg.d_model, n_cls)
+        self.clf     = SimplerHead(cfg.d_model, n_cls)
     def forward(self, spec):                                      # (B,F,T)
         spec = spec.unsqueeze(1)                   # (B,1,F,T)
         encoder_output = self.encoder(spec)
@@ -193,27 +202,12 @@ class Trainer:
             {"params": self.net.clf.parameters(),     "lr": head_lr, "weight_decay": 5e-3},
         ], eps=1e-8, betas=(0.9, 0.98))
         self.scaler = torch.cuda.amp.GradScaler(enabled=AMP)
-        # --- pos_weight balancing for BCE ---
-        # build a SMALL, finite view only for freq calc
-        static_ds = TorchSpecDataset(
-            args.train_spec_dir,
-            segment_len=args.context_length,
-            csv_path=args.train_csv,
-            infinite=False
-        )
-        counts = torch.zeros(len(self.classes))
-        for _, _, f in static_ds:
-            idx = self.train_ds.label_idx(f)
-            if idx >= 0:
-                counts[idx] += 1
-        pos_freq = counts / len(static_ds)
-        pw = 1 / torch.clamp(pos_freq, 1e-3)
-        self.crit = nn.BCEWithLogitsLoss(pos_weight=pw.to(self.dev))
-        print("Positive frequency for each class:", pos_freq)
-        print("Positive weight for each class:", pw)
-        # optional: cosine to 1e‑5
-        self.sched = torch.optim.lr_scheduler.CosineAnnealingLR(
-            self.opt, T_max=args.max_steps, eta_min=1e-5)
+        # --- Loss Function: Using standard BCEWithLogitsLoss for a more default setup ---
+        self.crit = nn.BCEWithLogitsLoss()
+        # Optional: Cosine LR Scheduler (now disabled by default)
+        # self.sched = torch.optim.lr_scheduler.CosineAnnealingLR(
+        #     self.opt, T_max=args.max_steps, eta_min=1e-5)
+        self.sched = None # Disabled LR scheduler for a more default setup
 
         # ── dirs / logging ─────────────────────────────────────
         self.run_dir = Path(args.output_dir); self.run_dir.mkdir(parents=True,exist_ok=True)
@@ -241,14 +235,15 @@ class Trainer:
         self.hist_auc  = []  # list of dicts for csv/plot
 
     # ----------------------------------------------------------
-    def _label_tensor(self, fnames, eps: float = 0.05):  # label‑smoothing ε
+    def _label_tensor(self, fnames, eps: float = 0.0):  # label‑smoothing ε (defaulted to 0.0)
         y = torch.zeros(len(fnames), len(self.classes), device=self.dev)
         for i, f in enumerate(fnames):
             idx = self.train_ds.label_idx(f)
             if idx >= 0:
                 y[i, idx] = 1.0
-        # smooth:   y ← (1‑ε)·y  +  ε/C
-        y = y * (1 - eps) + eps / y.size(1)
+        if eps > 0.0: # Apply label smoothing only if eps > 0
+            # smooth:   y ← (1‑ε)·y  +  ε/C
+            y = y * (1 - eps) + eps / y.size(1)
         return y
 
     # ----------------------------------------------------------
@@ -370,7 +365,7 @@ class Trainer:
                 if step % self.args.save_interval == 0:
                     self._save(step, 'ckpt')
 
-                if self.bad_evals >= 200:
+                if self.bad_evals >= self.args.early_stopping_patience:
                     self.log(f"early stop (no improve for {self.bad_evals} evals)")
                     break
 
@@ -529,8 +524,8 @@ def main():
     p.add_argument("--log_dir")
     p.add_argument("--submission_csv", default="submission.csv")
     p.add_argument("--context_length",type=int,default=256)
-    p.add_argument("--batch_size",type=int,default=320)
-    p.add_argument("--learning_rate",type=float,default=5e-3)
+    p.add_argument("--batch_size",type=int,default=128)
+    p.add_argument("--learning_rate",type=float,default=1e-3)
     p.add_argument("--max_steps",type=int,default=20000)
     p.add_argument("--eval_interval",type=int,default=100)
     p.add_argument("--save_interval",type=int,default=1000)

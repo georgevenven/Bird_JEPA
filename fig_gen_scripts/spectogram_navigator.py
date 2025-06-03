@@ -7,7 +7,7 @@ from matplotlib.backend_bases import KeyEvent
 import torch
 
 # ===== MODIFY THESE PARAMETERS =====
-NPZ_DIR = '/media/george-vengrovski/Desk SSD/BirdJEPA/train_soundscapes_spec'
+NPZ_DIR = '/media/george-vengrovski/Desk SSD/BirdJEPA/bengalese_finch_specs'
 PATTERN = '*.pt'        # File pattern to match
 SPEC_KEY = 's'           # Key for the spectrogram in the NPZ file
 CROP_TOP = 0            # Crop from the top

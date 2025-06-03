@@ -711,7 +711,7 @@ def main():
     p.add_argument('--decoder_ff_mult', type=int, default=4, help="Decoder feedforward multiplier")
 
     # System / Logging
-    p.add_argument('--num_workers', type=int, default=4, help="Number of DataLoader workers")
+    p.add_argument('--num_workers', type=int, default=0, help="Number of DataLoader workers")
     p.add_argument('--eval_interval', type=int, default=500, help="Steps between validation/logging/viz")
     p.add_argument('--early_stop', type=int, default=0, help="Stop after N evals without improvement (0 to disable)")
     p.add_argument('--resume', action='store_true', help='Continue training from latest.pt in run_dir')

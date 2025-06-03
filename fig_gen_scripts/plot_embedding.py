@@ -25,6 +25,9 @@ try:
 except ImportError:
     sys.exit("UMAP not found – pip install umap-learn and retry.")
 
+# Add PCA import
+from sklearn.decomposition import PCA
+
 # ══════════════════════════════════════════════════════════════════════
 # helpers
 # ══════════════════════════════════════════════════════════════════════
@@ -37,21 +40,18 @@ def make_cmap(n_cls=73):
     return ListedColormap((base * repeats)[:n_cls])
 
 
-def load_encoder_and_config(ckpt_dir: Path, device):
-    ckpt = (sorted(ckpt_dir.glob("latest.pt")) +
-            sorted(ckpt_dir.glob("latest.pt")) +
-            list(ckpt_dir.glob("latest.pt"))) # Check for latest.pt too
-    if not ckpt:
-        raise FileNotFoundError(f"no weights in {ckpt_dir}")
+def load_encoder_and_config(ckpt_path: Path, device):
+    if not ckpt_path.exists():
+        raise FileNotFoundError(f"no weights at {ckpt_path}")
 
-    state = torch.load(ckpt[-1], map_location="cpu")
+    state = torch.load(ckpt_path, map_location="cpu")
     state = state.get("enc", state.get("model", state))
     if "model" in state:            # fine-tune format
         state = {k[len("encoder."):] : v
                  for k, v in state.items() if k.startswith("encoder.")}
 
     # --- Load Model Config ---
-    config_path = ckpt_dir / "../model_config.json" # Assumes config is one level up from weights
+    config_path = ckpt_path.parent / "../model_config.json" # Assumes config is one level up from weights
     if not config_path.exists():
          # Try loading from args saved in checkpoint if available
          if 'args' in state and state['args'] is not None:
@@ -220,7 +220,7 @@ def sanity_grid(rows, out_png="sanity_check.png"):
 def main():
     p = argparse.ArgumentParser()
     p.add_argument("--spec_dir", required=True)
-    p.add_argument("--ckpt_dir", required=True)
+    p.add_argument("--ckpt", required=True)
     p.add_argument("--out_png",  default="umap_embedding_chunked.png")
     p.add_argument("--max_tokens", type=int, default=25_600)
     p.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
@@ -228,7 +228,7 @@ def main():
 
     device = torch.device(args.device)
     # Load encoder and the config it was trained with
-    enc, cfg = load_encoder_and_config(Path(args.ckpt_dir), device)
+    enc, cfg = load_encoder_and_config(Path(args.ckpt), device)
 
     pt_files = sorted(glob.glob(os.path.join(args.spec_dir, "*.pt")))
     if not pt_files:
@@ -275,9 +275,11 @@ def main():
 
     print(f"[raw] S {S.shape}   [enc] Z {Z.shape}   labels {L.shape}")
 
-    reducer_enc  = umap.UMAP(n_neighbors=200, min_dist=0.1, metric="cosine",
-                             n_components=2, random_state=42)
-    print("\n[UMAP-ENC] fitting …"); emb_enc  = reducer_enc.fit_transform(Z)
+    # --- PCA instead of UMAP ---
+    # reducer_enc = PCA(n_components=2)
+    import umap
+    reducer_enc = umap.UMAP(n_components=2, metric='cosine')
+    print("\n[UMAP-ENC] fitting …"); emb_enc = reducer_enc.fit_transform(Z)
 
     # --- Define plotting helper ---
     def _scatter(a, emb, lab, title):
