@@ -226,35 +226,44 @@ def evaluate_model(encoder, decoder, dataset, cfg, train_config, Fp, Tp, f_strid
 def create_reconstructed_spectrograms(spec_batch, pred_pixels, pixel_mask, mask_batch, Fp, Tp, f_stride, t_stride):
     """
     Create reconstructed spectrograms by filling in predicted pixels.
+    Updated for batch-consistent masking where all samples share the same mask pattern.
     """
     B = spec_batch.shape[0]
     reconstructed = spec_batch.clone()
     
-    # Track position in pred_pixels
-    pixel_idx = 0
+    # Since all samples in the batch have the same mask pattern, we can use the first mask
+    single_mask = mask_batch[0].view(Fp, Tp)  # (Fp, Tp) - same pattern for all samples
+    
+    # Calculate how many patches are masked (same for all samples)
+    num_masked_patches = single_mask.sum().item()
+    patches_per_sample = num_masked_patches
+    
+    # pred_pixels is organized as: [sample0_patch0, sample0_patch1, ..., sample1_patch0, sample1_patch1, ...]
+    # Shape: (B * num_masked_patches, patch_pixels)
     
     for b in range(B):
-        # Get mask for this sample
-        sample_mask = mask_batch[b].view(Fp, Tp)  # (Fp, Tp)
-        sample_pixel_mask = pixel_mask[b]  # (freq_bins, time_bins)
+        # Calculate the starting index for this sample's predictions
+        sample_start_idx = b * patches_per_sample
+        patch_idx = 0
         
-        # Iterate through masked patches
+        # Iterate through the token grid to find masked patches
         for fp in range(Fp):
             for tp in range(Tp):
-                if sample_mask[fp, tp]:  # This patch is masked
+                if single_mask[fp, tp]:  # This patch is masked (same pattern for all samples)
                     # Get patch boundaries
                     f_start = fp * f_stride
                     f_end = f_start + f_stride
                     t_start = tp * t_stride
                     t_end = t_start + t_stride
                     
-                    # Get predicted pixels for this patch
-                    patch_pixels = pred_pixels[pixel_idx].view(f_stride, t_stride)
+                    # Get predicted pixels for this patch from this sample
+                    pred_idx = sample_start_idx + patch_idx
+                    patch_pixels = pred_pixels[pred_idx].view(f_stride, t_stride)
                     
                     # Fill in the reconstruction
                     reconstructed[b, 0, f_start:f_end, t_start:t_end] = patch_pixels
                     
-                    pixel_idx += 1
+                    patch_idx += 1
     
     return reconstructed
 
