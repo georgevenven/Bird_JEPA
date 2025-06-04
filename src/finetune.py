@@ -123,23 +123,37 @@ def grad_norm(model: nn.Module) -> float:
 # ╭──────────────────────────────────────────────────────────────────────────╮
 # │  classifier head                                                        │
 # ╰──────────────────────────────────────────────────────────────────────────╯
-# class SimplerHead(nn.Module):
-#     def __init__(self, d, n_cls):
-#         super().__init__()
-#         self.w = nn.Linear(d, 1, bias=False)  # attention weights
-#         self.fc = nn.Linear(d, n_cls)         # single linear layer for classification
-#     def forward(self, x):  # (B,T,d)
-#         α = torch.softmax(self.w(x).squeeze(-1), dim=-1).unsqueeze(-1)
-#         pooled = (α * x).sum(1)
-#         return self.fc(pooled)
-
 class SimplerHead(nn.Module):
     def __init__(self, d, n_cls):
         super().__init__()
-        self.fc = nn.Linear(d, n_cls)         # single linear layer for classification
-    def forward(self, x):  # (B,T,d)
-        pooled = x.mean(1)  # simple average pooling
-        return self.fc(pooled)
+        # Input will be reshaped to (B,d,Fp,Tp) based on actual encoder dimensions
+        self.conv1 = nn.Conv2d(d, d//2, kernel_size=3, padding=1)
+        self.conv2 = nn.Conv2d(d//2, d//4, kernel_size=3, padding=1)
+        self.fc = nn.Linear(d//4, n_cls)
+        self.dropout = nn.Dropout(0.1)
+        
+    def forward(self, x, Fp, Tp):  # (B,Fp*Tp,d), Fp, Tp
+        B, _, d = x.shape
+        # Reshape to treat as image: (B,Fp*Tp,d) -> (B,d,Fp,Tp)
+        x = x.view(B, Fp, Tp, d).permute(0, 3, 1, 2)  # (B,d,Fp,Tp)
+        
+        # Convolutional layers
+        x = F.relu(self.conv1(x))  # (B,d//2,Fp,Tp)
+        x = self.dropout(x)
+        x = F.relu(self.conv2(x))  # (B,d//4,Fp,Tp)
+        
+        # Global average pooling using mean
+        x = x.mean(dim=(2, 3))  # (B,d//4)
+        
+        return self.fc(x)
+
+# class SimplerHead(nn.Module):
+#     def __init__(self, d, n_cls):
+#         super().__init__()
+#         self.fc = nn.Linear(d, n_cls)         # single linear layer for classification
+#     def forward(self, x):  # (B,T,d)
+#         pooled = x.mean(1)  # simple average pooling
+#         return self.fc(pooled)
 # ╭──────────────────────────────────────────────────────────────────────────╮
 # │  Net = frozen (or not) encoder + head                                    │
 # ╰──────────────────────────────────────────────────────────────────────────╯
@@ -152,8 +166,8 @@ class Net(nn.Module):
     def forward(self, spec):                                      # (B,F,T)
         spec = spec.unsqueeze(1)                   # (B,1,F,T)
         encoder_output = self.encoder(spec)
-        emb = encoder_output[0]
-        return self.clf(emb)
+        emb, Fp, Tp = encoder_output  # Unpack all three values
+        return self.clf(emb, Fp, Tp)
 
 # ╭──────────────────────────────────────────────────────────────────────────╮
 # │  TRAINER                                                                │
